@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "easy-mcp"
+version = "0.1.0"
+description = "Build secure MCP (Model Context Protocol) servers from plain Python functions."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Mark Rodrigues", email = "markrodrigues2004@gmail.com" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "agents",
+    "llm",
+    "tools",
+    "server",
+    "sse",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Typing :: Typed",
+]
+dependencies = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mark007-R/easy_mcp"
+Repository = "https://github.com/Mark007-R/easy_mcp"
+Issues = "https://github.com/Mark007-R/easy_mcp/issues"
+Roadmap = "https://github.com/Mark007-R/easy_mcp/blob/main/ROADMAP.md"
+Security = "https://github.com/Mark007-R/easy_mcp/blob/main/SECURITY.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["easy_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_optional = true

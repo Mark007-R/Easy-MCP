@@ -1,0 +1,520 @@
+"""The :class:`MCPServer` class: registration, dispatch, security, lifecycle.
+
+``dispatch`` is transport-independent: it takes one decoded JSON-RPC message
+plus a :class:`ClientContext` and returns the response dict (or ``None`` for
+notifications).  Transports stay thin; every security decision that is not
+transport-specific happens here, so adding a transport cannot silently drop
+a protection.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import traceback
+import uuid
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
+
+from .decorators import ToolDefinition, ToolRegistry, build_tool
+from .exceptions import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    TOOL_TIMEOUT,
+    ProtocolError,
+    SessionLimitError,
+    ToolError,
+)
+from .logging import audit, configure_logging
+from .schema import validate_arguments
+from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
+from .security.ratelimit import SlidingWindowRateLimiter
+from .transport.base import ClientContext, Transport
+from .transport.sse import SSETransport
+
+PROTOCOL_VERSION = "2024-11-05"
+
+
+def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _error_response(msg_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}
+
+
+def _protocol_error_response(msg_id: Any, exc: ProtocolError) -> dict[str, Any]:
+    return _error_response(msg_id, exc.code, str(exc), exc.data)
+
+
+def _tool_failure(text: str) -> dict[str, Any]:
+    """An MCP CallToolResult marking a tool-level (not protocol-level) error."""
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
+def _serialize_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    # sort_keys keeps output byte-identical for identical inputs, which
+    # matters for reproducible agent runs and response caching.
+    return json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+
+
+class MCPServer:
+    """A secure-by-default MCP server exposing Python functions as tools.
+
+    Example::
+
+        from easy_mcp import MCPServer
+
+        server = MCPServer(port=8000)
+
+        @server.tool
+        def add(a: int, b: int) -> int:
+            \"\"\"Add two numbers.\"\"\"
+            return a + b
+
+        server.run()
+
+    Args:
+        port: TCP port to bind.
+        host: Interface to bind. Defaults to loopback — exposing the server
+            beyond localhost is an explicit decision.
+        name: Server name reported during the MCP handshake.
+        version: Server version reported during the MCP handshake.
+        debug: When True, clients receive full tracebacks and uvicorn logs
+            verbosely. Never enable in production.
+        auth: Optional :class:`APIKeyAuth`. Without it, only public tools
+            (no ``requires_auth``/``scopes``) are reachable.
+        rate_limit_per_minute: Per-client request budget; ``None`` disables.
+        max_request_bytes: Hard cap on request body size.
+        default_timeout: Tool execution timeout in seconds unless a tool
+            overrides it; ``None`` disables.
+        max_sessions: Cap on concurrent SSE sessions.
+        instructions: Optional usage hints sent to clients at initialize.
+        json_logs: Emit structured JSON logs (recommended) or plain text.
+    """
+
+    def __init__(
+        self,
+        port: int = 8000,
+        host: str = "127.0.0.1",
+        *,
+        name: str = "easy-mcp",
+        version: str = "0.1.0",
+        debug: bool = False,
+        auth: APIKeyAuth | None = None,
+        rate_limit_per_minute: int | None = 120,
+        max_request_bytes: int = 1_048_576,
+        default_timeout: float | None = 30.0,
+        max_sessions: int = 256,
+        instructions: str | None = None,
+        json_logs: bool = True,
+    ) -> None:
+        if default_timeout is not None and default_timeout <= 0:
+            raise ValueError("default_timeout must be positive or None")
+        if max_request_bytes < 1:
+            raise ValueError("max_request_bytes must be >= 1")
+        self.host = host
+        self.port = port
+        self.name = name
+        self.version = version
+        self.debug = debug
+        self.auth = auth
+        self.max_request_bytes = max_request_bytes
+        self.default_timeout = default_timeout
+        self.max_sessions = max_sessions
+        self.instructions = instructions
+        self._registry = ToolRegistry()
+        self._limiter = (
+            SlidingWindowRateLimiter(rate_limit_per_minute)
+            if rate_limit_per_minute
+            else None
+        )
+        self._transport: Transport | None = None
+        self._logger: logging.Logger = configure_logging(debug=debug, json_logs=json_logs)
+
+    # ------------------------------------------------------------ registration
+
+    def tool(
+        self,
+        fn: Callable[..., Any] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        requires_auth: bool = False,
+        scopes: Iterable[str] = (),
+        tags: Iterable[str] = (),
+        category: str | None = None,
+        examples: Iterable[Mapping[str, Any]] = (),
+        timeout: float | None = None,
+        max_calls_per_session: int | None = None,
+    ) -> Callable[..., Any]:
+        """Register a function as an MCP tool.
+
+        Works bare (``@server.tool``) or with options
+        (``@server.tool(name="sum", scopes=("math",))``).  The wrapped
+        function is returned unchanged, so it stays directly callable.
+        """
+
+        def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_tool(
+                target,
+                name=name,
+                description=description,
+                requires_auth=requires_auth,
+                scopes=scopes,
+                tags=tags,
+                category=category,
+                examples=examples,
+                timeout=timeout,
+                max_calls_per_session=max_calls_per_session,
+            )
+            return target
+
+        if fn is not None:
+            return decorate(fn)
+        return decorate
+
+    def register_tool(self, fn: Callable[..., Any], **options: Any) -> ToolDefinition:
+        """Register a tool dynamically at runtime (same options as ``tool``)."""
+        definition = build_tool(fn, **options)
+        self._registry.register(definition)
+        self._logger.debug("registered tool %r", definition.name)
+        return definition
+
+    def unregister_tool(self, name: str) -> ToolDefinition:
+        """Remove a tool at runtime; returns its definition."""
+        removed = self._registry.unregister(name)
+        self._logger.debug("unregistered tool %r", name)
+        return removed
+
+    @property
+    def tools(self) -> list[ToolDefinition]:
+        """All registered tools, sorted by name."""
+        return self._registry.list()
+
+    # ------------------------------------------------------------------- auth
+
+    def authenticate_key(self, api_key: str | None) -> ClientIdentity | None:
+        """Resolve an API key to an identity via the configured auth backend.
+
+        Returns ``None`` when no auth is configured or no key was presented.
+
+        Raises:
+            AuthenticationError: If a key was presented but is invalid.
+        """
+        if self.auth is None:
+            return None
+        return self.auth.authenticate(api_key)
+
+    # --------------------------------------------------------------- dispatch
+
+    async def dispatch(self, message: Any, context: ClientContext) -> dict[str, Any] | None:
+        """Handle one JSON-RPC message; returns the response or ``None``.
+
+        This is the single entry point every transport funnels through, and
+        the place rate limiting and method routing are enforced.  It never
+        raises: malformed input and internal failures both come back as
+        JSON-RPC error responses (sanitized outside debug mode).
+        """
+        if not isinstance(message, dict):
+            return _error_response(None, INVALID_REQUEST, "Invalid request: expected a JSON object")
+        msg_id = message.get("id")
+        is_notification = "id" not in message
+        if message.get("jsonrpc") != "2.0":
+            if is_notification:
+                return None
+            return _error_response(
+                msg_id, INVALID_REQUEST, "Invalid request: jsonrpc must be '2.0'"
+            )
+        method = message.get("method")
+        if not isinstance(method, str):
+            if is_notification:
+                return None
+            return _error_response(msg_id, INVALID_REQUEST, "Invalid request: missing method")
+        params = message.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            if is_notification:
+                return None
+            return _error_response(msg_id, INVALID_PARAMS, "params must be an object")
+
+        # Rate limiting applies to every method, so discovery endpoints cannot
+        # be used to bypass the budget.
+        if self._limiter is not None:
+            try:
+                self._limiter.check(context.client_id)
+            except ProtocolError as exc:
+                audit("rate_limited", client_id=context.client_id, method=method)
+                return None if is_notification else _protocol_error_response(msg_id, exc)
+
+        try:
+            if method == "initialize":
+                result: Any = self._handle_initialize(params)
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = self._handle_tools_list(context)
+            elif method == "tools/call":
+                return await self._handle_tools_call(params, context, msg_id, is_notification)
+            elif method.startswith("notifications/"):
+                self._handle_notification(method, params, context)
+                return None
+            else:
+                if is_notification:
+                    return None
+                return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        except ProtocolError as exc:
+            return None if is_notification else _protocol_error_response(msg_id, exc)
+        except Exception:
+            # Sanitize: clients get an opaque error_id; the log gets the trace.
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            if is_notification:
+                return None
+            return _error_response(
+                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
+        return None if is_notification else _result_response(msg_id, result)
+
+    def _handle_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": self.name, "version": self.version},
+        }
+        if self.instructions:
+            result["instructions"] = self.instructions
+        return result
+
+    def _handle_tools_list(self, context: ClientContext) -> dict[str, Any]:
+        # Protected tools are omitted for callers who could not invoke them.
+        return {
+            "tools": [
+                definition.to_mcp()
+                for definition in self._registry.list()
+                if visible(context.identity, definition)
+            ]
+        }
+
+    def _handle_notification(
+        self, method: str, params: dict[str, Any], context: ClientContext
+    ) -> None:
+        if method == "notifications/initialized":
+            self._logger.debug("client initialized (session %s)", context.session_id)
+        elif method == "notifications/cancelled":
+            request_id = params.get("requestId")
+            task = context.in_flight.get(request_id)
+            if task is not None:
+                task.cancel()
+        # Unknown notifications are ignored per JSON-RPC semantics.
+
+    async def _handle_tools_call(
+        self,
+        params: dict[str, Any],
+        context: ClientContext,
+        msg_id: Any,
+        is_notification: bool,
+    ) -> dict[str, Any] | None:
+        # The call runs as its own task so notifications/cancelled can abort it.
+        task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+            self._execute_tool(params, context)
+        )
+        if msg_id is not None:
+            context.in_flight[msg_id] = task
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            if task.cancelled():
+                # Cancelled via notifications/cancelled: per MCP, the request's
+                # response is dropped.
+                audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
+                return None
+            task.cancel()  # our own caller is being cancelled; don't orphan it
+            raise
+        except ProtocolError as exc:
+            return None if is_notification else _protocol_error_response(msg_id, exc)
+        except Exception:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            if is_notification:
+                return None
+            return _error_response(
+                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
+        finally:
+            if msg_id is not None:
+                context.in_flight.pop(msg_id, None)
+        return None if is_notification else _result_response(msg_id, result)
+
+    async def _execute_tool(
+        self, params: dict[str, Any], context: ClientContext
+    ) -> dict[str, Any]:
+        name = params.get("name")
+        if not isinstance(name, str):
+            raise ProtocolError("tools/call requires a string 'name'", code=INVALID_PARAMS)
+        definition = self._registry.get(name)
+        # Report protected tools as unknown to unauthorized callers, so their
+        # existence is not enumerable.
+        if definition is None or not visible(context.identity, definition):
+            raise ProtocolError(f"Unknown tool: {name}", code=INVALID_PARAMS)
+
+        try:
+            authorize(context.identity, definition)
+            call_count = context.tool_calls.get(name, 0)
+            if (
+                definition.max_calls_per_session is not None
+                and call_count >= definition.max_calls_per_session
+            ):
+                raise SessionLimitError(
+                    f"Session limit reached for tool '{name}' "
+                    f"({definition.max_calls_per_session} calls)"
+                )
+            arguments = params.get("arguments")
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
+            validate_arguments(arguments, definition.input_schema)
+        except ProtocolError as exc:
+            audit(
+                "tool_denied",
+                tool=name,
+                client_id=context.client_id,
+                reason=type(exc).__name__,
+            )
+            raise
+
+        context.tool_calls[name] = call_count + 1
+        timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        started = time.perf_counter()
+
+        def _duration_ms() -> float:
+            return round((time.perf_counter() - started) * 1000, 2)
+
+        try:
+            if definition.is_async:
+                awaitable: Any = definition.fn(**arguments)
+            else:
+                # Sync tools run in a worker thread so they cannot block the
+                # event loop.  NOTE: a timeout/cancel abandons the thread —
+                # Python cannot force-kill it (documented in SECURITY.md).
+                awaitable = asyncio.to_thread(definition.fn, **arguments)
+            result = await asyncio.wait_for(awaitable, timeout)
+        except TimeoutError:
+            audit(
+                "tool_call",
+                tool=name,
+                client_id=context.client_id,
+                duration_ms=_duration_ms(),
+                status="timeout",
+            )
+            raise ProtocolError(
+                f"Tool '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except asyncio.CancelledError:
+            raise
+        except ToolError as exc:
+            # Intentional, safe-to-show tool error raised by the tool author.
+            audit(
+                "tool_call",
+                tool=name,
+                client_id=context.client_id,
+                duration_ms=_duration_ms(),
+                status="tool_error",
+            )
+            return _tool_failure(str(exc))
+        except Exception as exc:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("tool %r failed error_id=%s", name, error_id, exc_info=True)
+            audit(
+                "tool_call",
+                tool=name,
+                client_id=context.client_id,
+                duration_ms=_duration_ms(),
+                status="error",
+                error_id=error_id,
+            )
+            if self.debug:
+                detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                return _tool_failure(f"Tool execution failed (error_id={error_id}): {detail}")
+            # Production: opaque message only — no exception text, no trace.
+            return _tool_failure(f"Tool execution failed (error_id={error_id})")
+
+        audit(
+            "tool_call",
+            tool=name,
+            client_id=context.client_id,
+            duration_ms=_duration_ms(),
+            status="ok",
+        )
+        return {
+            "content": [{"type": "text", "text": _serialize_result(result)}],
+            "isError": False,
+        }
+
+    # -------------------------------------------------------------- lifecycle
+
+    def build_app(self) -> Any:
+        """Return the ASGI app (for tests, mounting, or ``uvicorn --workers``)."""
+        if self._transport is None:
+            self._transport = SSETransport(self)
+        return self._transport.build_app()  # type: ignore[attr-defined]
+
+    def run(self, transport: Transport | None = None) -> None:
+        """Start the server (blocking).  Ctrl-C shuts down gracefully."""
+        self._warn_if_misconfigured()
+        self._transport = transport or SSETransport(self)
+        self._logger.info(
+            "starting %s v%s on %s:%d",
+            self.name,
+            self.version,
+            self.host,
+            self.port,
+            extra={
+                "event": {
+                    "type": "startup",
+                    "tools": [definition.name for definition in self.tools],
+                    "auth": self.auth is not None,
+                    "rate_limit": self._limiter is not None,
+                    "debug": self.debug,
+                }
+            },
+        )
+        try:
+            self._transport.run()
+        finally:
+            self._logger.info("server stopped")
+
+    def stop(self) -> None:
+        """Request a graceful shutdown of a running server."""
+        if self._transport is not None:
+            self._transport.stop()
+
+    def _warn_if_misconfigured(self) -> None:
+        if self.auth is None:
+            protected = [d.name for d in self.tools if d.requires_auth]
+            if protected:
+                self._logger.warning(
+                    "tools %s require authentication but no auth is configured; "
+                    "they will be unreachable",
+                    protected,
+                )
+            if self.host not in ("127.0.0.1", "localhost", "::1"):
+                self._logger.warning(
+                    "binding %s without authentication exposes all public tools "
+                    "to the network; configure APIKeyAuth",
+                    self.host,
+                )
+        if self.debug:
+            self._logger.warning("debug mode is ON: clients will receive tracebacks")
