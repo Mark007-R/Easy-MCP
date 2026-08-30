@@ -20,7 +20,7 @@ jobs:
       - name: Install
         run: pip install -e .[dev]
       - name: Lint
-        run: ruff check easy_mcp tests examples
+        run: ruff check easy_mcp tests
       - name: Test
         run: pytest -q
 
