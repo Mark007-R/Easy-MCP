@@ -7,7 +7,9 @@
 
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
 
-![Terminal recording: starting the server, then an MCP client calling get_weather (live Mumbai weather) and list_s3_buckets, with the real captured JSON responses](https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/demo.gif?v=3)
+<video src="https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/Demo.mp4" controls muted width="100%"></video>
+
+▶️ **[Watch the demo](https://github.com/Mark007-R/Easy-MCP/raw/main/docs/Demo.mp4)** — `pip install`, write a tool, run the server, and call it from an MCP client.
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Schema generation, validation, authentication, rate limiting, timeouts,
@@ -188,21 +190,6 @@ npx @modelcontextprotocol/inspector      # connect to http://127.0.0.1:8000/sse
 # Claude Code:
 claude mcp add --transport sse my-server http://127.0.0.1:8000/sse
 ```
-
-Or run the raw wire-protocol walkthrough in
-[`examples/raw_client.py`](examples/raw_client.py) against
-[`examples/demo_server.py`](examples/demo_server.py).
-
-## Real-world examples
-
-| Example | What it shows |
-|---|---|
-| [`weather_server.py`](examples/weather_server.py) | Live weather for any city via the free Open-Meteo API — stdlib only, no API key needed |
-| [`aws_server.py`](examples/aws_server.py) | Query your AWS account (S3 buckets, EC2 instances) with scope-protected tools; loads a local `.env` if present |
-| [`demo_server.py`](examples/demo_server.py) | Kitchen-sink tour: auth, scopes, timeouts, session caps, async tools |
-
-For the AWS example, copy [`.env.example`](.env.example) to `.env` and fill in your
-own credentials — `.env` is gitignored, so your keys never get committed.
 
 ## Architecture
 

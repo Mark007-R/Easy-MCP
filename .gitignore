@@ -23,3 +23,6 @@ htmlcov/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Local-only example servers (kept for testing, out of the published repo)
+examples/
