@@ -221,7 +221,7 @@ easy_mcp/
 The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
-so adding HTTP/WebSocket/stdio transports (see [ROADMAP.md](ROADMAP.md))
+so adding HTTP/WebSocket/stdio transports (planned)
 cannot silently bypass a security check.
 
 **Determinism:** tool listings are sorted, JSON output uses sorted keys, and
@@ -240,7 +240,7 @@ prefer returning compact structures over huge strings.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
 - For multiple workers: `uvicorn "myapp:server.build_app" --factory` won't share
-  sessions across processes — v0.1 targets a single process (see ROADMAP).
+  sessions across processes — v0.1 targets a single process.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development

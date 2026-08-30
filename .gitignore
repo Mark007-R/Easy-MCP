@@ -24,5 +24,6 @@ htmlcov/
 Thumbs.db
 .DS_Store
 
-# Local-only example servers (kept for testing, out of the published repo)
+# Local-only files (kept for testing/planning, out of the published repo)
 examples/
+ROADMAP.md
