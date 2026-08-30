@@ -201,6 +201,9 @@ Or run the raw wire-protocol walkthrough in
 | [`aws_server.py`](examples/aws_server.py) | Query your AWS account (S3 buckets, EC2 instances) with scope-protected tools; loads a local `.env` if present |
 | [`demo_server.py`](examples/demo_server.py) | Kitchen-sink tour: auth, scopes, timeouts, session caps, async tools |
 
+For the AWS example, copy [`.env.example`](.env.example) to `.env` and fill in your
+own credentials — `.env` is gitignored, so your keys never get committed.
+
 ## Architecture
 
 ```
