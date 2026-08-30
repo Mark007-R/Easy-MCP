@@ -198,7 +198,7 @@ Or run the raw wire-protocol walkthrough in
 | Example | What it shows |
 |---|---|
 | [`weather_server.py`](examples/weather_server.py) | Live weather for any city via the free Open-Meteo API — stdlib only, no API key needed |
-| [`aws_server.py`](examples/aws_server.py) | Query your AWS account (S3 buckets, EC2 instances) with scope-protected tools |
+| [`aws_server.py`](examples/aws_server.py) | Query your AWS account (S3 buckets, EC2 instances) with scope-protected tools; loads a local `.env` if present |
 | [`demo_server.py`](examples/demo_server.py) | Kitchen-sink tour: auth, scopes, timeouts, session caps, async tools |
 
 ## Architecture
