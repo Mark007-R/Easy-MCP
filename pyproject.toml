@@ -51,7 +51,6 @@ dev = [
 Homepage = "https://github.com/Mark007-R/Easy-MCP"
 Repository = "https://github.com/Mark007-R/Easy-MCP"
 Issues = "https://github.com/Mark007-R/Easy-MCP/issues"
-Roadmap = "https://github.com/Mark007-R/Easy-MCP/blob/main/ROADMAP.md"
 Security = "https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md"
 
 [tool.hatch.build.targets.wheel]
