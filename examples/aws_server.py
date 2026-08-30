@@ -3,6 +3,15 @@
 Requires boto3 (``pip install boto3``) and AWS credentials configured the
 standard way — environment variables, ``~/.aws/credentials``, or a role.
 
+Prefer a ``.env`` file? Install ``python-dotenv`` and this example loads it
+automatically. Put it next to where you run the server, and NEVER commit it
+(this repo's .gitignore already excludes ``.env``)::
+
+    AWS_ACCESS_KEY_ID=...
+    AWS_SECRET_ACCESS_KEY=...
+    AWS_DEFAULT_REGION=us-east-1
+    EASY_MCP_AWS_KEY=a-long-random-string
+
 Cloud data is worth protecting, so this example shows per-tool scopes: set
 ``EASY_MCP_AWS_KEY`` to a long random value and both tools require an API
 key holding the ``aws`` scope (clients send ``Authorization: Bearer <key>``).
@@ -22,6 +31,13 @@ from __future__ import annotations
 import os
 
 from easy_mcp import APIKeyAuth, MCPServer, ToolError
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # python-dotenv is optional — the standard AWS chain still works
+    pass
+else:
+    load_dotenv()
 
 api_key = os.environ.get("EASY_MCP_AWS_KEY")
 auth = APIKeyAuth({api_key: ["aws"]}) if api_key else None
