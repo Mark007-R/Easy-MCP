@@ -7,7 +7,7 @@
 
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
 
-![Animated demo: a public live-weather tool and a scope-protected AWS tool on one server — the unauthorized client cannot even see the AWS tool, gets real Mumbai weather from get_weather, is rejected calling list_s3_buckets, and the tool appears once the client presents a key with the aws scope](https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/demo.gif?v=2)
+![Terminal recording: starting the server, then an MCP client calling get_weather (live Mumbai weather) and list_s3_buckets, with the real captured JSON responses](https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/demo.gif?v=3)
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Schema generation, validation, authentication, rate limiting, timeouts,
