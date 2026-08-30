@@ -1,6 +1,13 @@
 # easy_mcp
 
+[![PyPI](https://img.shields.io/pypi/v/easy-mcp-kit)](https://pypi.org/project/easy-mcp-kit/)
+[![Python versions](https://img.shields.io/pypi/pyversions/easy-mcp-kit)](https://pypi.org/project/easy-mcp-kit/)
+[![CI](https://github.com/Mark007-R/Easy-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Mark007-R/Easy-MCP/actions/workflows/ci.yml)
+[![License](https://img.shields.io/pypi/l/easy-mcp-kit)](https://github.com/Mark007-R/Easy-MCP/blob/main/LICENSE)
+
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
+
+![Animated demo: install easy-mcp-kit, write an add tool in eight lines, run the server, call the tool, and watch strict validation reject a bad argument](https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/demo.gif)
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Schema generation, validation, authentication, rate limiting, timeouts,
