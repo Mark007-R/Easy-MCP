@@ -28,8 +28,10 @@ from the docstring.
 ## Installation
 
 ```bash
-pip install easy-mcp
+pip install easy-mcp-kit
 ```
+
+The package installs as `easy-mcp-kit`; the import name is `easy_mcp`.
 
 Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 
