@@ -7,20 +7,6 @@
 
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
 
-<video src="https://raw.githubusercontent.com/Mark007-R/Easy-MCP/main/docs/Demo.mp4" controls muted width="100%"></video>
-
-▶️ **[Watch the demo](https://github.com/Mark007-R/Easy-MCP/raw/main/docs/Demo.mp4)** — `pip install`, write a tool, run the server, and call it from an MCP client.
-
-The `server.py` and `client.py` from the demo, for reference:
-
-![server.py — a weather-and-aws MCP server built with easy_mcp](docs/server.py.png)
-
-![client.py — an MCP client that calls the tools over SSE](docs/client.py.png)
-
-Run both together with a single command:
-
-![run_demo.py — starts the server, runs the client, prints the results](docs/run_demo.py.png)
-
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Schema generation, validation, authentication, rate limiting, timeouts,
 structured logging, and sanitized error handling are all built in — and secure
