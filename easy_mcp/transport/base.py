@@ -47,6 +47,10 @@ class Transport(abc.ABC):
     def __init__(self, server: MCPServer) -> None:
         self._server = server
 
+    def describe(self) -> str:
+        """Short human-readable description for the startup log."""
+        return type(self).__name__
+
     @abc.abstractmethod
     def run(self) -> None:
         """Serve until stopped (blocking)."""

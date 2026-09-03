@@ -31,7 +31,8 @@ server.run()
 That's a complete, MCP-compliant server. Connect any MCP client to
 `http://127.0.0.1:8000/sse` and the `add` tool is discoverable and callable —
 with its JSON schema generated from the type hints and its description taken
-from the docstring.
+from the docstring. Prefer a local, launch-on-demand server for Claude Desktop
+or Claude Code? Swap the last line for `server.run("stdio")`.
 
 ## Installation
 
@@ -102,6 +103,37 @@ server.unregister_tool("late_tool")
 Anything else is rejected **at registration time** with a clear error — never
 at call time. Validation is strict: booleans are not integers, unknown
 arguments are hard errors, and every violation is reported (not just the first).
+
+### Transports: SSE or stdio
+
+The same server object serves either transport; nothing else changes.
+
+```python
+server.run()          # HTTP + SSE on host:port — remote clients, reverse proxies
+server.run("stdio")   # stdin/stdout — Claude Desktop, `claude mcp add`, local hosts
+```
+
+Over stdio the MCP host launches your script as a child process and talks
+JSON-RPC over its pipes. Logs go to stderr, and `sys.stdout` is redirected to
+stderr while serving, so a stray `print()` inside a tool cannot corrupt the
+protocol stream. Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "my-tools": {
+      "command": "python",
+      "args": ["/path/to/server.py"],
+      "env": {"EASY_MCP_STDIO_API_KEY": "optional-key-for-protected-tools"}
+    }
+  }
+}
+```
+
+Authentication works the same way as over SSE, except the credential is the
+`EASY_MCP_STDIO_API_KEY` environment variable (or
+`StdioTransport(server, api_key=...)`) instead of a header. An invalid key
+fails at startup rather than silently downgrading to anonymous access.
 
 ### Authentication and per-tool permissions
 
@@ -186,8 +218,11 @@ SHA-256 fingerprints ever appear):
 # MCP Inspector (interactive UI):
 npx @modelcontextprotocol/inspector      # connect to http://127.0.0.1:8000/sse
 
-# Claude Code:
+# Claude Code, SSE server already running:
 claude mcp add --transport sse my-server http://127.0.0.1:8000/sse
+
+# Claude Code, stdio (launched on demand; server.py calls server.run("stdio")):
+claude mcp add my-server -- python /path/to/server.py
 ```
 
 ## Architecture
@@ -202,7 +237,8 @@ easy_mcp/
 │   └── ratelimit.py sliding-window per-client rate limiter
 ├── transport/
 │   ├── base.py      Transport ABC + ClientContext
-│   └── sse.py       HTTP + SSE transport (Starlette/uvicorn)
+│   ├── sse.py       HTTP + SSE transport (Starlette/uvicorn)
+│   └── stdio.py     stdin/stdout transport (Claude Desktop, local hosts)
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail
 ```
@@ -210,8 +246,8 @@ easy_mcp/
 The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
-so adding HTTP/WebSocket/stdio transports (planned)
-cannot silently bypass a security check.
+so the stdio transport reuses every check the SSE transport gets, and the
+planned Streamable HTTP/WebSocket transports cannot silently bypass one.
 
 **Determinism:** tool listings are sorted, JSON output uses sorted keys, and
 identical inputs produce byte-identical responses — useful for reproducible
@@ -236,7 +272,7 @@ prefer returning compact structures over huge strings.
 
 ```bash
 pip install -e .[dev]
-pytest            # 60+ tests: schema, registration, dispatch, security, transport
+pytest            # 80+ tests: schema, registration, dispatch, security, SSE, stdio
 ruff check .
 ```
 

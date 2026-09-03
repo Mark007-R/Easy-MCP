@@ -40,6 +40,21 @@ Consequences:
 | Information disclosure | Production errors are opaque (`error_id` only); tracebacks stay in server logs; `debug=True` is loudly warned about at startup |
 | Accidental exposure | Default bind is `127.0.0.1`; binding non-loopback without auth logs a warning at startup |
 | Crash amplification | Exceptions in one tool call are contained; the server keeps serving |
+| Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
+| Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
+
+## Transport trust boundaries
+
+- **SSE (HTTP)** — clients are remote and untrusted; credentials arrive in
+  headers, sessions are capability tokens, and every protection above applies.
+- **stdio** — the client is the *parent process* that launched the server
+  (Claude Desktop, Claude Code, an agent runtime). There is no network
+  surface, but the parent is still treated as an MCP client: schema
+  validation, scopes, rate limits, timeouts, payload caps, and error
+  sanitization all apply unchanged. Protected tools stay hidden unless the
+  parent presents a valid key via `EASY_MCP_STDIO_API_KEY`. Anything the
+  parent can pass as environment it can also read, so a stdio key is a
+  scoping mechanism, not a secret from the host itself.
 
 ## Known limitations (v0.1)
 
@@ -87,4 +102,5 @@ patch versions and credited unless you prefer otherwise.
 
 | Version | Supported |
 |---|---|
-| 0.1.x | ✅ |
+| 0.2.x | ✅ |
+| 0.1.x | Security fixes only until 0.3.0 |
