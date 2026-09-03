@@ -35,6 +35,7 @@ from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
 from .security.ratelimit import SlidingWindowRateLimiter
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
+from .transport.stdio import StdioTransport
 
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -97,7 +98,7 @@ class MCPServer:
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
             overrides it; ``None`` disables.
-        max_sessions: Cap on concurrent SSE sessions.
+        max_sessions: Cap on concurrent SSE sessions (stdio has exactly one).
         instructions: Optional usage hints sent to clients at initialize.
         json_logs: Emit structured JSON logs (recommended) or plain text.
     """
@@ -471,19 +472,26 @@ class MCPServer:
             self._transport = SSETransport(self)
         return self._transport.build_app()  # type: ignore[attr-defined]
 
-    def run(self, transport: Transport | None = None) -> None:
-        """Start the server (blocking).  Ctrl-C shuts down gracefully."""
+    def run(self, transport: Transport | str | None = None) -> None:
+        """Start the server (blocking).  Ctrl-C shuts down gracefully.
+
+        Args:
+            transport: ``"sse"`` (default) serves HTTP + SSE on ``host:port``;
+                ``"stdio"`` serves the parent process over stdin/stdout
+                (Claude Desktop, ``claude mcp add``).  A :class:`Transport`
+                instance can be passed for custom configuration.
+        """
+        self._transport = self._resolve_transport(transport)
         self._warn_if_misconfigured()
-        self._transport = transport or SSETransport(self)
         self._logger.info(
-            "starting %s v%s on %s:%d",
+            "starting %s v%s via %s",
             self.name,
             self.version,
-            self.host,
-            self.port,
+            self._transport.describe(),
             extra={
                 "event": {
                     "type": "startup",
+                    "transport": self._transport.describe(),
                     "tools": [definition.name for definition in self.tools],
                     "auth": self.auth is not None,
                     "rate_limit": self._limiter is not None,
@@ -501,6 +509,17 @@ class MCPServer:
         if self._transport is not None:
             self._transport.stop()
 
+    def _resolve_transport(self, transport: Transport | str | None) -> Transport:
+        if transport is None or transport == "sse":
+            return SSETransport(self)
+        if transport == "stdio":
+            return StdioTransport(self)
+        if isinstance(transport, Transport):
+            return transport
+        raise ValueError(
+            f"unknown transport {transport!r}: expected 'sse', 'stdio', or a Transport instance"
+        )
+
     def _warn_if_misconfigured(self) -> None:
         if self.auth is None:
             protected = [d.name for d in self.tools if d.requires_auth]
@@ -510,7 +529,9 @@ class MCPServer:
                     "they will be unreachable",
                     protected,
                 )
-            if self.host not in ("127.0.0.1", "localhost", "::1"):
+            if self.host not in ("127.0.0.1", "localhost", "::1") and not isinstance(
+                self._transport, StdioTransport
+            ):
                 self._logger.warning(
                     "binding %s without authentication exposes all public tools "
                     "to the network; configure APIKeyAuth",

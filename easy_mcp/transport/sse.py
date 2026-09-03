@@ -68,6 +68,9 @@ class SSETransport(Transport):
         self._sessions: dict[str, _Session] = {}
         self._uvicorn: Any = None
 
+    def describe(self) -> str:
+        return f"sse on {self._server.host}:{self._server.port}"
+
     # ------------------------------------------------------------------ app
 
     def build_app(self) -> Starlette:
