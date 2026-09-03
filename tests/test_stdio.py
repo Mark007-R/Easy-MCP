@@ -284,7 +284,7 @@ def test_stdio_subprocess_end_to_end() -> None:
 
         first = json.loads(proc.stdout.readline())
         second = json.loads(proc.stdout.readline())
-        proc.stdin.close()  # EOF: the server should exit cleanly
+        # communicate() closes stdin itself; that EOF makes the server exit cleanly.
         stdout_rest, stderr = proc.communicate(timeout=15)
     except BaseException:
         proc.kill()
