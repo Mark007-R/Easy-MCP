@@ -29,12 +29,14 @@ from .exceptions import (
     ToolRegistrationError,
     ValidationError,
 )
+from .protocol import SUPPORTED_PROTOCOL_VERSIONS
 from .security.auth import APIKeyAuth, ClientIdentity
 from .security.ratelimit import SlidingWindowRateLimiter
 from .server import PROTOCOL_VERSION, MCPServer
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
+from .transport.streamable_http import StreamableHTTPTransport
 
 __version__ = "0.2.0"
 
@@ -51,10 +53,12 @@ __all__ = [
     "ProtocolError",
     "RateLimitError",
     "SSETransport",
+    "SUPPORTED_PROTOCOL_VERSIONS",
     "SchemaError",
     "SessionLimitError",
     "SlidingWindowRateLimiter",
     "StdioTransport",
+    "StreamableHTTPTransport",
     "ToolDefinition",
     "ToolError",
     "ToolRegistrationError",

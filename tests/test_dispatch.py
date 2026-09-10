@@ -8,7 +8,7 @@ import json
 import pytest
 from conftest import make_context, notification, rpc
 
-from easy_mcp import MCPServer, ToolError
+from easy_mcp import PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, MCPServer, ToolError
 from easy_mcp.exceptions import (
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -59,6 +59,20 @@ async def test_initialize(app: MCPServer) -> None:
     assert result["protocolVersion"] == "2024-11-05"
     assert result["serverInfo"]["name"] == "easy-mcp"
     assert "tools" in result["capabilities"]
+
+
+async def test_protocol_version_negotiation(app: MCPServer) -> None:
+    # A supported version is echoed back ...
+    for requested in SUPPORTED_PROTOCOL_VERSIONS:
+        response = await app.dispatch(
+            rpc("initialize", {"protocolVersion": requested}), make_context()
+        )
+        assert response["result"]["protocolVersion"] == requested
+    # ... anything else gets the newest version this server speaks.
+    assert PROTOCOL_VERSION == SUPPORTED_PROTOCOL_VERSIONS[0] == "2025-11-25"
+    for params in ({"protocolVersion": "2099-01-01"}, {"protocolVersion": 42}, {}):
+        response = await app.dispatch(rpc("initialize", params), make_context())
+        assert response["result"]["protocolVersion"] == PROTOCOL_VERSION
 
 
 async def test_ping(app: MCPServer) -> None:

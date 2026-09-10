@@ -18,6 +18,7 @@ keywords = [
     "llm",
     "tools",
     "server",
+    "streamable-http",
     "sse",
 ]
 classifiers = [
