@@ -32,10 +32,12 @@ Consequences:
 | Credential stuffing / key probing | Constant-time key comparison over the full key set (`hmac.compare_digest`); timing does not reveal partial matches |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
-| Session hijacking | Session ids are 192-bit random capability tokens; every POST must present the same credential the session was opened with (403 otherwise) |
+| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise) |
+| DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
 | Request flooding | Per-client sliding-window rate limiting on every method, including discovery; concurrent session cap (`max_sessions`) |
+| Session exhaustion (Streamable HTTP) | Sessions idle past `session_idle_timeout` (default 1 h) expire; `max_sessions` caps live sessions per endpoint (503 beyond it); `DELETE` ends a session early and cancels its running calls |
 | Resource exhaustion via slow tools | Per-tool and server-default timeouts; sync tools run off the event loop so they cannot stall other clients |
 | Information disclosure | Production errors are opaque (`error_id` only); tracebacks stay in server logs; `debug=True` is loudly warned about at startup |
 | Accidental exposure | Default bind is `127.0.0.1`; binding non-loopback without auth logs a warning at startup |
@@ -45,8 +47,10 @@ Consequences:
 
 ## Transport trust boundaries
 
-- **SSE (HTTP)** — clients are remote and untrusted; credentials arrive in
-  headers, sessions are capability tokens, and every protection above applies.
+- **Streamable HTTP** and legacy **SSE** — clients are remote and untrusted;
+  credentials arrive in headers, sessions are capability tokens bound to the
+  credential that opened them, browsers are held to the `Origin` allowlist,
+  and every protection above applies.
 - **stdio** — the client is the *parent process* that launched the server
   (Claude Desktop, Claude Code, an agent runtime). There is no network
   surface, but the parent is still treated as an MCP client: schema
@@ -56,7 +60,7 @@ Consequences:
   parent can pass as environment it can also read, so a stdio key is a
   scoping mechanism, not a secret from the host itself.
 
-## Known limitations (v0.1)
+## Known limitations (v0.2)
 
 - **Sync tool timeouts are cooperative.** A timed-out or cancelled sync tool's
   worker thread cannot be force-killed by Python; the response is discarded
@@ -64,8 +68,9 @@ Consequences:
   or external workers.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx, a cloud LB).
   API keys travel in headers and must not cross the network in plaintext.
-- **Single-process sessions.** SSE sessions live in process memory; running
-  multiple workers requires sticky routing (roadmap: shared session store).
+- **Single-process sessions.** SSE and Streamable HTTP sessions live in process
+  memory; running multiple workers requires sticky routing (roadmap: shared
+  session store).
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
   values; OAuth2 support is on the roadmap.
 
@@ -87,6 +92,7 @@ easy_mcp for sandboxing:
 - [ ] `debug=False` (the default) in production.
 - [ ] Auth configured (`APIKeyAuth.from_env()`), keys ≥ 32 random characters.
 - [ ] TLS terminated in front of the server.
+- [ ] `allowed_origins` lists only the browser origins that should reach the server (default: loopback).
 - [ ] Rate limit and `max_request_bytes` tuned to your workload.
 - [ ] Timeouts set for every tool that touches the network or disk.
 - [ ] Audit logs (`easy_mcp.audit`) shipped to your log store and reviewed.

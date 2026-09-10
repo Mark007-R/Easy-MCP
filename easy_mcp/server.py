@@ -30,14 +30,18 @@ from .exceptions import (
     ToolError,
 )
 from .logging import audit, configure_logging
+from .protocol import LATEST_PROTOCOL_VERSION, negotiate_protocol_version
 from .schema import validate_arguments
 from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
 from .security.ratelimit import SlidingWindowRateLimiter
+from .transport._http import BaseHTTPTransport, normalize_origins
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
+from .transport.streamable_http import StreamableHTTPTransport
 
-PROTOCOL_VERSION = "2024-11-05"
+# The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
+PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 
 
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
@@ -98,7 +102,12 @@ class MCPServer:
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
             overrides it; ``None`` disables.
-        max_sessions: Cap on concurrent SSE sessions (stdio has exactly one).
+        max_sessions: Cap on concurrent sessions, enforced by each HTTP
+            endpoint (Streamable HTTP, legacy SSE); stdio has exactly one.
+        allowed_origins: Browser origins allowed to call the HTTP endpoints,
+            e.g. ``["https://app.example.com"]``; ``"*"`` allows any.  The
+            default (``None``) allows loopback origins only.  Requests that
+            carry no ``Origin`` header (non-browser clients) are unaffected.
         instructions: Optional usage hints sent to clients at initialize.
         json_logs: Emit structured JSON logs (recommended) or plain text.
     """
@@ -109,13 +118,14 @@ class MCPServer:
         host: str = "127.0.0.1",
         *,
         name: str = "easy-mcp",
-        version: str = "0.2.0",
+        version: str = "0.2.1",
         debug: bool = False,
         auth: APIKeyAuth | None = None,
         rate_limit_per_minute: int | None = 120,
         max_request_bytes: int = 1_048_576,
         default_timeout: float | None = 30.0,
         max_sessions: int = 256,
+        allowed_origins: Iterable[str] | None = None,
         instructions: str | None = None,
         json_logs: bool = True,
     ) -> None:
@@ -132,6 +142,9 @@ class MCPServer:
         self.max_request_bytes = max_request_bytes
         self.default_timeout = default_timeout
         self.max_sessions = max_sessions
+        self.allowed_origins = (
+            normalize_origins(allowed_origins) if allowed_origins is not None else None
+        )
         self.instructions = instructions
         self._registry = ToolRegistry()
         self._limiter = (
@@ -290,7 +303,7 @@ class MCPServer:
 
     def _handle_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": self.name, "version": self.version},
         }
@@ -467,19 +480,24 @@ class MCPServer:
     # -------------------------------------------------------------- lifecycle
 
     def build_app(self) -> Any:
-        """Return the ASGI app (for tests, mounting, or ``uvicorn --workers``)."""
-        if self._transport is None:
-            self._transport = SSETransport(self)
-        return self._transport.build_app()  # type: ignore[attr-defined]
+        """Return the ASGI app (for tests, mounting, or ``uvicorn --factory``).
+
+        It serves Streamable HTTP at ``/mcp`` plus the legacy SSE endpoints.
+        """
+        if not isinstance(self._transport, BaseHTTPTransport):
+            self._transport = StreamableHTTPTransport(self)
+        return self._transport.build_app()
 
     def run(self, transport: Transport | str | None = None) -> None:
         """Start the server (blocking).  Ctrl-C shuts down gracefully.
 
         Args:
-            transport: ``"sse"`` (default) serves HTTP + SSE on ``host:port``;
-                ``"stdio"`` serves the parent process over stdin/stdout
-                (Claude Desktop, ``claude mcp add``).  A :class:`Transport`
-                instance can be passed for custom configuration.
+            transport: ``"http"`` (default; alias ``"streamable-http"``)
+                serves Streamable HTTP at ``/mcp`` plus the legacy SSE
+                endpoints on ``host:port``; ``"sse"`` serves only the legacy
+                HTTP + SSE transport; ``"stdio"`` serves the parent process
+                over stdin/stdout.  A :class:`Transport` instance can be
+                passed for custom configuration.
         """
         self._transport = self._resolve_transport(transport)
         self._warn_if_misconfigured()
@@ -510,14 +528,17 @@ class MCPServer:
             self._transport.stop()
 
     def _resolve_transport(self, transport: Transport | str | None) -> Transport:
-        if transport is None or transport == "sse":
+        if isinstance(transport, Transport):
+            return transport
+        if transport is None or transport in ("http", "streamable-http"):
+            return StreamableHTTPTransport(self)
+        if transport == "sse":
             return SSETransport(self)
         if transport == "stdio":
             return StdioTransport(self)
-        if isinstance(transport, Transport):
-            return transport
         raise ValueError(
-            f"unknown transport {transport!r}: expected 'sse', 'stdio', or a Transport instance"
+            f"unknown transport {transport!r}: expected 'http', 'sse', 'stdio', "
+            "or a Transport instance"
         )
 
     def _warn_if_misconfigured(self) -> None:

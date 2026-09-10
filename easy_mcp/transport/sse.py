@@ -1,4 +1,7 @@
-"""SSE transport (HTTP + Server-Sent Events), the classic MCP remote transport.
+"""SSE transport (HTTP + Server-Sent Events), the legacy MCP remote transport.
+
+Superseded by Streamable HTTP (:mod:`.streamable_http`), which serves these
+same endpoints next to ``/mcp`` by default so older clients keep working.
 
 Flow:
 
@@ -9,6 +12,8 @@ Flow:
 
 Security handled here (before anything reaches the dispatcher):
 
+* Browser ``Origin`` headers must be on the allowlist (403 otherwise), the
+  DNS-rebinding defense shared with Streamable HTTP.
 * API keys are resolved from ``Authorization: Bearer`` / ``X-API-Key`` and
   invalid keys are rejected with 401.
 * Session ids are 192-bit random capability tokens, and every POST must
@@ -34,8 +39,8 @@ from starlette.routing import Route
 
 from ..exceptions import PARSE_ERROR, AuthenticationError
 from ..logging import audit
-from ..security.auth import ClientIdentity
-from .base import ClientContext, Transport
+from ._http import BaseHTTPTransport
+from .base import ClientContext
 
 KEEPALIVE_SECONDS = 15.0
 
@@ -50,9 +55,10 @@ class _Session:
     context: ClientContext
     identity_fp: str | None
     queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
+    tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
-class SSETransport(Transport):
+class SSETransport(BaseHTTPTransport):
     """Serve MCP over HTTP + Server-Sent Events using Starlette/uvicorn."""
 
     def __init__(
@@ -66,12 +72,18 @@ class SSETransport(Transport):
         self._sse_path = sse_path
         self._messages_path = messages_path
         self._sessions: dict[str, _Session] = {}
-        self._uvicorn: Any = None
 
     def describe(self) -> str:
         return f"sse on {self._server.host}:{self._server.port}"
 
     # ------------------------------------------------------------------ app
+
+    def routes(self) -> list[Route]:
+        """The SSE endpoints, for serving from another transport's app."""
+        return [
+            Route(self._sse_path, self._handle_sse, methods=["GET"]),
+            Route(self._messages_path, self._handle_messages, methods=["POST"]),
+        ]
 
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
@@ -82,50 +94,20 @@ class SSETransport(Transport):
                 yield
             finally:
                 # Graceful shutdown: unblock every open SSE stream.
-                await self._close_all_sessions()
+                await self.close_all_sessions()
 
         return Starlette(
-            routes=[
-                Route(self._sse_path, self._handle_sse, methods=["GET"]),
-                Route(self._messages_path, self._handle_messages, methods=["POST"]),
-                Route("/healthz", self._handle_health, methods=["GET"]),
-            ],
+            routes=[*self.routes(), Route("/healthz", self._handle_health, methods=["GET"])],
+            middleware=self._middleware(),
             lifespan=lifespan,
         )
 
-    def run(self) -> None:
-        """Serve blocking; SIGINT/SIGTERM trigger a graceful uvicorn shutdown."""
-        import uvicorn
-
-        config = uvicorn.Config(
-            self.build_app(),
-            host=self._server.host,
-            port=self._server.port,
-            log_level="info" if self._server.debug else "warning",
-        )
-        self._uvicorn = uvicorn.Server(config)
-        self._uvicorn.run()
-
-    def stop(self) -> None:
-        """Ask the running uvicorn server to exit gracefully."""
-        if self._uvicorn is not None:
-            self._uvicorn.should_exit = True
+    async def close_all_sessions(self) -> None:
+        """Unblock every open SSE stream so its connection can close."""
+        for session in list(self._sessions.values()):
+            await session.queue.put(_CLOSE)
 
     # ------------------------------------------------------------- endpoints
-
-    def _resolve_identity(self, request: Request) -> ClientIdentity | None:
-        """Extract and verify the API key from request headers.
-
-        Raises:
-            AuthenticationError: If a key was presented but is invalid.
-        """
-        key: str | None = None
-        authorization = request.headers.get("authorization")
-        if authorization and authorization.lower().startswith("bearer "):
-            key = authorization[7:].strip() or None
-        if key is None:
-            key = request.headers.get("x-api-key")
-        return self._server.authenticate_key(key)
 
     async def _handle_sse(self, request: Request) -> Response:
         try:
@@ -168,6 +150,9 @@ class SSETransport(Transport):
                     yield f"event: message\ndata: {payload}\n\n"
             finally:
                 self._sessions.pop(session_id, None)
+                # Calls still running for this session have nobody left to answer.
+                for task in list(session.tasks):
+                    task.cancel()
                 audit("session_close", session_id=session_id, client_id=client_id)
 
         return StreamingResponse(
@@ -229,22 +214,16 @@ class SSETransport(Transport):
                 status_code=400,
             )
 
+        # Dispatch in the background and answer 202 now: the JSON-RPC response
+        # travels over the SSE stream, and holding this POST open would stall
+        # clients that send one message at a time (a notifications/cancelled
+        # could never overtake the slow call it targets).
+        task = asyncio.create_task(self._deliver(session, message))
+        session.tasks.add(task)
+        task.add_done_callback(session.tasks.discard)
+        return Response(status_code=202)
+
+    async def _deliver(self, session: _Session, message: Any) -> None:
         response = await self._server.dispatch(message, session.context)
         if response is not None:
             await session.queue.put(response)
-        # 202: the JSON-RPC response travels over the SSE stream, not here.
-        return Response(status_code=202)
-
-    async def _handle_health(self, request: Request) -> Response:
-        return JSONResponse(
-            {
-                "status": "ok",
-                "server": self._server.name,
-                "version": self._server.version,
-                "tools": len(self._server.tools),
-            }
-        )
-
-    async def _close_all_sessions(self) -> None:
-        for session in list(self._sessions.values()):
-            await session.queue.put(_CLOSE)

@@ -29,7 +29,7 @@ server.run()
 ```
 
 That's a complete, MCP-compliant server. Connect any MCP client to
-`http://127.0.0.1:8000/sse` and the `add` tool is discoverable and callable —
+`http://127.0.0.1:8000/mcp` and the `add` tool is discoverable and callable —
 with its JSON schema generated from the type hints and its description taken
 from the docstring. Prefer a local, launch-on-demand server for Claude Desktop
 or Claude Code? Swap the last line for `server.run("stdio")`.
@@ -104,13 +104,41 @@ Anything else is rejected **at registration time** with a clear error — never
 at call time. Validation is strict: booleans are not integers, unknown
 arguments are hard errors, and every violation is reported (not just the first).
 
-### Transports: SSE or stdio
+### Transports: Streamable HTTP, SSE, or stdio
 
-The same server object serves either transport; nothing else changes.
+The same server object serves every transport; nothing else changes.
 
 ```python
-server.run()          # HTTP + SSE on host:port — remote clients, reverse proxies
+server.run()          # HTTP on host:port — Streamable HTTP at /mcp, legacy SSE at /sse
+server.run("sse")     # legacy HTTP + SSE only
 server.run("stdio")   # stdin/stdout — Claude Desktop, `claude mcp add`, local hosts
+```
+
+**Streamable HTTP** is the MCP spec's current HTTP transport. One endpoint,
+`/mcp`, takes one JSON-RPC message per `POST` and answers requests in the
+response body. `initialize` opens a session whose `MCP-Session-Id` header the
+client echoes on later requests; `DELETE /mcp` ends it, and sessions idle for
+an hour expire. The same app keeps serving the legacy `/sse` + `/messages`
+endpoints, so older clients connect unchanged. Protocol versions `2024-11-05`
+through `2025-11-25` are negotiated during `initialize`.
+
+```python
+from easy_mcp import StreamableHTTPTransport
+
+server.run(StreamableHTTPTransport(
+    server,
+    path="/mcp",                 # the MCP endpoint
+    legacy_sse=False,            # stop serving /sse + /messages
+    session_idle_timeout=600.0,  # seconds; None keeps sessions until DELETE
+))
+```
+
+Browsers get one more check: their `Origin` header must be allowlisted, which
+stops DNS-rebinding pages from reaching a server on your machine. Loopback
+origins are allowed by default; list any web app that should connect:
+
+```python
+server = MCPServer(allowed_origins=["https://app.example.com"])  # "*" allows any
 ```
 
 Over stdio the MCP host launches your script as a child process and talks
@@ -216,7 +244,7 @@ SHA-256 fingerprints ever appear):
 
 ```bash
 # MCP Inspector (interactive UI):
-npx @modelcontextprotocol/inspector      # connect to http://127.0.0.1:8000/sse
+npx @modelcontextprotocol/inspector      # Streamable HTTP, http://127.0.0.1:8000/mcp
 
 # Claude Code, SSE server already running:
 claude mcp add --transport sse my-server http://127.0.0.1:8000/sse
@@ -237,8 +265,11 @@ easy_mcp/
 │   └── ratelimit.py sliding-window per-client rate limiter
 ├── transport/
 │   ├── base.py      Transport ABC + ClientContext
-│   ├── sse.py       HTTP + SSE transport (Starlette/uvicorn)
+│   ├── _http.py     shared HTTP plumbing: Origin allowlist, credentials, uvicorn
+│   ├── streamable_http.py  Streamable HTTP transport (/mcp, sessions)
+│   ├── sse.py       legacy HTTP + SSE transport (Starlette/uvicorn)
 │   └── stdio.py     stdin/stdout transport (Claude Desktop, local hosts)
+├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail
 ```
@@ -246,8 +277,8 @@ easy_mcp/
 The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
-so the stdio transport reuses every check the SSE transport gets, and the
-planned Streamable HTTP/WebSocket transports cannot silently bypass one.
+so Streamable HTTP, SSE, and stdio all get the same checks, and a future
+WebSocket transport cannot silently bypass one.
 
 **Determinism:** tool listings are sorted, JSON output uses sorted keys, and
 identical inputs produce byte-identical responses — useful for reproducible
@@ -264,15 +295,17 @@ prefer returning compact structures over huge strings.
 - Run behind TLS (reverse proxy such as Caddy/nginx) — API keys travel in headers.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
+- Browser-based clients on other origins must be listed in `allowed_origins`.
 - For multiple workers: `uvicorn "myapp:server.build_app" --factory` won't share
-  sessions across processes — v0.1 targets a single process.
+  sessions across processes — run one process, or route each `MCP-Session-Id`
+  to the same worker.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development
 
 ```bash
 pip install -e .[dev]
-pytest            # 80+ tests: schema, registration, dispatch, security, SSE, stdio
+pytest            # 95+ tests: schema, dispatch, security, Streamable HTTP, SSE, stdio
 ruff check .
 ```
 

@@ -1,15 +1,18 @@
-"""End-to-end SSE transport tests against a real uvicorn server."""
+"""End-to-end SSE transport tests against a real uvicorn server.
+
+``server.build_app()`` serves Streamable HTTP too; these tests pin down that
+the legacy SSE endpoints it still carries behave exactly as before.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
 import httpx
-import pytest
-import uvicorn
 
 from easy_mcp import APIKeyAuth, MCPServer
 
@@ -25,34 +28,6 @@ def make_server(**kwargs: object) -> MCPServer:
         return a + b
 
     return server
-
-
-@pytest.fixture
-def live_server() -> Iterator[Callable[[MCPServer], str]]:
-    """Start servers on ephemeral ports in background threads; stop them after."""
-    running: list[tuple[uvicorn.Server, threading.Thread]] = []
-
-    def start(server: MCPServer) -> str:
-        config = uvicorn.Config(
-            server.build_app(), host="127.0.0.1", port=0, log_level="warning"
-        )
-        uv = uvicorn.Server(config)
-        thread = threading.Thread(target=uv.run, daemon=True)
-        thread.start()
-        deadline = time.time() + 10
-        while not uv.started:
-            if time.time() > deadline:
-                raise RuntimeError("uvicorn failed to start within 10s")
-            time.sleep(0.01)
-        running.append((uv, thread))
-        port = uv.servers[0].sockets[0].getsockname()[1]
-        return f"http://127.0.0.1:{port}"
-
-    yield start
-
-    for uv, thread in running:
-        uv.should_exit = True
-        thread.join(timeout=5)
 
 
 def _next_data(lines: Iterator[str]) -> str:
@@ -127,6 +102,39 @@ def test_sse_roundtrip(live_server) -> None:  # type: ignore[no-untyped-def]
             )
             assert malformed.status_code == 400
             assert malformed.json()["error"]["code"] == -32700
+
+
+def test_sse_post_does_not_wait_for_the_tool(live_server) -> None:  # type: ignore[no-untyped-def]
+    server = make_server()
+    started = threading.Event()
+
+    @server.tool
+    async def slow() -> str:
+        """Sleep for a long time."""
+        started.set()
+        await asyncio.sleep(30)
+        return "done"
+
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=httpx.Timeout(10.0)) as client:
+        with client.stream("GET", "/sse") as stream:
+            lines = stream.iter_lines()
+            endpoint = _next_data(lines)
+            began = time.perf_counter()
+            call = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "slow"}}
+            assert client.post(endpoint, json=call).status_code == 202
+            assert started.wait(5)
+            # The POST returned while the tool runs, so a cancel can follow it.
+            cancel = {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 7},
+            }
+            assert client.post(endpoint, json=cancel).status_code == 202
+            client.post(endpoint, json={"jsonrpc": "2.0", "id": 8, "method": "ping"})
+            # The cancelled call never answers; the ping's reply is next.
+            assert json.loads(_next_data(lines)) == {"jsonrpc": "2.0", "id": 8, "result": {}}
+            assert time.perf_counter() - began < 5
 
 
 def test_transport_auth(live_server) -> None:  # type: ignore[no-untyped-def]
