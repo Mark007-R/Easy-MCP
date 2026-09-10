@@ -1,7 +1,7 @@
 """stdio transport: newline-delimited JSON-RPC over stdin/stdout.
 
-This is the transport Claude Desktop, Claude Code (``claude mcp add``), and
-most local MCP clients use: the client *launches* the server as a child
+This is the transport most local MCP clients (desktop apps, CLI agents)
+use: the client *launches* the server as a child
 process, writes one JSON-RPC message per line to its stdin, and reads one
 JSON-RPC message per line from its stdout.  Logs go to stderr, so they never
 corrupt the protocol stream.

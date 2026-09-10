@@ -3,8 +3,8 @@
 * :class:`StreamableHTTPTransport` — the MCP endpoint (``/mcp``) for remote
   clients; it serves the legacy SSE endpoints alongside by default.
 * :class:`SSETransport` — the legacy HTTP + Server-Sent Events transport.
-* :class:`StdioTransport` — stdin/stdout for local clients such as Claude
-  Desktop and Claude Code.
+* :class:`StdioTransport` — stdin/stdout for local clients such as desktop
+  MCP hosts and CLI agents.
 
 A WebSocket transport is planned.
 """

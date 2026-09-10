@@ -52,7 +52,7 @@ Consequences:
   credential that opened them, browsers are held to the `Origin` allowlist,
   and every protection above applies.
 - **stdio** — the client is the *parent process* that launched the server
-  (Claude Desktop, Claude Code, an agent runtime). There is no network
+  (a desktop app, a CLI agent, an agent runtime). There is no network
   surface, but the parent is still treated as an MCP client: schema
   validation, scopes, rate limits, timeouts, payload caps, and error
   sanitization all apply unchanged. Protected tools stay hidden unless the
