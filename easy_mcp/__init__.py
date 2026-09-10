@@ -38,7 +38,7 @@ from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
 from .transport.streamable_http import StreamableHTTPTransport
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = [
     "APIKeyAuth",
