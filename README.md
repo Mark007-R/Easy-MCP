@@ -31,8 +31,8 @@ server.run()
 That's a complete, MCP-compliant server. Connect any MCP client to
 `http://127.0.0.1:8000/mcp` and the `add` tool is discoverable and callable —
 with its JSON schema generated from the type hints and its description taken
-from the docstring. Prefer a local, launch-on-demand server for Claude Desktop
-or Claude Code? Swap the last line for `server.run("stdio")`.
+from the docstring. Prefer a local, launch-on-demand server for a desktop MCP
+host? Swap the last line for `server.run("stdio")`.
 
 ## Installation
 
@@ -111,7 +111,7 @@ The same server object serves every transport; nothing else changes.
 ```python
 server.run()          # HTTP on host:port — Streamable HTTP at /mcp, legacy SSE at /sse
 server.run("sse")     # legacy HTTP + SSE only
-server.run("stdio")   # stdin/stdout — Claude Desktop, `claude mcp add`, local hosts
+server.run("stdio")   # stdin/stdout — desktop apps, CLI agents, local MCP hosts
 ```
 
 **Streamable HTTP** is the MCP spec's current HTTP transport. One endpoint,
@@ -144,7 +144,7 @@ server = MCPServer(allowed_origins=["https://app.example.com"])  # "*" allows an
 Over stdio the MCP host launches your script as a child process and talks
 JSON-RPC over its pipes. Logs go to stderr, and `sys.stdout` is redirected to
 stderr while serving, so a stray `print()` inside a tool cannot corrupt the
-protocol stream. Claude Desktop configuration:
+protocol stream. Most desktop MCP hosts take a config entry like this:
 
 ```json
 {
@@ -245,13 +245,27 @@ SHA-256 fingerprints ever appear):
 ```bash
 # MCP Inspector (interactive UI):
 npx @modelcontextprotocol/inspector      # Streamable HTTP, http://127.0.0.1:8000/mcp
-
-# Claude Code, SSE server already running:
-claude mcp add --transport sse my-server http://127.0.0.1:8000/sse
-
-# Claude Code, stdio (launched on demand; server.py calls server.run("stdio")):
-claude mcp add my-server -- python /path/to/server.py
 ```
+
+From code, any MCP client SDK works. With the official Python SDK (v2):
+
+```python
+import asyncio
+
+from mcp import Client
+
+
+async def main() -> None:
+    async with Client("http://127.0.0.1:8000/mcp") as client:
+        result = await client.call_tool("add", {"a": 2, "b": 3})
+        print(result.content[0].text)  # 5
+
+
+asyncio.run(main())
+```
+
+Stdio servers are started by the MCP host itself, from a config entry like the
+one in [Transports](#transports-streamable-http-sse-or-stdio).
 
 ## Architecture
 
@@ -268,7 +282,7 @@ easy_mcp/
 │   ├── _http.py     shared HTTP plumbing: Origin allowlist, credentials, uvicorn
 │   ├── streamable_http.py  Streamable HTTP transport (/mcp, sessions)
 │   ├── sse.py       legacy HTTP + SSE transport (Starlette/uvicorn)
-│   └── stdio.py     stdin/stdout transport (Claude Desktop, local hosts)
+│   └── stdio.py     stdin/stdout transport (desktop MCP hosts, local agents)
 ├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail
