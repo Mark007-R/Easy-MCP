@@ -118,7 +118,7 @@ class MCPServer:
         host: str = "127.0.0.1",
         *,
         name: str = "easy-mcp",
-        version: str = "0.2.1",
+        version: str = "0.2.2",
         debug: bool = False,
         auth: APIKeyAuth | None = None,
         rate_limit_per_minute: int | None = 120,
