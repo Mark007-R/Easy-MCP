@@ -90,8 +90,8 @@ def build_tool(
     """
     if not callable(fn):
         raise ToolRegistrationError(f"@tool target must be callable, got {type(fn).__name__}")
-    tool_name = name or getattr(fn, "__name__", "")
-    if not _TOOL_NAME_RE.match(tool_name or ""):
+    tool_name: str = name or str(getattr(fn, "__name__", "") or "")
+    if not _TOOL_NAME_RE.match(tool_name):
         raise ToolRegistrationError(
             f"invalid tool name {tool_name!r}: use 1-64 chars [A-Za-z0-9_-], "
             "starting with a letter"

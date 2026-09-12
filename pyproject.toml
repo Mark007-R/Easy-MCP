@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "easy-mcp-kit"
-version = "0.2.2"
+dynamic = ["version"]
 description = "Build secure MCP (Model Context Protocol) servers from plain Python functions."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,6 +30,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Typing :: Typed",
@@ -53,6 +54,9 @@ Homepage = "https://github.com/Mark007-R/Easy-MCP"
 Repository = "https://github.com/Mark007-R/Easy-MCP"
 Issues = "https://github.com/Mark007-R/Easy-MCP/issues"
 Security = "https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md"
+
+[tool.hatch.version]
+path = "easy_mcp/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["easy_mcp"]

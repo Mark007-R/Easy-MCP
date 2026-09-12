@@ -205,3 +205,25 @@ def test_validate_collects_multiple_errors() -> None:
     with pytest.raises(ValidationError) as excinfo:
         validate_arguments({"a": "x", "extra": 1}, _schema_for(fn))
     assert len(excinfo.value.errors) == 3  # wrong type + missing b + unexpected extra
+
+
+def test_validate_integral_float_accepted_and_normalized() -> None:
+    def fn(n: int, xs: list[int], m: dict[str, int], o: int | None = None) -> None: ...
+
+    schema = _schema_for(fn)
+    arguments = {"n": 3.0, "xs": [1, 2.0], "m": {"k": 4.0}, "o": 5.0}
+    normalized = validate_arguments(arguments, schema)
+    assert normalized == {"n": 3, "xs": [1, 2], "m": {"k": 4}, "o": 5}
+    for value in (normalized["n"], normalized["xs"][1], normalized["m"]["k"], normalized["o"]):
+        assert type(value) is int
+    # The caller's mapping is left untouched.
+    assert type(arguments["n"]) is float
+
+
+def test_validate_fractional_float_rejected_for_integer() -> None:
+    def fn(n: int) -> None: ...
+
+    with pytest.raises(ValidationError, match="expected integer"):
+        validate_arguments({"n": 3.5}, _schema_for(fn))
+    with pytest.raises(ValidationError):
+        validate_arguments({"n": float("inf")}, _schema_for(fn))

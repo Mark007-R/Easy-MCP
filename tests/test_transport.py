@@ -181,3 +181,17 @@ def test_transport_auth(live_server) -> None:  # type: ignore[no-untyped-def]
             assert posted.status_code == 202
             reply = json.loads(_next_data(lines))
             assert reply["result"]["content"][0]["text"] == "s3cr3t"
+
+
+def test_sse_session_open_is_rate_limited(live_server) -> None:  # type: ignore[no-untyped-def]
+    server = MCPServer(port=0, rate_limit_per_minute=1)
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=httpx.Timeout(10.0)) as client:
+        with client.stream("GET", "/sse") as first:
+            assert first.status_code == 200
+            # The budget is spent: a second session cannot be opened even
+            # though max_sessions is nowhere near reached.
+            second = client.get("/sse")
+            assert second.status_code == 429
+            assert int(second.headers["Retry-After"]) >= 1
+            assert "Rate limit exceeded" in second.json()["error"]

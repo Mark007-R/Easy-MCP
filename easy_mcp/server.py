@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from ._version import __version__
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     INTERNAL_ERROR,
@@ -93,7 +94,8 @@ class MCPServer:
         host: Interface to bind. Defaults to loopback — exposing the server
             beyond localhost is an explicit decision.
         name: Server name reported during the MCP handshake.
-        version: Server version reported during the MCP handshake.
+        version: Server version reported during the MCP handshake; defaults
+            to the easy_mcp package version.
         debug: When True, clients receive full tracebacks and uvicorn logs
             verbosely. Never enable in production.
         auth: Optional :class:`APIKeyAuth`. Without it, only public tools
@@ -118,7 +120,7 @@ class MCPServer:
         host: str = "127.0.0.1",
         *,
         name: str = "easy-mcp",
-        version: str = "0.2.2",
+        version: str = __version__,
         debug: bool = False,
         auth: APIKeyAuth | None = None,
         rate_limit_per_minute: int | None = 120,
@@ -230,6 +232,20 @@ class MCPServer:
             return None
         return self.auth.authenticate(api_key)
 
+    def check_rate_limit(self, client_id: str) -> None:
+        """Consume one unit of *client_id*'s request budget.
+
+        ``dispatch`` calls this for every message; transports call it for
+        work that happens before any message exists (opening an SSE session)
+        so that path cannot sidestep the budget.
+
+        Raises:
+            RateLimitError: If the client is over budget.  A no-op when rate
+                limiting is disabled.
+        """
+        if self._limiter is not None:
+            self._limiter.check(client_id)
+
     # --------------------------------------------------------------- dispatch
 
     async def dispatch(self, message: Any, context: ClientContext) -> dict[str, Any] | None:
@@ -265,12 +281,11 @@ class MCPServer:
 
         # Rate limiting applies to every method, so discovery endpoints cannot
         # be used to bypass the budget.
-        if self._limiter is not None:
-            try:
-                self._limiter.check(context.client_id)
-            except ProtocolError as exc:
-                audit("rate_limited", client_id=context.client_id, method=method)
-                return None if is_notification else _protocol_error_response(msg_id, exc)
+        try:
+            self.check_rate_limit(context.client_id)
+        except ProtocolError as exc:
+            audit("rate_limited", client_id=context.client_id, method=method)
+            return None if is_notification else _protocol_error_response(msg_id, exc)
 
         try:
             if method == "initialize":
@@ -399,7 +414,7 @@ class MCPServer:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
-            validate_arguments(arguments, definition.input_schema)
+            arguments = validate_arguments(arguments, definition.input_schema)
         except ProtocolError as exc:
             audit(
                 "tool_denied",

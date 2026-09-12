@@ -35,7 +35,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -57,6 +57,9 @@ from ..security.auth import ClientIdentity
 from ._http import BaseHTTPTransport, rpc_error
 from .base import ClientContext
 from .sse import SSETransport
+
+if TYPE_CHECKING:
+    from ..server import MCPServer
 
 SESSION_HEADER = "MCP-Session-Id"
 PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version"
@@ -121,7 +124,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
     def __init__(
         self,
-        server: Any,
+        server: MCPServer,
         *,
         path: str = "/mcp",
         legacy_sse: bool = True,

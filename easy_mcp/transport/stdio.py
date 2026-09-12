@@ -29,11 +29,14 @@ import os
 import secrets
 import sys
 import threading
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
 from ..logging import audit
 from .base import ClientContext, Transport
+
+if TYPE_CHECKING:
+    from ..server import MCPServer
 
 API_KEY_ENV_VAR = "EASY_MCP_STDIO_API_KEY"
 
@@ -64,7 +67,7 @@ class StdioTransport(Transport):
 
     def __init__(
         self,
-        server: Any,
+        server: MCPServer,
         *,
         api_key: str | None = None,
         stdin: BinaryIO | None = None,
