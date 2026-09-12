@@ -15,6 +15,7 @@ Quickstart::
     server.run()
 """
 
+from ._version import __version__
 from .decorators import ToolDefinition
 from .exceptions import (
     AuthenticationError,
@@ -37,8 +38,6 @@ from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
 from .transport.streamable_http import StreamableHTTPTransport
-
-__version__ = "0.2.2"
 
 __all__ = [
     "APIKeyAuth",

@@ -103,6 +103,8 @@ server.unregister_tool("late_tool")
 Anything else is rejected **at registration time** with a clear error — never
 at call time. Validation is strict: booleans are not integers, unknown
 arguments are hard errors, and every violation is reported (not just the first).
+Following JSON Schema, a number with no fractional part (`3.0`) is a valid
+integer; it reaches your function as `int`, so `range(times)` never sees a float.
 
 ### Transports: Streamable HTTP, SSE, or stdio
 
@@ -319,9 +321,13 @@ prefer returning compact structures over huge strings.
 
 ```bash
 pip install -e .[dev]
-pytest            # 95+ tests: schema, dispatch, security, Streamable HTTP, SSE, stdio
+pytest            # 100+ tests: schema, dispatch, security, Streamable HTTP, SSE, stdio
 ruff check .
+mypy easy_mcp
 ```
+
+CI runs the same three commands on Python 3.11 through 3.14. Releases are
+listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

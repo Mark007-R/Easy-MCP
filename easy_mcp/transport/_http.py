@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
@@ -26,6 +26,9 @@ from ..exceptions import FORBIDDEN
 from ..logging import audit
 from ..security.auth import ClientIdentity
 from .base import Transport
+
+if TYPE_CHECKING:
+    from ..server import MCPServer
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
@@ -109,7 +112,7 @@ class OriginGuard:
 class BaseHTTPTransport(Transport):
     """Shared plumbing for transports that uvicorn serves over HTTP."""
 
-    def __init__(self, server: Any) -> None:
+    def __init__(self, server: MCPServer) -> None:
         super().__init__(server)
         self._uvicorn: Any = None
 

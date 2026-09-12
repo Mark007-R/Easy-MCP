@@ -29,14 +29,14 @@ Consequences:
 
 | Threat | Mitigation |
 |---|---|
-| Credential stuffing / key probing | Constant-time key comparison over the full key set (`hmac.compare_digest`); timing does not reveal partial matches |
+| Credential stuffing / key probing | Constant-time comparison of SHA-256 digests over the full key set (`hmac.compare_digest`); timing reveals neither partial matches nor key length |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
 | Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise) |
 | DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
-| Request flooding | Per-client sliding-window rate limiting on every method, including discovery; concurrent session cap (`max_sessions`) |
+| Request flooding | Per-client sliding-window rate limiting on every method, including discovery and opening an SSE session; idle clients are dropped from the limiter so its memory stays bounded; concurrent session cap (`max_sessions`) |
 | Session exhaustion (Streamable HTTP) | Sessions idle past `session_idle_timeout` (default 1 h) expire; `max_sessions` caps live sessions per endpoint (503 beyond it); `DELETE` ends a session early and cancels its running calls |
 | Resource exhaustion via slow tools | Per-tool and server-default timeouts; sync tools run off the event loop so they cannot stall other clients |
 | Information disclosure | Production errors are opaque (`error_id` only); tracebacks stay in server logs; `debug=True` is loudly warned about at startup |

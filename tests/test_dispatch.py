@@ -280,3 +280,28 @@ async def test_cancellation() -> None:
     assert cancel_ack is None
     # Per MCP, a cancelled request produces no response at all.
     assert await asyncio.wait_for(call, timeout=5) is None
+
+
+async def test_integral_float_arguments_reach_the_tool_as_int(app: MCPServer) -> None:
+    @app.tool
+    def repeat(text: str, times: int) -> str:
+        """Repeat text; fails loudly if ``times`` is not an int."""
+        return text * times
+
+    response = await app.dispatch(
+        rpc("tools/call", {"name": "repeat", "arguments": {"text": "ab", "times": 2.0}}),
+        make_context(),
+    )
+    assert response is not None
+    assert response["result"]["isError"] is False
+    assert response["result"]["content"][0]["text"] == "abab"
+
+
+async def test_server_reports_package_version_by_default() -> None:
+    from easy_mcp import __version__
+
+    response = await MCPServer(port=0, rate_limit_per_minute=None).dispatch(
+        rpc("initialize", {"protocolVersion": PROTOCOL_VERSION}), make_context()
+    )
+    assert response is not None
+    assert response["result"]["serverInfo"]["version"] == __version__

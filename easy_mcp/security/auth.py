@@ -2,9 +2,10 @@
 
 Design notes (security-sensitive):
 
-* Key comparison uses :func:`hmac.compare_digest` and always iterates the
-  full key set, so response timing does not reveal whether or where a
-  presented key partially matched.
+* Key comparison uses :func:`hmac.compare_digest` over SHA-256 digests of
+  the keys (fixed length, so timing cannot reveal a key's length either) and
+  always iterates the full key set, so response timing does not reveal
+  whether or where a presented key partially matched.
 * Raw keys never appear in logs or errors — only SHA-256 *fingerprints*.
 * "No key presented" is anonymous (public tools only); "wrong key presented"
   is an outright :class:`AuthenticationError`.
@@ -30,9 +31,13 @@ logger = logging.getLogger("easy_mcp.security")
 MIN_KEY_LENGTH = 16
 
 
+def _digest(key: str) -> bytes:
+    return hashlib.sha256(key.encode()).digest()
+
+
 def fingerprint(key: str) -> str:
     """A short, non-reversible identifier for an API key (safe to log)."""
-    return hashlib.sha256(key.encode()).hexdigest()[:12]
+    return _digest(key).hex()[:12]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +66,7 @@ class APIKeyAuth:
     def __init__(self, keys: Mapping[str, Iterable[str] | str | None]) -> None:
         if not keys:
             raise ValueError("APIKeyAuth requires at least one API key")
-        normalized: dict[str, frozenset[str]] = {}
+        normalized: list[tuple[bytes, str, frozenset[str]]] = []
         for key, scopes in keys.items():
             if not isinstance(key, str) or not key:
                 raise ValueError("API keys must be non-empty strings")
@@ -77,8 +82,8 @@ class APIKeyAuth:
                 scope_set = frozenset({scopes})
             else:
                 scope_set = frozenset(scopes)
-            normalized[key] = scope_set
-        self._keys = normalized
+            normalized.append((_digest(key), fingerprint(key), scope_set))
+        self._keys = tuple(normalized)
 
     @classmethod
     def from_env(cls, var: str = "EASY_MCP_API_KEYS") -> APIKeyAuth:
@@ -114,11 +119,13 @@ class APIKeyAuth:
         if presented is None:
             return None
         matched: ClientIdentity | None = None
+        presented_digest = _digest(presented)
         # Iterate every key even after a match so timing stays independent
-        # of match position (constant-time comparison per key).
-        for key, scopes in self._keys.items():
-            if hmac.compare_digest(key.encode(), presented.encode()):
-                matched = ClientIdentity(fingerprint=fingerprint(key), scopes=scopes)
+        # of match position; digests are fixed-length, so compare_digest is
+        # constant-time regardless of the presented key's length.
+        for digest, key_fingerprint, scopes in self._keys:
+            if hmac.compare_digest(digest, presented_digest):
+                matched = ClientIdentity(fingerprint=key_fingerprint, scopes=scopes)
         if matched is None:
             raise AuthenticationError("Invalid API key")
         return matched

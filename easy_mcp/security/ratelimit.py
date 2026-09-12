@@ -15,7 +15,9 @@ class SlidingWindowRateLimiter:
 
     A true sliding window (per-client deque of timestamps) rather than fixed
     buckets, so a burst straddling a bucket boundary cannot double the
-    effective limit.
+    effective limit.  Clients whose whole history has aged out of the window
+    are forgotten once per window, so memory stays bounded by the number of
+    *recently active* clients rather than every client ever seen.
 
     Args:
         max_requests: Requests allowed per window per client.
@@ -38,7 +40,14 @@ class SlidingWindowRateLimiter:
         self._window = window_seconds
         self._clock = clock
         self._events: dict[str, deque[float]] = {}
+        self._last_sweep = clock()
         self._lock = threading.Lock()
+
+    @property
+    def tracked_clients(self) -> int:
+        """How many clients currently hold rate-limit history."""
+        with self._lock:
+            return len(self._events)
 
     def check(self, client_id: str) -> None:
         """Record one request for *client_id*, or reject it.
@@ -50,6 +59,8 @@ class SlidingWindowRateLimiter:
         now = self._clock()
         cutoff = now - self._window
         with self._lock:
+            if now - self._last_sweep >= self._window:
+                self._sweep(cutoff, now)
             window = self._events.setdefault(client_id, deque())
             while window and window[0] <= cutoff:
                 window.popleft()
@@ -57,6 +68,15 @@ class SlidingWindowRateLimiter:
                 retry_after = max(0.0, window[0] + self._window - now)
                 raise RateLimitError(retry_after)
             window.append(now)
+
+    def _sweep(self, cutoff: float, now: float) -> None:
+        """Drop clients with no request inside the window (lock held)."""
+        idle = [
+            client for client, window in self._events.items() if not window or window[-1] <= cutoff
+        ]
+        for client in idle:
+            del self._events[client]
+        self._last_sweep = now
 
     def reset(self, client_id: str | None = None) -> None:
         """Forget history for one client, or for all clients."""

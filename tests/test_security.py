@@ -222,3 +222,23 @@ def test_error_codes_are_stable() -> None:
     # Public contract: documented codes must not drift between releases.
     assert AUTHENTICATION_REQUIRED == -32001
     assert RATE_LIMITED == -32003
+
+
+def test_authenticate_length_mismatch_rejected() -> None:
+    auth = APIKeyAuth({ADMIN_KEY: "*"})
+    with pytest.raises(AuthenticationError):
+        auth.authenticate(ADMIN_KEY[:-1])
+    with pytest.raises(AuthenticationError):
+        auth.authenticate(ADMIN_KEY + "x")
+
+
+def test_rate_limiter_forgets_idle_clients() -> None:
+    now = [0.0]
+    limiter = SlidingWindowRateLimiter(5, 60.0, clock=lambda: now[0])
+    for index in range(100):
+        limiter.check(f"client-{index}")
+    assert limiter.tracked_clients == 100
+
+    now[0] = 61.0  # every recorded request has aged out of the window
+    limiter.check("fresh")  # triggers the once-per-window sweep
+    assert limiter.tracked_clients == 1

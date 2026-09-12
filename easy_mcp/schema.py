@@ -170,8 +170,13 @@ def build_input_schema(
     }
 
 
-def validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> None:
-    """Validate *arguments* against *schema*.
+def validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Validate *arguments* against *schema* and return them normalized.
+
+    Normalization follows JSON Schema semantics: a float with no fractional
+    part (``3.0``) is a valid ``integer`` and comes back as ``int`` so the
+    tool receives the Python type its annotation promises.  Nothing else is
+    coerced, and the input is never modified in place.
 
     Raises:
         ValidationError: Listing every violation found (not just the first).
@@ -179,6 +184,9 @@ def validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> Non
     errors = _check(arguments, schema, "arguments")
     if errors:
         raise ValidationError(errors)
+    normalized = _normalize(arguments, schema)
+    assert isinstance(normalized, dict)
+    return normalized
 
 
 def _type_ok(value: Any, expected: str) -> bool:
@@ -187,6 +195,10 @@ def _type_ok(value: Any, expected: str) -> bool:
     if expected == "boolean":
         return isinstance(value, bool)
     if expected == "integer":
+        # JSON Schema: a number with a zero fractional part is an integer, so
+        # 3.0 is accepted (and normalized to 3 before the tool runs).
+        if isinstance(value, float):
+            return value.is_integer()
         return isinstance(value, int) and not isinstance(value, bool)
     if expected == "number":
         return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -244,3 +256,36 @@ def _check(value: Any, schema: dict[str, Any], path: str) -> list[str]:
     if not _type_ok(value, expected):
         return [f"{path}: expected {expected}, got {type(value).__name__}"]
     return []
+
+
+def _normalize(value: Any, schema: dict[str, Any]) -> Any:
+    """Return *value* (already validated against *schema*) with integral
+    floats converted to ``int`` wherever the schema asks for an integer."""
+    if "enum" in schema:
+        return value
+    if "anyOf" in schema:
+        for option in schema["anyOf"]:
+            if not _check(value, option, ""):
+                return _normalize(value, option)
+        return value
+    expected = schema.get("type")
+    if expected == "integer" and isinstance(value, float):
+        return int(value)
+    if expected == "array" and isinstance(value, list):
+        items = schema.get("items")
+        if not items:
+            return value
+        return [_normalize(item, items) for item in value]
+    if expected == "object" and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        additional = schema.get("additionalProperties", True)
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in properties:
+                result[key] = _normalize(item, properties[key])
+            elif isinstance(additional, dict):
+                result[key] = _normalize(item, additional)
+            else:
+                result[key] = item
+        return result
+    return value

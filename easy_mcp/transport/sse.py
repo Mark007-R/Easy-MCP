@@ -21,6 +21,9 @@ Security handled here (before anything reaches the dispatcher):
   so a leaked session id alone cannot escalate privileges.
 * Bodies are size-capped while streaming — a lying ``Content-Length`` header
   does not bypass the limit.
+* Opening a session (``GET /sse``) spends the client's rate-limit budget like
+  any message (429 when exhausted), so an anonymous client cannot fill
+  ``max_sessions`` and lock everyone else out.
 """
 
 from __future__ import annotations
@@ -28,19 +31,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import secrets
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from ..exceptions import PARSE_ERROR, AuthenticationError
+from ..exceptions import PARSE_ERROR, AuthenticationError, RateLimitError
 from ..logging import audit
 from ._http import BaseHTTPTransport
 from .base import ClientContext
+
+if TYPE_CHECKING:
+    from ..server import MCPServer
 
 KEEPALIVE_SECONDS = 15.0
 
@@ -63,7 +70,7 @@ class SSETransport(BaseHTTPTransport):
 
     def __init__(
         self,
-        server: Any,
+        server: MCPServer,
         *,
         sse_path: str = "/sse",
         messages_path: str = "/messages",
@@ -115,14 +122,26 @@ class SSETransport(BaseHTTPTransport):
         except AuthenticationError:
             return JSONResponse({"error": "invalid API key"}, status_code=401)
 
+        client_host = request.client.host if request.client else "unknown"
+        client_id = identity.fingerprint if identity else f"ip:{client_host}"
+        # Opening a session costs one request, so session slots cannot be
+        # exhausted faster than the rate limit allows.
+        try:
+            self._server.check_rate_limit(client_id)
+        except RateLimitError as exc:
+            audit("rate_limited", client_id=client_id, method="GET " + self._sse_path)
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=429,
+                headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
+            )
+
         if len(self._sessions) >= self._server.max_sessions:
             return JSONResponse({"error": "too many concurrent sessions"}, status_code=503)
 
         # 192-bit random token: the session id is a bearer capability, it
         # must be unguessable.
         session_id = secrets.token_urlsafe(24)
-        client_host = request.client.host if request.client else "unknown"
-        client_id = identity.fingerprint if identity else f"ip:{client_host}"
         context = ClientContext(client_id=client_id, session_id=session_id, identity=identity)
         session = _Session(
             id=session_id,
