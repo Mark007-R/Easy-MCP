@@ -83,3 +83,8 @@ python_version = "3.11"
 warn_unused_ignores = true
 disallow_untyped_defs = true
 no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# Optional driver behind the [postgres] extra; imported lazily by the connector.
+module = "psycopg"
+ignore_missing_imports = true
