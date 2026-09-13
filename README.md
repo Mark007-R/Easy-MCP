@@ -269,6 +269,50 @@ asyncio.run(main())
 Stdio servers are started by the MCP host itself, from a config entry like the
 one in [Transports](#transports-streamable-http-sse-or-stdio).
 
+## Ready-made connectors
+
+Two servers ship with the package. They are built on the same `@server.tool`
+decorator you use, so everything above (validation, scopes, rate limits,
+timeouts, sanitized errors, audit log) applies to them unchanged.
+
+| Connector | Command | Credential | Tools |
+|---|---|---|---|
+| GitHub | `easy-mcp-github` | `GITHUB_TOKEN` (optional; public data without it) | `list_repos`, `get_repo`, `list_issues`, `get_issue`, `list_pull_requests`, `get_pull_request`, `get_file`, and with `--allow-write`: `create_issue`, `comment_on_issue` |
+| Postgres | `easy-mcp-postgres` | `DATABASE_URL` | `list_schemas`, `list_tables`, `describe_table`, `query` |
+
+```bash
+pip install "easy-mcp-kit[postgres]"   # the GitHub connector needs no extra
+
+GITHUB_TOKEN=github_pat_... easy-mcp-github --transport stdio
+DATABASE_URL=postgresql://user:pass@host/db easy-mcp-postgres --port 8011
+```
+
+Both take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
+and `--debug`, and load API keys from `EASY_MCP_API_KEYS` when it is set.
+`python -m easy_mcp.connectors.github` and `... .postgres` work as well, and
+each module's `build_server(...)` returns a normal `MCPServer` for embedding.
+
+**GitHub** is read-only by default. `--allow-write` registers `create_issue`
+and `comment_on_issue`, which are gated by the `github:write` scope: only a
+client presenting a key that holds it can see or call them, and starting
+with `--allow-write` but no keys is refused. The token is sent only to
+`GITHUB_API_URL` (default `https://api.github.com`) and never appears in logs
+or errors. Use a fine-grained token scoped to the repositories you need.
+
+```bash
+export EASY_MCP_API_KEYS="a-long-random-key:github:write"   # key : scope
+easy-mcp-github --allow-write --transport stdio             # stdio: EASY_MCP_STDIO_API_KEY=a-long-random-key
+```
+
+**Postgres** runs every statement in a `READ ONLY` transaction
+(`default_transaction_read_only=on` is set for the session, so a query cannot
+turn it off) with a statement timeout (`--statement-timeout`, default 10 s)
+and a row cap (`--max-rows`, default 500; `query` returns `truncated: true`
+when it hit the cap). Writes are rejected by the database itself, not by
+parsing SQL. Still connect with a dedicated role holding only `SELECT`
+grants: a read-only transaction does not stop side-effecting functions that
+role is allowed to call.
+
 ## Architecture
 
 ```
@@ -285,6 +329,10 @@ easy_mcp/
 │   ├── streamable_http.py  Streamable HTTP transport (/mcp, sessions)
 │   ├── sse.py       legacy HTTP + SSE transport (Starlette/uvicorn)
 │   └── stdio.py     stdin/stdout transport (desktop MCP hosts, local agents)
+├── connectors/
+│   ├── _cli.py      shared --transport/--host/--port options
+│   ├── github.py    GitHub connector (stdlib HTTP; read-only unless --allow-write)
+│   └── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
 ├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail

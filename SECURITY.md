@@ -60,6 +60,24 @@ Consequences:
   parent can pass as environment it can also read, so a stdio key is a
   scoping mechanism, not a secret from the host itself.
 
+## Ready-made connectors
+
+The connectors are ordinary tool functions and follow the trust model above:
+the client is untrusted, the credential in the environment is trusted.
+
+- **GitHub** — give it a fine-grained token limited to the repositories and
+  permissions the tools need (contents, issues, pull requests: read). Write
+  tools exist only with `--allow-write` and are hidden from every client whose
+  API key lacks the `github:write` scope; starting with `--allow-write` and no
+  keys is refused. The token is sent only to `GITHUB_API_URL` and never logged.
+- **Postgres** — statements run in `READ ONLY` transactions with
+  `default_transaction_read_only=on` at session level, a statement timeout and
+  a row cap, so `INSERT`/`UPDATE`/`DDL` fail at the database. That does not
+  prevent calling side-effecting functions the role may execute, so connect
+  with a role that holds only `SELECT` on the schemas you want exposed.
+  Error messages from the database are forwarded (they are what a client
+  needs to fix its query); the connection string never is.
+
 ## Known limitations (v0.2)
 
 - **Sync tool timeouts are cooperative.** A timed-out or cancelled sync tool's
