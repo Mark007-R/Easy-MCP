@@ -4,7 +4,19 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
-## [Unreleased]
+## [0.2.3] - 2026-09-13
+
+### Added
+
+- Ready-made connectors, each a normal `MCPServer` built with `@server.tool` and
+  launchable with one command:
+  - **GitHub** (`easy-mcp-github`): repositories, issues, pull requests and file
+    contents through a `GITHUB_TOKEN` read from the environment, using only the
+    standard library for HTTP. Read-only by default; `--allow-write` adds
+    `create_issue` and `comment_on_issue`, gated by the `github:write` scope.
+  - **Postgres** (`easy-mcp-postgres`, extra `easy-mcp-kit[postgres]`): schema and
+    table discovery plus `query`, every statement in a `READ ONLY` transaction with
+    a statement timeout and a row cap; `DATABASE_URL` read from the environment.
 
 ### Fixed
 
@@ -70,7 +82,8 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   correlation, structured JSON logs with an audit trail, and the HTTP + SSE
   transport.
 
-[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.1.0...v0.2.0
