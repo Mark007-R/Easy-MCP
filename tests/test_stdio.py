@@ -18,6 +18,7 @@ from easy_mcp import APIKeyAuth, AuthenticationError, MCPServer, StdioTransport
 from easy_mcp.transport.stdio import API_KEY_ENV_VAR
 
 KEY = "stdio-test-key-" + "k" * 17
+WRONG_KEY = "wrong-key-" + "0" * 10
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -160,7 +161,7 @@ async def test_stdio_api_key_from_environment(monkeypatch: pytest.MonkeyPatch) -
 async def test_stdio_invalid_api_key_fails_fast() -> None:
     stdout = io.BytesIO()
     transport = StdioTransport(
-        _auth_server(), api_key="wrong-key-0000000000", stdin=_secret_call(), stdout=stdout
+        _auth_server(), api_key=WRONG_KEY, stdin=_secret_call(), stdout=stdout
     )
     with pytest.raises(AuthenticationError):
         await transport.serve()
