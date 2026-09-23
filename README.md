@@ -49,7 +49,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Concern | What you write | What easy_mcp does |
 |---|---|---|
 | Schemas | Type hints | Generates strict JSON Schema (`additionalProperties: false`) |
-| Descriptions | Docstrings | Parses summary + Google-style `Args:` into tool/param descriptions |
+| Descriptions | Docstrings or `Annotated` | Parses summary + Google-style `Args:` into tool/param descriptions; `Annotated[int, "..."]` documents a parameter in place |
 | Validation | Nothing | Rejects unknown fields, wrong types, missing params — before your code runs |
 | Auth | `auth=APIKeyAuth({...})` | Constant-time key checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
@@ -70,6 +70,14 @@ def word_count(text: str) -> dict[str, int]:
         text: The text to analyze.
     """
     return {"words": len(text.split()), "characters": len(text)}
+
+# Or document a parameter where it is declared, instead of in the docstring.
+# Annotated is plain typing (from typing import Annotated) and the tool still
+# receives an int; where both exist, the annotation wins.
+@server.tool
+def tail_log(lines: Annotated[int, "How many lines to return, newest first"]) -> list[str]:
+    """Read the end of the log."""
+    ...
 
 # With options:
 @server.tool(name="summarize", tags=("stats",), category="math",

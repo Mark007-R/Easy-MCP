@@ -61,6 +61,46 @@ def test_unsupported_annotations_rejected() -> None:
         annotation_to_schema(tuple[int, str])
 
 
+def test_annotated_carries_a_description() -> None:
+    assert annotation_to_schema(typing.Annotated[int, "How many rows"]) == {
+        "type": "integer",
+        "description": "How many rows",
+    }
+    # The wrapped type is still fully understood, not flattened to Any.
+    assert annotation_to_schema(typing.Annotated[list[str], "Tags"]) == {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Tags",
+    }
+    assert annotation_to_schema(typing.Annotated[typing.Literal["asc", "desc"], "Order"]) == {
+        "enum": ["asc", "desc"],
+        "description": "Order",
+    }
+
+
+def test_annotated_nested_inside_a_container() -> None:
+    assert annotation_to_schema(list[typing.Annotated[int, "A row id"]]) == {
+        "type": "array",
+        "items": {"type": "integer", "description": "A row id"},
+    }
+
+
+def test_annotated_ignores_non_string_metadata() -> None:
+    # Markers meant for other libraries must not become the description.
+    marker = object()
+    assert annotation_to_schema(typing.Annotated[int, marker]) == {"type": "integer"}
+    # With several pieces of metadata, the first string wins.
+    assert annotation_to_schema(typing.Annotated[int, marker, "Real one", "Second"]) == {
+        "type": "integer",
+        "description": "Real one",
+    }
+
+
+def test_annotated_still_rejects_unsupported_types() -> None:
+    with pytest.raises(SchemaError):
+        annotation_to_schema(typing.Annotated[set, "Nope"])
+
+
 # ----------------------------------------------------------- input schemas
 
 
@@ -109,6 +149,46 @@ def test_param_descriptions_from_docstring() -> None:
 
     schema = build_input_schema(fn, params)
     assert schema["properties"]["a"]["description"] == "First operand."
+
+
+def test_param_descriptions_from_annotated() -> None:
+    def fn(limit: typing.Annotated[int, "How many rows to return"]) -> int:
+        return limit
+
+    schema = build_input_schema(fn)
+    assert schema["properties"]["limit"] == {
+        "type": "integer",
+        "description": "How many rows to return",
+    }
+
+
+def test_annotated_description_beats_the_docstring() -> None:
+    def fn(a: typing.Annotated[int, "From the annotation"], b: int = 2) -> int:
+        """Add two numbers.
+
+        Args:
+            a: From the docstring.
+            b: Also from the docstring.
+        """
+        return a + b
+
+    _, params = parse_docstring(fn.__doc__)
+    schema = build_input_schema(fn, params)
+    # The annotation travels with the parameter, so it wins...
+    assert schema["properties"]["a"]["description"] == "From the annotation"
+    # ...but the docstring still documents every parameter without one.
+    assert schema["properties"]["b"]["description"] == "Also from the docstring."
+    assert schema["properties"]["b"]["default"] == 2
+
+
+def test_annotated_arguments_validate_as_their_base_type() -> None:
+    def fn(limit: typing.Annotated[int, "How many rows"]) -> int:
+        return limit
+
+    schema = build_input_schema(fn)
+    assert validate_arguments({"limit": 5}, schema) == {"limit": 5}
+    with pytest.raises(ValidationError):
+        validate_arguments({"limit": "five"}, schema)
 
 
 def test_parse_docstring_empty() -> None:
