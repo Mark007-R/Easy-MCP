@@ -57,6 +57,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
 | Crashes | Nothing | One failing tool never takes down the server |
+| Launching | Nothing | `easy-mcp run my_tools:server` serves a module on any transport |
 
 ## Quickstart tour
 
@@ -251,6 +252,28 @@ Authentication works the same way as over SSE, except the credential is the
 `EASY_MCP_STDIO_API_KEY` environment variable (or
 `StdioTransport(server, api_key=...)`) instead of a header. An invalid key
 fails at startup rather than silently downgrading to anonymous access.
+
+### Launching from the command line
+
+A module of `@server.tool` functions does not need a `__main__` block to be
+runnable:
+
+```bash
+easy-mcp run my_tools:server              # Streamable HTTP on the server's own host/port
+easy-mcp run my_tools --transport stdio   # attribute defaults to "server"
+easy-mcp run my_tools:server --host 0.0.0.0 --port 9000
+```
+
+The target is `module:attribute`, resolved from the current directory;
+`my_tools.py:server` works too. The attribute may be a server or a callable
+returning one, so a factory that reads configuration at startup is fine.
+
+`--host`, `--port` and `--debug` override the server's own constructor
+arguments, and only when given — the transport is the one thing you usually
+want to vary per host, since a desktop MCP client wants `stdio` where
+everything else wants HTTP.
+
+Importing a module runs it, so point this only at code you trust.
 
 ### Authentication and per-tool permissions
 

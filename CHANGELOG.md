@@ -49,6 +49,14 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   (`list[User]`), and two different models sharing a class name in one tool.
   Both would need `$defs` hoisted out of an ambiguous position.
 
+- `easy-mcp run my_tools:server`, a command that imports a module and serves the
+  server it defines, so a module of `@server.tool` functions needs no `__main__`
+  block to be launchable. The target resolves from the current directory and
+  `my_tools.py:server` is accepted too; the attribute defaults to `server` and may
+  be a callable returning one. `--transport` picks stdio or HTTP per host, and
+  `--host`, `--port` and `--debug` override the server's own constructor arguments
+  only when given.
+
 ### Fixed
 
 - An `Annotated` parameter's description no longer vanishes from the generated

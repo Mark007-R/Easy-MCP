@@ -53,6 +53,7 @@ dev = [
 ]
 
 [project.scripts]
+easy-mcp = "easy_mcp.cli:main"
 easy-mcp-github = "easy_mcp.connectors.github:main"
 easy-mcp-postgres = "easy_mcp.connectors.postgres:main"
 
