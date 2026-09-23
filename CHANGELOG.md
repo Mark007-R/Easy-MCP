@@ -4,6 +4,18 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Fixed
+
+- `python -m easy_mcp` and `python -m easy_mcp.cli` now run the command. `cli.py`
+  had no `__main__` guard, so `python -m easy_mcp.cli` imported the module and
+  exited without serving anything — silently, which is the worst way for a launch
+  to fail. The console script is a generated `.exe` on Windows and application
+  control sometimes refuses to launch one out of a fresh virtualenv, so `python -m`
+  is the invocation that always works; the ready-made connectors already supported
+  it.
+
 ## [0.2.4] - 2026-09-23
 
 ### Added

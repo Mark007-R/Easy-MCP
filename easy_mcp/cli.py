@@ -132,3 +132,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.debug:
         server.debug = True
     server.run(args.transport)
+
+
+if __name__ == "__main__":
+    main()

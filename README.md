@@ -262,6 +262,7 @@ runnable:
 easy-mcp run my_tools:server              # Streamable HTTP on the server's own host/port
 easy-mcp run my_tools --transport stdio   # attribute defaults to "server"
 easy-mcp run my_tools:server --host 0.0.0.0 --port 9000
+python -m easy_mcp run my_tools:server    # same thing, without the launcher
 ```
 
 The target is `module:attribute`, resolved from the current directory;

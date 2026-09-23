@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import itertools
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,33 @@ def ping() -> str:
     """Say pong."""
     return "pong"
 '''
+
+
+# ---------------------------------------------------- module entry points
+
+
+@pytest.mark.parametrize("target", ["easy_mcp", "easy_mcp.cli"])
+def test_runnable_through_python_m(target: str) -> None:
+    # The console script is a generated .exe on Windows, which application
+    # control sometimes refuses to launch out of a fresh virtualenv; python -m
+    # goes through the interpreter that is already running.
+    result = subprocess.run(
+        [sys.executable, "-m", target, "--version"], capture_output=True, text=True
+    )
+    assert result.returncode == 0
+    assert "easy-mcp-kit" in result.stdout
+
+
+def test_python_m_reports_a_bad_target(tmp_path: Path) -> None:
+    # Proves main() actually runs rather than the module importing and exiting.
+    result = subprocess.run(
+        [sys.executable, "-m", "easy_mcp", "run", "definitely_not_a_module"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 2
+    assert "cannot import" in result.stderr
 
 
 # ----------------------------------------------------------------- targets
