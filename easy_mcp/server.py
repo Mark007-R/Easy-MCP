@@ -33,7 +33,7 @@ from .exceptions import (
 )
 from .logging import audit, configure_logging
 from .protocol import LATEST_PROTOCOL_VERSION, negotiate_protocol_version
-from .schema import validate_arguments, validate_result
+from .schema import build_param_models, dump_model, validate_arguments, validate_result
 from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
 from .security.ratelimit import SlidingWindowRateLimiter
 from .transport._http import BaseHTTPTransport, normalize_origins
@@ -69,9 +69,47 @@ def _tool_failure(text: str) -> dict[str, Any]:
 def _serialize_result(result: Any) -> str:
     if isinstance(result, str):
         return result
+    dump = getattr(result, "model_dump", None)
+    if callable(dump):
+        # A Pydantic model that no output schema covers still serializes as
+        # its data rather than as its repr.
+        try:
+            result = dump(mode="json")
+        except Exception:  # not a Pydantic model after all
+            pass
     # sort_keys keeps output byte-identical for identical inputs, which
     # matters for reproducible agent runs and response caching.
     return json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _render_result(definition: ToolDefinition, result: Any) -> tuple[str, Any | None]:
+    """The text block and the ``structuredContent`` for a tool's return value.
+
+    ``None`` for the second item means the tool advertises no output schema and
+    so sends no structured content.
+
+    Raises:
+        ValidationError: The value does not match the schema the tool published.
+    """
+    if definition.output_model is not None:
+        # The model both checks and serializes, so a tool may return an
+        # instance or any dict the model accepts.
+        structured = dump_model(definition.output_model, result)
+        return _serialize_result(structured), (
+            structured if definition.output_schema is not None else None
+        )
+
+    text = _serialize_result(result)
+    if definition.output_schema is None:
+        return text, None
+    try:
+        # Check and send exactly what the client will parse: a value JSON can
+        # only carry loosely -- a datetime, say -- is judged in its serialized
+        # form, not its richer Python one.
+        structured = json.loads(text)
+    except ValueError:
+        structured = result  # not JSON at all; the check below says so
+    return text, validate_result(structured, definition.output_schema)
 
 
 class MCPServer:
@@ -417,7 +455,8 @@ class MCPServer:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
-            arguments = validate_arguments(arguments, definition.input_schema)
+            arguments = validate_arguments(arguments, definition.arguments_schema)
+            arguments = build_param_models(definition.param_models, arguments)
         except ProtocolError as exc:
             audit(
                 "tool_denied",
@@ -483,46 +522,37 @@ class MCPServer:
             # Production: opaque message only — no exception text, no trace.
             return _tool_failure(f"Tool execution failed (error_id={error_id})")
 
-        text = _serialize_result(result)
+        try:
+            text, structured = _render_result(definition, result)
+        except ValidationError as exc:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error(
+                "tool %r broke its own output schema error_id=%s: %s",
+                name,
+                error_id,
+                "; ".join(exc.errors),
+            )
+            audit(
+                "tool_call",
+                tool=name,
+                client_id=context.client_id,
+                duration_ms=_duration_ms(),
+                status="output_schema_error",
+                error_id=error_id,
+            )
+            # The mismatch describes the server's own data, so it stays in the
+            # log unless the operator asked for detail.
+            detail = f": {'; '.join(exc.errors)}" if self.debug else ""
+            return _tool_failure(
+                f"Tool result did not match its output schema (error_id={error_id}){detail}"
+            )
+
         payload: dict[str, Any] = {
             "content": [{"type": "text", "text": text}],
             "isError": False,
         }
-        if definition.output_schema is not None:
-            try:
-                # Check and send exactly what the client will parse: a value
-                # JSON can only carry loosely -- a datetime, say -- is judged
-                # in its serialized form, not its richer Python one.
-                structured = json.loads(text)
-            except ValueError:
-                structured = result  # not JSON at all; the check below says so
-            try:
-                payload["structuredContent"] = validate_result(
-                    structured, definition.output_schema
-                )
-            except ValidationError as exc:
-                error_id = uuid.uuid4().hex[:12]
-                self._logger.error(
-                    "tool %r broke its own output schema error_id=%s: %s",
-                    name,
-                    error_id,
-                    "; ".join(exc.errors),
-                )
-                audit(
-                    "tool_call",
-                    tool=name,
-                    client_id=context.client_id,
-                    duration_ms=_duration_ms(),
-                    status="output_schema_error",
-                    error_id=error_id,
-                )
-                # The mismatch describes the server's own data, so it stays in
-                # the log unless the operator asked for detail.
-                detail = f": {'; '.join(exc.errors)}" if self.debug else ""
-                return _tool_failure(
-                    f"Tool result did not match its output schema "
-                    f"(error_id={error_id}){detail}"
-                )
+        if structured is not None:
+            payload["structuredContent"] = structured
 
         audit(
             "tool_call",
