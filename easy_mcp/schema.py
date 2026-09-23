@@ -2,7 +2,8 @@
 
 Only a deliberate subset of JSON Schema is generated and validated —
 ``type`` (with strict bool/int separation), ``items``, ``properties`` /
-``required`` / ``additionalProperties``, ``enum`` and ``anyOf``.  Keeping the
+``required`` / ``additionalProperties``, ``enum``, ``anyOf`` and
+``description``.  Keeping the
 validator small and hand-written means there is no third-party dependency in
 the request path and its behavior is easy to audit.
 """
@@ -70,15 +71,40 @@ def parse_docstring(doc: str | None) -> tuple[str, dict[str, str]]:
     return " ".join(summary_parts), params
 
 
+def _unwrap_annotated(annotation: Any) -> tuple[Any, str | None]:
+    """Split ``Annotated[T, ...]`` into ``(T, description)``.
+
+    The description is the first ``str`` in the metadata, so
+    ``Annotated[int, "how many rows"]`` documents a parameter right where it is
+    declared.  Non-string metadata (markers other libraries attach) is ignored,
+    and a plain annotation comes back unchanged alongside ``None``.
+    """
+    metadata = getattr(annotation, "__metadata__", None)
+    if metadata is None:
+        return annotation, None
+    description = next((item for item in metadata if isinstance(item, str)), None)
+    return annotation.__origin__, description
+
+
 def annotation_to_schema(annotation: Any) -> dict[str, Any]:
     """Convert a Python type annotation into a JSON Schema fragment.
 
     Supported: ``str``, ``int``, ``float``, ``bool``, ``list``/``list[T]``,
-    ``dict``/``dict[str, T]``, ``Optional``/unions, ``Literal`` and ``Any``.
+    ``dict``/``dict[str, T]``, ``Optional``/unions, ``Literal`` and ``Any`` --
+    each optionally wrapped in ``Annotated[T, "description"]``, at any depth.
 
     Raises:
         SchemaError: For any annotation outside the supported set.
     """
+    base, description = _unwrap_annotated(annotation)
+    schema = _base_schema(base)
+    if description:
+        schema = {**schema, "description": description}
+    return schema
+
+
+def _base_schema(annotation: Any) -> dict[str, Any]:
+    """``annotation_to_schema`` without the ``Annotated`` unwrapping."""
     if annotation is inspect.Parameter.empty:
         raise SchemaError("parameter is missing a type annotation")
     if annotation is None or annotation is type(None):
@@ -127,11 +153,18 @@ def build_input_schema(
     Every parameter must have a supported type annotation.  ``*args`` /
     ``**kwargs`` and positional-only parameters are rejected because tool
     arguments arrive as a JSON object and are passed by keyword.
+
+    A parameter's description comes from ``Annotated[T, "..."]`` when it has
+    one, and otherwise from *param_docs* (the docstring's ``Args:`` section).
+    The annotation wins because it travels with the parameter -- a docstring
+    entry silently stops applying the moment the parameter is renamed.
     """
     param_docs = param_docs or {}
     signature = inspect.signature(fn)
     try:
-        hints = typing.get_type_hints(fn)
+        # include_extras keeps Annotated metadata: without it the parameter
+        # descriptions are silently stripped before they can be read.
+        hints = typing.get_type_hints(fn, include_extras=True)
     except Exception as exc:  # unresolvable forward references etc.
         raise SchemaError(f"could not resolve type hints: {exc}") from exc
 
@@ -147,7 +180,7 @@ def build_input_schema(
             prop = annotation_to_schema(annotation)
         except SchemaError as exc:
             raise SchemaError(f"parameter '{name}': {exc}") from exc
-        if name in param_docs:
+        if "description" not in prop and name in param_docs:
             prop = {**prop, "description": param_docs[name]}
         if param.default is inspect.Parameter.empty:
             required.append(name)

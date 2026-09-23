@@ -4,6 +4,22 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- Parameter descriptions from `Annotated[T, "description"]`, alongside the
+  docstring's `Args:` section. The annotation sits next to the parameter, so it
+  cannot quietly stop applying when the parameter is renamed; where both exist,
+  the annotation wins. Nested forms such as `list[Annotated[int, "a row id"]]`
+  are described too.
+
+### Fixed
+
+- An `Annotated` parameter's description no longer vanishes from the generated
+  schema. `get_type_hints()` strips annotation metadata unless asked not to, so
+  the text was silently dropped and clients saw an undocumented parameter.
+
 ## [0.2.3] - 2026-09-13
 
 ### Added
