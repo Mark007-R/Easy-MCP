@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .exceptions import SchemaError, ToolRegistrationError
-from .schema import build_input_schema, parse_docstring
+from .schema import build_input_schema, build_output_schema, parse_docstring
 
 logger = logging.getLogger("easy_mcp.registry")
 
@@ -27,6 +27,7 @@ class ToolDefinition:
     fn: Callable[..., Any]
     input_schema: dict[str, Any]
     is_async: bool
+    output_schema: dict[str, Any] | None = None
     requires_auth: bool = False
     scopes: frozenset[str] = frozenset()
     tags: tuple[str, ...] = ()
@@ -42,6 +43,8 @@ class ToolDefinition:
             "description": self.description,
             "inputSchema": self.input_schema,
         }
+        if self.output_schema is not None:
+            entry["outputSchema"] = self.output_schema
         meta: dict[str, Any] = {}
         if self.tags:
             meta["tags"] = list(self.tags)
@@ -60,6 +63,7 @@ def build_tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    output_schema: dict[str, Any] | None = None,
     requires_auth: bool = False,
     scopes: Iterable[str] = (),
     tags: Iterable[str] = (),
@@ -75,6 +79,9 @@ def build_tool(
         name: Override for the tool name (defaults to ``fn.__name__``).
         description: Override for the description (defaults to the docstring
             summary line).
+        output_schema: Override for the output schema.  By default one is
+            derived from the return annotation when it describes a JSON
+            object; pass ``{}`` to advertise none at all.
         requires_auth: Mark the tool as callable only by authenticated clients.
         scopes: Scopes an API key must hold to call the tool.  A non-empty
             value implies ``requires_auth``.
@@ -116,6 +123,19 @@ def build_tool(
     except SchemaError as exc:
         raise ToolRegistrationError(f"cannot register tool {tool_name!r}: {exc}") from exc
 
+    if output_schema is None:
+        result_schema = build_output_schema(fn)
+    elif not output_schema:
+        result_schema = None  # explicit opt-out
+    elif output_schema.get("type") != "object":
+        # structuredContent is a JSON object; advertising anything else would
+        # promise clients something the protocol cannot carry.
+        raise ToolRegistrationError(
+            f"cannot register tool {tool_name!r}: output_schema must describe an object"
+        )
+    else:
+        result_schema = output_schema
+
     scope_set = frozenset(scopes)
     return ToolDefinition(
         name=tool_name,
@@ -123,6 +143,7 @@ def build_tool(
         fn=fn,
         input_schema=input_schema,
         is_async=inspect.iscoroutinefunction(fn),
+        output_schema=result_schema,
         # A scope requirement implies the tool is protected.
         requires_auth=bool(requires_auth or scope_set),
         scopes=scope_set,

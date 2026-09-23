@@ -203,6 +203,47 @@ def build_input_schema(
     }
 
 
+def build_output_schema(fn: Callable[..., Any]) -> dict[str, Any] | None:
+    """The JSON Schema for *fn*'s return value, or ``None`` when it has none.
+
+    MCP carries structured results in ``structuredContent``, which is a JSON
+    *object*, so only a return annotation that maps to an object earns an
+    ``outputSchema`` -- ``dict[str, int]`` does, ``str`` and ``list[int]`` do
+    not and keep their text-only result.
+
+    A missing or unsupported return annotation is not an error here.  Return
+    types were never validated before, so raising would unregister tools that
+    have worked since 0.1; they simply go without an output schema.
+    """
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception:
+        return None
+    annotation = hints.get("return", inspect.Parameter.empty)
+    if annotation is inspect.Parameter.empty:
+        return None
+    try:
+        schema = annotation_to_schema(annotation)
+    except SchemaError:
+        return None
+    return schema if schema.get("type") == "object" else None
+
+
+def validate_result(result: Any, schema: dict[str, Any]) -> Any:
+    """Validate a tool's return value against its output schema.
+
+    The MCP spec is emphatic that a server "MUST provide structured results
+    that conform to this schema", so this runs before the value is sent.
+
+    Raises:
+        ValidationError: Listing every violation found.
+    """
+    errors = _check(result, schema, "result")
+    if errors:
+        raise ValidationError(errors, message="Invalid tool result")
+    return _normalize(result, schema)
+
+
 def validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
     """Validate *arguments* against *schema* and return them normalized.
 

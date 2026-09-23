@@ -14,6 +14,23 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   the annotation wins. Nested forms such as `list[Annotated[int, "a row id"]]`
   are described too.
 
+- Structured tool results. A tool whose return annotation describes a JSON object
+  now publishes an `outputSchema` in `tools/list` and answers with
+  `structuredContent` alongside the existing text block, which the spec keeps for
+  older clients. `output_schema={...}` declares one by hand and `output_schema={}`
+  opts out.
+
+  Only object-shaped returns qualify, because `structuredContent` is a JSON
+  object; `-> str` and `-> list[int]` tools are untouched. A missing or
+  unsupported return annotation is not an error -- return types were never
+  validated before, so tools that have worked since 0.1 keep working, just
+  without a schema.
+
+  Results are validated against the schema before they are sent, since the spec
+  requires a server to honour the shape it advertised. A tool that breaks its own
+  contract fails the call with an `error_id`; the offending data goes to the log,
+  not to the client.
+
 ### Fixed
 
 - An `Annotated` parameter's description no longer vanishes from the generated

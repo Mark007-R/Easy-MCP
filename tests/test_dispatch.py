@@ -47,6 +47,11 @@ def app() -> MCPServer:
         """Fails with a safe, intentional message."""
         raise ToolError("upstream service unavailable")
 
+    @server.tool
+    def mislabeled() -> dict[str, int]:
+        """Promises an object of integers and returns a list."""
+        return [1, 2, 3]  # type: ignore[return-value]
+
     return server
 
 
@@ -110,7 +115,14 @@ async def test_malformed_envelope(app: MCPServer) -> None:
 async def test_tools_list(app: MCPServer) -> None:
     response = await app.dispatch(rpc("tools/list"), make_context())
     tools = response["result"]["tools"]
-    assert [t["name"] for t in tools] == ["add", "boom", "greet", "polite_error", "report"]
+    assert [t["name"] for t in tools] == [
+        "add",
+        "boom",
+        "greet",
+        "mislabeled",
+        "polite_error",
+        "report",
+    ]
     add_tool = tools[0]
     assert add_tool["description"] == "Add two integers."
     assert add_tool["inputSchema"]["required"] == ["a", "b"]
@@ -140,6 +152,37 @@ async def test_result_serialization_is_deterministic(app: MCPServer) -> None:
     text = response["result"]["content"][0]["text"]
     assert text == '{"alpha": 1, "beta": 2}'
     assert json.loads(text) == {"alpha": 1, "beta": 2}
+
+
+async def test_structured_content_accompanies_the_text_block(app: MCPServer) -> None:
+    response = await app.dispatch(
+        rpc("tools/call", {"name": "report", "arguments": {}}), make_context()
+    )
+    result = response["result"]
+    assert result["structuredContent"] == {"alpha": 1, "beta": 2}
+    # The spec asks for the serialized JSON in a text block as well, so older
+    # clients that ignore structuredContent still see the data.
+    assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+
+
+async def test_no_structured_content_without_an_output_schema(app: MCPServer) -> None:
+    response = await app.dispatch(
+        rpc("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}}), make_context()
+    )
+    assert "structuredContent" not in response["result"]
+
+
+async def test_result_breaking_the_output_schema_is_an_error(app: MCPServer) -> None:
+    response = await app.dispatch(
+        rpc("tools/call", {"name": "mislabeled", "arguments": {}}), make_context()
+    )
+    result = response["result"]
+    assert result["isError"] is True
+    assert "structuredContent" not in result
+    text = result["content"][0]["text"]
+    assert "output schema" in text and "error_id=" in text
+    # The offending data stays in the log, not in the client's hands.
+    assert "1, 2, 3" not in text
 
 
 async def test_call_unknown_tool(app: MCPServer) -> None:
