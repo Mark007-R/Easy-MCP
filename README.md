@@ -51,6 +51,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Schemas | Type hints | Generates strict JSON Schema (`additionalProperties: false`) |
 | Descriptions | Docstrings or `Annotated` | Parses summary + Google-style `Args:` into tool/param descriptions; `Annotated[int, "..."]` documents a parameter in place |
 | Validation | Nothing | Rejects unknown fields, wrong types, missing params — before your code runs |
+| Structured results | A return type | Publishes `outputSchema` and answers with `structuredContent` |
 | Auth | `auth=APIKeyAuth({...})` | Constant-time key checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
@@ -113,6 +114,41 @@ at call time. Validation is strict: booleans are not integers, unknown
 arguments are hard errors, and every violation is reported (not just the first).
 Following JSON Schema, a number with no fractional part (`3.0`) is a valid
 integer; it reaches your function as `int`, so `range(times)` never sees a float.
+
+### Structured results
+
+A tool whose return annotation describes a JSON object publishes an
+`outputSchema`, and its results carry `structuredContent` so clients get typed
+data instead of a string they have to parse:
+
+```python
+@server.tool
+def weather(city: str) -> dict[str, float]:
+    """Get current weather."""
+    return {"temperature": 22.5, "humidity": 65}
+```
+
+```jsonc
+// tools/call result
+{
+  "content": [{"type": "text", "text": "{\"humidity\": 65, \"temperature\": 22.5}"}],
+  "structuredContent": {"humidity": 65, "temperature": 22.5},
+  "isError": false
+}
+```
+
+The text block stays for clients that predate structured content — the spec
+asks for both, and they always hold the same data.
+
+MCP carries structured content as a JSON *object*, so only object-shaped
+returns get a schema; `-> str` and `-> list[int]` tools are unchanged. A
+missing or unsupported return annotation is not an error, it just means no
+schema. Pass `output_schema={...}` to declare one yourself, or
+`output_schema={}` to advertise none.
+
+Because the schema is a promise to clients, results are checked against it
+before they are sent. A tool that breaks its own contract fails the call with
+an `error_id` rather than shipping data that does not match.
 
 ### Transports: Streamable HTTP, SSE, or stdio
 

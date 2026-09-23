@@ -10,8 +10,10 @@ from easy_mcp.exceptions import SchemaError, ValidationError
 from easy_mcp.schema import (
     annotation_to_schema,
     build_input_schema,
+    build_output_schema,
     parse_docstring,
     validate_arguments,
+    validate_result,
 )
 
 # ------------------------------------------------------- annotation mapping
@@ -194,6 +196,58 @@ def test_annotated_arguments_validate_as_their_base_type() -> None:
 def test_parse_docstring_empty() -> None:
     assert parse_docstring(None) == ("", {})
     assert parse_docstring("") == ("", {})
+
+
+# ---------------------------------------------------------- output schemas
+
+
+def test_output_schema_from_an_object_return() -> None:
+    def fn() -> dict[str, int]:
+        return {}
+
+    assert build_output_schema(fn) == {
+        "type": "object",
+        "additionalProperties": {"type": "integer"},
+    }
+
+
+def test_output_schema_only_for_objects() -> None:
+    # structuredContent is a JSON object, so nothing else earns a schema.
+    def returns_str() -> str:
+        return ""
+
+    def returns_list() -> list[int]:
+        return []
+
+    assert build_output_schema(returns_str) is None
+    assert build_output_schema(returns_list) is None
+
+
+def test_output_schema_absent_rather_than_fatal() -> None:
+    # Return types were never validated before, so an unannotated or
+    # unsupported one must not stop a tool registering.
+    def unannotated():  # type: ignore[no-untyped-def]
+        return {}
+
+    def unsupported() -> set:
+        return set()
+
+    assert build_output_schema(unannotated) is None
+    assert build_output_schema(unsupported) is None
+
+
+def test_validate_result_accepts_and_normalizes() -> None:
+    schema = {"type": "object", "additionalProperties": {"type": "integer"}}
+    assert validate_result({"a": 1}, schema) == {"a": 1}
+    # Same JSON Schema rule as arguments: 3.0 is a valid integer.
+    assert validate_result({"a": 3.0}, schema) == {"a": 3}
+
+
+def test_validate_result_rejects_a_mismatch() -> None:
+    schema = {"type": "object", "additionalProperties": {"type": "integer"}}
+    with pytest.raises(ValidationError) as excinfo:
+        validate_result([1, 2], schema)
+    assert "result" in str(excinfo.value)
 
 
 # -------------------------------------------------------------- validation

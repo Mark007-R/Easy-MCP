@@ -64,14 +64,14 @@ class ProtocolError(EasyMCPError):
 
 
 class ValidationError(ProtocolError):
-    """Tool arguments failed schema validation."""
+    """Tool arguments -- or a tool's own result -- failed schema validation."""
 
     code = INVALID_PARAMS
 
-    def __init__(self, errors: list[str]) -> None:
+    def __init__(self, errors: list[str], *, message: str = "Invalid tool arguments") -> None:
         self.errors = list(errors)
         super().__init__(
-            "Invalid tool arguments: " + "; ".join(self.errors),
+            f"{message}: " + "; ".join(self.errors),
             data={"errors": self.errors},
         )
 

@@ -21,6 +21,63 @@ def test_bare_decorator(server: MCPServer) -> None:
     assert definition.input_schema["required"] == ["a", "b"]
 
 
+def test_output_schema_from_the_return_annotation(server: MCPServer) -> None:
+    @server.tool
+    def weather(city: str) -> dict[str, float]:
+        """Get weather."""
+        return {"temperature": 22.5}
+
+    (definition,) = server.tools
+    assert definition.output_schema == {
+        "type": "object",
+        "additionalProperties": {"type": "number"},
+    }
+    assert definition.to_mcp()["outputSchema"] == definition.output_schema
+
+
+def test_no_output_schema_for_a_text_tool(server: MCPServer) -> None:
+    @server.tool
+    def greet(name: str) -> str:
+        """Greet someone."""
+        return name
+
+    (definition,) = server.tools
+    assert definition.output_schema is None
+    assert "outputSchema" not in definition.to_mcp()
+
+
+def test_explicit_output_schema_overrides_the_annotation(server: MCPServer) -> None:
+    explicit = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+
+    @server.tool(output_schema=explicit)
+    def check() -> dict[str, bool]:
+        """Check something."""
+        return {"ok": True}
+
+    (definition,) = server.tools
+    assert definition.output_schema == explicit
+
+
+def test_empty_output_schema_opts_out(server: MCPServer) -> None:
+    @server.tool(output_schema={})
+    def quiet() -> dict[str, int]:
+        """Advertise no output schema."""
+        return {"a": 1}
+
+    (definition,) = server.tools
+    assert definition.output_schema is None
+
+
+def test_output_schema_must_describe_an_object(server: MCPServer) -> None:
+    # structuredContent is an object; promising an array would be a lie.
+    with pytest.raises(ToolRegistrationError, match="must describe an object"):
+
+        @server.tool(output_schema={"type": "array"})
+        def listy() -> list[int]:
+            """Return a list."""
+            return []
+
+
 def test_decorator_with_options(server: MCPServer) -> None:
     @server.tool(
         name="sum_two",

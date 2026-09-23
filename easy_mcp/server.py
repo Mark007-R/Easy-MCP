@@ -29,10 +29,11 @@ from .exceptions import (
     ProtocolError,
     SessionLimitError,
     ToolError,
+    ValidationError,
 )
 from .logging import audit, configure_logging
 from .protocol import LATEST_PROTOCOL_VERSION, negotiate_protocol_version
-from .schema import validate_arguments
+from .schema import validate_arguments, validate_result
 from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
 from .security.ratelimit import SlidingWindowRateLimiter
 from .transport._http import BaseHTTPTransport, normalize_origins
@@ -166,6 +167,7 @@ class MCPServer:
         *,
         name: str | None = None,
         description: str | None = None,
+        output_schema: dict[str, Any] | None = None,
         requires_auth: bool = False,
         scopes: Iterable[str] = (),
         tags: Iterable[str] = (),
@@ -186,6 +188,7 @@ class MCPServer:
                 target,
                 name=name,
                 description=description,
+                output_schema=output_schema,
                 requires_auth=requires_auth,
                 scopes=scopes,
                 tags=tags,
@@ -480,6 +483,47 @@ class MCPServer:
             # Production: opaque message only — no exception text, no trace.
             return _tool_failure(f"Tool execution failed (error_id={error_id})")
 
+        text = _serialize_result(result)
+        payload: dict[str, Any] = {
+            "content": [{"type": "text", "text": text}],
+            "isError": False,
+        }
+        if definition.output_schema is not None:
+            try:
+                # Check and send exactly what the client will parse: a value
+                # JSON can only carry loosely -- a datetime, say -- is judged
+                # in its serialized form, not its richer Python one.
+                structured = json.loads(text)
+            except ValueError:
+                structured = result  # not JSON at all; the check below says so
+            try:
+                payload["structuredContent"] = validate_result(
+                    structured, definition.output_schema
+                )
+            except ValidationError as exc:
+                error_id = uuid.uuid4().hex[:12]
+                self._logger.error(
+                    "tool %r broke its own output schema error_id=%s: %s",
+                    name,
+                    error_id,
+                    "; ".join(exc.errors),
+                )
+                audit(
+                    "tool_call",
+                    tool=name,
+                    client_id=context.client_id,
+                    duration_ms=_duration_ms(),
+                    status="output_schema_error",
+                    error_id=error_id,
+                )
+                # The mismatch describes the server's own data, so it stays in
+                # the log unless the operator asked for detail.
+                detail = f": {'; '.join(exc.errors)}" if self.debug else ""
+                return _tool_failure(
+                    f"Tool result did not match its output schema "
+                    f"(error_id={error_id}){detail}"
+                )
+
         audit(
             "tool_call",
             tool=name,
@@ -487,10 +531,7 @@ class MCPServer:
             duration_ms=_duration_ms(),
             status="ok",
         )
-        return {
-            "content": [{"type": "text", "text": _serialize_result(result)}],
-            "isError": False,
-        }
+        return payload
 
     # -------------------------------------------------------------- lifecycle
 
