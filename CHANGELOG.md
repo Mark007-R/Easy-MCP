@@ -4,7 +4,7 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
-## [Unreleased]
+## [0.2.5] - 2026-09-23
 
 ### Fixed
 
@@ -153,7 +153,8 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   correlation, structured JSON logs with an audit trail, and the HTTP + SSE
   transport.
 
-[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.1...v0.2.2
