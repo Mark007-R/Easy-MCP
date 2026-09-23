@@ -7,11 +7,18 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .exceptions import SchemaError, ToolRegistrationError
-from .schema import build_input_schema, build_output_schema, parse_docstring
+from .schema import (
+    build_input_schema,
+    build_output_schema,
+    build_validation_schema,
+    collect_param_models,
+    output_model,
+    parse_docstring,
+)
 
 logger = logging.getLogger("easy_mcp.registry")
 
@@ -28,6 +35,16 @@ class ToolDefinition:
     input_schema: dict[str, Any]
     is_async: bool
     output_schema: dict[str, Any] | None = None
+    param_models: Mapping[str, Any] = field(default_factory=dict)
+    output_model: Any | None = None
+    #: What arguments are validated against.  Same as ``input_schema`` unless
+    #: Pydantic models are involved, which validate themselves.
+    validation_schema: dict[str, Any] | None = None
+
+    @property
+    def arguments_schema(self) -> dict[str, Any]:
+        """The schema arguments are checked against before the tool runs."""
+        return self.validation_schema or self.input_schema
     requires_auth: bool = False
     scopes: frozenset[str] = frozenset()
     tags: tuple[str, ...] = ()
@@ -123,6 +140,8 @@ def build_tool(
     except SchemaError as exc:
         raise ToolRegistrationError(f"cannot register tool {tool_name!r}: {exc}") from exc
 
+    param_models = collect_param_models(fn)
+    result_model = output_model(fn)
     if output_schema is None:
         result_schema = build_output_schema(fn)
     elif not output_schema:
@@ -144,6 +163,9 @@ def build_tool(
         input_schema=input_schema,
         is_async=inspect.iscoroutinefunction(fn),
         output_schema=result_schema,
+        param_models=param_models,
+        output_model=result_model,
+        validation_schema=build_validation_schema(input_schema, param_models),
         # A scope requirement implies the tool is protected.
         requires_auth=bool(requires_auth or scope_set),
         scopes=scope_set,

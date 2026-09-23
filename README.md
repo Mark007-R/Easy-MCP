@@ -52,6 +52,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Descriptions | Docstrings or `Annotated` | Parses summary + Google-style `Args:` into tool/param descriptions; `Annotated[int, "..."]` documents a parameter in place |
 | Validation | Nothing | Rejects unknown fields, wrong types, missing params — before your code runs |
 | Structured results | A return type | Publishes `outputSchema` and answers with `structuredContent` |
+| Rich schemas | A Pydantic model (optional) | The model's own schema and validation, for parameters and results |
 | Auth | `auth=APIKeyAuth({...})` | Constant-time key checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
@@ -149,6 +150,48 @@ schema. Pass `output_schema={...}` to declare one yourself, or
 Because the schema is a promise to clients, results are checked against it
 before they are sent. A tool that breaks its own contract fails the call with
 an `error_id` rather than shipping data that does not match.
+
+### Pydantic models (optional)
+
+For a parameter too complex for a plain type hint, annotate it with a Pydantic
+v2 model. Install it with `pip install "easy-mcp-kit[pydantic]"`; easy_mcp
+never imports Pydantic itself, so projects that skip it pay nothing.
+
+```python
+class Address(BaseModel):
+    city: str
+    zip_code: str | None = None
+
+class User(BaseModel):
+    name: str = Field(min_length=1)
+    age: int
+    home: Address
+
+@server.tool
+def save_user(user: User) -> Saved:
+    """Save a user.
+
+    Args:
+        user: The person to store.
+    """
+    return Saved(id=7, label=user.name)
+```
+
+Clients receive the model's own JSON Schema — constraints like `minLength`
+included — and the tool receives a validated `User` instance, not a dict. A
+model return type becomes the `outputSchema`, and the tool may return either an
+instance or any dict the model accepts.
+
+Pydantic does the validating inside a model rather than the built-in validator,
+so you get every error it finds instead of the first one a weaker second copy
+of its rules would hit. The outer guarantees are unchanged: unknown top-level
+arguments are still a hard error.
+
+Two limits worth knowing. A model must be a whole parameter or return type —
+`list[User]` is refused at registration, because a model brings `$defs` and
+hoisting those out of an arbitrary nesting depth is ambiguous; wrap it in a
+model instead. And two different models that share a class name in one tool are
+refused for the same reason: their definitions would collide.
 
 ### Transports: Streamable HTTP, SSE, or stdio
 

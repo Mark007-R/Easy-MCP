@@ -31,6 +31,24 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   contract fails the call with an `error_id`; the offending data goes to the log,
   not to the client.
 
+- Optional Pydantic v2 support for complex parameters and results, via the new
+  `easy-mcp-kit[pydantic]` extra. A parameter annotated with a model advertises
+  the model's own JSON Schema, constraints included, and reaches the tool as a
+  validated instance; a model return type becomes the `outputSchema`, and the
+  tool may return an instance or any dict the model accepts.
+
+  Pydantic validates the inside of a model rather than the built-in validator,
+  so a client sees every violation Pydantic finds instead of the first one a
+  weaker second copy of its rules would hit. Unknown top-level arguments are
+  still refused as before.
+
+  `easy_mcp` never imports Pydantic -- models are recognised by duck typing --
+  so projects that do not use it neither pay for the import nor install it.
+
+  Two cases are refused at registration: a model nested inside another type
+  (`list[User]`), and two different models sharing a class name in one tool.
+  Both would need `$defs` hoisted out of an ambiguous position.
+
 ### Fixed
 
 - An `Annotated` parameter's description no longer vanishes from the generated

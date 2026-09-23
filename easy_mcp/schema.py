@@ -15,7 +15,7 @@ import json
 import re
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from .exceptions import SchemaError, ValidationError
@@ -120,6 +120,14 @@ def _base_schema(annotation: Any) -> dict[str, Any]:
             return {"type": "array"}
         if annotation is dict:
             return {"type": "object"}
+        if is_pydantic_model(annotation):
+            # Reachable only from inside another type, e.g. list[User]: a model
+            # brings $defs, and hoisting those out of an arbitrary nesting depth
+            # is not worth the ambiguity.  Wrapping it in a model is the fix.
+            raise SchemaError(
+                f"Pydantic model {annotation.__name__!r} must be a whole parameter or "
+                "return type, not nested inside another type"
+            )
         raise SchemaError(f"unsupported type annotation: {annotation!r}")
     if origin is list:
         args = typing.get_args(annotation)
@@ -143,6 +151,129 @@ def _base_schema(annotation: Any) -> dict[str, Any]:
                 raise SchemaError(f"Literal values must be JSON scalars, got {value!r}")
         return {"enum": values}
     raise SchemaError(f"unsupported type annotation: {annotation!r}")
+
+
+def is_pydantic_model(annotation: Any) -> bool:
+    """True for a Pydantic v2 model class.
+
+    Deliberately duck-typed: easy_mcp never imports Pydantic, so projects that
+    do not use it neither pay for the import nor have to install it.
+    """
+    return (
+        isinstance(annotation, type)
+        and hasattr(annotation, "model_json_schema")
+        and hasattr(annotation, "model_validate")
+        and hasattr(annotation, "model_dump")
+    )
+
+
+def model_schema(model: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(schema, defs)`` for a Pydantic model, with ``$defs`` split off.
+
+    Pydantic writes ``{"$ref": "#/$defs/Address"}`` for a nested model, and
+    that pointer resolves from the root of whatever document it lands in.  As
+    one property of a tool's input schema the root is the *tool's* schema, so
+    the definitions have to move up there for the pointers to still resolve.
+    """
+    schema = dict(model.model_json_schema())
+    return schema, dict(schema.pop("$defs", {}))
+
+
+def collect_param_models(fn: Callable[..., Any]) -> dict[str, Any]:
+    """Parameters of *fn* annotated with a Pydantic model, by name."""
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception:
+        return {}
+    models: dict[str, Any] = {}
+    for name, param in inspect.signature(fn).parameters.items():
+        base, _ = _unwrap_annotated(hints.get(name, param.annotation))
+        if is_pydantic_model(base):
+            models[name] = base
+    return models
+
+
+def _pydantic_errors(prefix: str, exc: Exception) -> list[str]:
+    """Pydantic's error list flattened into this package's message style."""
+    details = getattr(exc, "errors", None)
+    if not callable(details):
+        return [f"{prefix}: {exc}"]
+    messages = []
+    for error in details():
+        location = ".".join(str(part) for part in error.get("loc", ()))
+        path = f"{prefix}.{location}" if location else prefix
+        messages.append(f"{path}: {error.get('msg', 'invalid value')}")
+    return messages or [f"{prefix}: invalid value"]
+
+
+def build_validation_schema(
+    input_schema: dict[str, Any], param_models: Mapping[str, Any]
+) -> dict[str, Any]:
+    """*input_schema* with every model-typed property loosened to a bare object.
+
+    Clients are still shown the model's precise schema; this is only what the
+    hand-written validator runs against.  Pydantic owns the inside of a model,
+    and checking it here too would report a subset of Pydantic's findings and
+    stop before Pydantic could report the rest -- so a client would see one
+    error where there were three.
+    """
+    if not param_models:
+        return input_schema
+    properties = dict(input_schema.get("properties", {}))
+    for name in param_models:
+        prop = properties.get(name)
+        if prop is None:
+            continue
+        loose: dict[str, Any] = {"type": "object"}
+        if "description" in prop:
+            loose["description"] = prop["description"]
+        properties[name] = loose
+    return {**input_schema, "properties": properties}
+
+
+def build_param_models(
+    models: Mapping[str, Any], arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace model-typed arguments with model instances.
+
+    The hand-written validator has already confirmed each one is an object;
+    Pydantic does the deep check, because re-implementing its constraints here
+    would be a second, weaker copy of rules it already enforces.
+
+    Raises:
+        ValidationError: With Pydantic's own messages, in this package's shape.
+    """
+    if not models:
+        return arguments
+    built = dict(arguments)
+    errors: list[str] = []
+    for name, model in models.items():
+        if name not in built:
+            continue  # optional parameter left out: the default applies
+        try:
+            built[name] = model.model_validate(built[name])
+        except Exception as exc:  # pydantic.ValidationError, which we cannot import
+            errors.extend(_pydantic_errors(f"arguments.{name}", exc))
+    if errors:
+        raise ValidationError(errors)
+    return built
+
+
+def dump_model(model: Any, result: Any) -> Any:
+    """A tool's return value as JSON-ready data, checked by its own model.
+
+    Accepts an instance or anything the model can validate, so a tool may
+    return a plain dict and still honour the schema it advertised.
+
+    Raises:
+        ValidationError: If the value does not fit the model.
+    """
+    try:
+        return model.model_validate(result).model_dump(mode="json")
+    except Exception as exc:
+        raise ValidationError(
+            _pydantic_errors("result", exc), message="Invalid tool result"
+        ) from exc
 
 
 def build_input_schema(
@@ -170,18 +301,33 @@ def build_input_schema(
 
     properties: dict[str, Any] = {}
     required: list[str] = []
+    defs: dict[str, Any] = {}
     for name, param in signature.parameters.items():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             raise SchemaError("*args/**kwargs parameters are not supported")
         if param.kind is inspect.Parameter.POSITIONAL_ONLY:
             raise SchemaError("positional-only parameters are not supported")
         annotation = hints.get(name, param.annotation)
-        try:
-            prop = annotation_to_schema(annotation)
-        except SchemaError as exc:
-            raise SchemaError(f"parameter '{name}': {exc}") from exc
-        if "description" not in prop and name in param_docs:
-            prop = {**prop, "description": param_docs[name]}
+        base, annotated_description = _unwrap_annotated(annotation)
+        model_description: str | None = None
+        if is_pydantic_model(base):
+            prop, model_defs = model_schema(base)
+            for key, value in model_defs.items():
+                if defs.setdefault(key, value) != value:
+                    raise SchemaError(
+                        f"parameter '{name}': two different models are named {key!r}"
+                    )
+            # A model's own docstring describes the type, not this parameter's
+            # role, so it ranks below both other sources.
+            model_description = prop.pop("description", None)
+        else:
+            try:
+                prop = annotation_to_schema(annotation)
+            except SchemaError as exc:
+                raise SchemaError(f"parameter '{name}': {exc}") from exc
+        description = annotated_description or param_docs.get(name) or model_description
+        if description:
+            prop = {**prop, "description": description}
         if param.default is inspect.Parameter.empty:
             required.append(name)
         else:
@@ -195,12 +341,17 @@ def build_input_schema(
 
     # additionalProperties: false makes unknown fields a hard error — clients
     # cannot smuggle unexpected arguments into a tool call.
-    return {
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": False,
     }
+    if defs:
+        # Hoisted out of the models above so their "#/$defs/..." pointers
+        # resolve against this document, which is now their root.
+        schema["$defs"] = defs
+    return schema
 
 
 def build_output_schema(fn: Callable[..., Any]) -> dict[str, Any] | None:
@@ -222,11 +373,26 @@ def build_output_schema(fn: Callable[..., Any]) -> dict[str, Any] | None:
     annotation = hints.get("return", inspect.Parameter.empty)
     if annotation is inspect.Parameter.empty:
         return None
+    base, _ = _unwrap_annotated(annotation)
+    if is_pydantic_model(base):
+        # Here the model's schema is the whole document, so its own $defs stay
+        # put and the pointers into them already resolve.
+        return dict(base.model_json_schema())
     try:
         schema = annotation_to_schema(annotation)
     except SchemaError:
         return None
     return schema if schema.get("type") == "object" else None
+
+
+def output_model(fn: Callable[..., Any]) -> Any | None:
+    """The Pydantic model *fn* returns, or ``None``."""
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception:
+        return None
+    base, _ = _unwrap_annotated(hints.get("return", inspect.Parameter.empty))
+    return base if is_pydantic_model(base) else None
 
 
 def validate_result(result: Any, schema: dict[str, Any]) -> Any:
