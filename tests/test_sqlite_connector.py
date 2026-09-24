@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -200,3 +201,27 @@ async def test_tools_advertise_output_schemas(db: Path) -> None:
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
     assert set(tools) == {"list_tables", "describe_table", "query"}
     assert tools["query"]["outputSchema"]["type"] == "object"
+
+
+async def test_infinite_reals_stay_valid_json(db: Path) -> None:
+    response = await call(make(db), "query", {"sql": "SELECT 1e999 AS big, -1e999 AS small"})
+    assert ok(response)["rows"] == [["Infinity", "-Infinity"]]
+    json.dumps(response, allow_nan=False)  # no bare Infinity token anywhere
+
+
+def test_a_file_that_is_not_a_database_fails_at_startup(tmp_path: Path) -> None:
+    junk = tmp_path / "junk.db"
+    junk.write_bytes(b"not a database" * 50)
+    with pytest.raises(ValueError, match="cannot open the SQLite database"):
+        sqlite.build_server(path=junk)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC paths are a Windows feature")
+async def test_unc_paths_open(db: Path) -> None:
+    # The administrative share (\\localhost\C$\...) reaches the same file.
+    unc = Path(r"\\localhost" + "\\" + str(db).replace(":", "$", 1))
+    if not unc.is_file():
+        pytest.skip("the administrative share is not reachable here")
+    assert "file:////localhost/" in sqlite._read_only_uri(unc)
+    tables = ok(await call(make(unc), "list_tables"))
+    assert {"name": "orders", "type": "table"} in tables

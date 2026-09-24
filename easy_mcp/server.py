@@ -344,15 +344,25 @@ class MCPServer:
             audit("rate_limited", client_id=context.client_id, method=method)
             return None if is_notification else _protocol_error_response(msg_id, exc)
 
+        if is_notification and not method.startswith("notifications/"):
+            # Only requests invoke methods.  A tools/call without an id would
+            # run a tool whose answer nobody can receive, and over HTTP it
+            # would skip the header checks that apply to requests.
+            return None
+
         # A request carrying the modern per-request _meta is served statelessly
         # (2026-07-28); anything else keeps the initialize-era behaviour.
         modern = not is_notification and is_modern_request(method, params)
         try:
-            if method.startswith("notifications/"):
-                self._handle_notification(method, params, context)
-                return None
             if modern:
                 check_request_meta(params)
+            if method.startswith("notifications/"):
+                if modern:
+                    # A notification has no id; a request naming one of these
+                    # methods is asking for a method that does not exist.
+                    raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+                self._handle_notification(method, params, context)
+                return None
             if method == "tools/call":
                 response = await self._handle_tools_call(params, context, msg_id, is_notification)
                 if modern and response is not None and "result" in response:

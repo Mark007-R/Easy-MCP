@@ -94,7 +94,8 @@ _NAME_FIELDS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "n
 
 # Stateless requests have no session to hang per-client accounting on
 # (max_calls_per_session), so it is kept per client id instead, for at most
-# this many recently seen clients.
+# this many recently seen clients.  Like a session, it lapses once the client
+# has been idle for session_idle_timeout.
 _STATELESS_CLIENTS_MAX = 4096
 
 # How often a running stateless request checks whether its client hung up.
@@ -112,6 +113,14 @@ class _Session:
     identity_fp: str | None
     last_seen: float
     active: int = 0  # requests currently being dispatched
+
+
+@dataclass(slots=True)
+class _StatelessClient:
+    """Per-client call counts for stateless requests; the stand-in for a session."""
+
+    tool_calls: dict[str, int]
+    last_seen: float
 
 
 def _media_type(value: str | None) -> str:
@@ -166,6 +175,11 @@ def _decode_header_value(value: str) -> str | None:
 
 def _check_mirrored_headers(request: Request, message: dict[str, Any]) -> str | None:
     """Why the request's mirrored headers disagree with its body, if they do."""
+    for name in (PROTOCOL_VERSION_HEADER, METHOD_HEADER, NAME_HEADER):
+        # Components that read only the first (or the last) copy of a repeated
+        # header would each see a different value.
+        if len(request.headers.getlist(name)) > 1:
+            return f"Header mismatch: {name} header appears more than once"
     params = message.get("params")
     params = params if isinstance(params, dict) else {}
     meta = params.get("_meta")
@@ -213,7 +227,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             ``/messages``) so clients that predate Streamable HTTP still connect.
         session_idle_timeout: Seconds without a request after which a session
             expires (its id then gets 404 and the client re-initializes);
-            ``None`` keeps sessions until the client deletes them.
+            ``None`` keeps sessions until the client deletes them.  Stateless
+            clients' per-client call counts lapse after the same idle time.
     """
 
     def __init__(
@@ -236,7 +251,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._idle_timeout = session_idle_timeout
         self._legacy = SSETransport(server) if legacy_sse else None
         self._sessions: dict[str, _Session] = {}
-        self._stateless: OrderedDict[str, ClientContext] = OrderedDict()
+        self._stateless: OrderedDict[str, _StatelessClient] = OrderedDict()
 
     def describe(self) -> str:
         legacy = " (+ legacy sse)" if self._legacy is not None else ""
@@ -348,7 +363,21 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         """Serve one request of the stateless era; no session is read or made."""
         msg_id = message.get("id")
         client_id = self._client_id(identity, request)
-        if "id" in message and "method" in message:
+        method = message.get("method")
+        if "id" not in message:
+            if isinstance(method, str) and method.startswith("notifications/"):
+                # This revision defines no client-to-server notifications over
+                # HTTP: closing the connection is how a request is cancelled.
+                # Acting on notifications/cancelled here would let anyone who
+                # shares an address or key cancel someone else's call.
+                return Response(status_code=202)
+            # Anything else without an id would be a request that skips the
+            # header checks below; refuse it rather than run it.
+            return _json_response(
+                _rpc_error_body(None, INVALID_REQUEST, "Invalid request: a request needs an id"),
+                status=400,
+            )
+        if "method" in message:
             mismatch = _check_mirrored_headers(request, message)
             if mismatch is not None:
                 audit("header_mismatch", client_id=client_id, transport=_TRANSPORT)
@@ -366,7 +395,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     _rpc_error_body(msg_id, exc.code, str(exc), exc.data), status=400
                 )
 
-        context = self._stateless_context(client_id, identity)
+        # A context of its own, so nothing in flight is shared with other
+        # requests; only the per-client call counts are.
+        context = ClientContext(
+            client_id=client_id,
+            session_id="stateless",
+            identity=identity,
+            tool_calls=self._stateless_calls(client_id),
+        )
         response = await self._dispatch_until_disconnect(message, context, request)
         if response is None:
             return Response(status_code=202)
@@ -383,21 +419,27 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         nobody is left to read the answer.
         """
         task = asyncio.ensure_future(self._server.dispatch(message, context))
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
-            if done:
-                return task.result()
-            if await request.is_disconnected():
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+                if done:
+                    return task.result()
+                if await request.is_disconnected():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    audit(
+                        "request_abandoned",
+                        client_id=context.client_id,
+                        request_id=message.get("id"),
+                        transport=_TRANSPORT,
+                    )
+                    return None
+        finally:
+            # Our own caller may be cancelled too (shutdown, a timeout in a
+            # wrapping app): the call must not outlive its request.
+            if not task.done():
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                audit(
-                    "request_abandoned",
-                    client_id=context.client_id,
-                    request_id=message.get("id"),
-                    transport=_TRANSPORT,
-                )
-                return None
 
     @staticmethod
     def _client_id(identity: ClientIdentity | None, request: Request) -> str:
@@ -405,17 +447,21 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return identity.fingerprint
         return f"ip:{request.client.host if request.client else 'unknown'}"
 
-    def _stateless_context(self, client_id: str, identity: ClientIdentity | None) -> ClientContext:
-        """The per-client accounting a stateless request is charged to."""
-        context = self._stateless.get(client_id)
-        if context is None:
-            context = ClientContext(client_id=client_id, session_id="stateless", identity=identity)
-            self._stateless[client_id] = context
-            if len(self._stateless) > _STATELESS_CLIENTS_MAX:
-                self._stateless.popitem(last=False)
-        else:
-            self._stateless.move_to_end(client_id)
-        return context
+    def _stateless_calls(self, client_id: str) -> dict[str, int]:
+        """The per-client call counts a stateless request is charged to."""
+        now = time.monotonic()
+        entry = self._stateless.get(client_id)
+        if entry is None or (
+            self._idle_timeout is not None and now - entry.last_seen > self._idle_timeout
+        ):
+            # New, or idle long enough that a session would have expired.
+            entry = _StatelessClient(tool_calls={}, last_seen=now)
+            self._stateless[client_id] = entry
+        entry.last_seen = now
+        self._stateless.move_to_end(client_id)
+        if len(self._stateless) > _STATELESS_CLIENTS_MAX:
+            self._stateless.popitem(last=False)
+        return entry.tool_calls
 
     async def _handle_delete(self, request: Request) -> Response:
         try:
