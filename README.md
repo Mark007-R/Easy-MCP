@@ -397,7 +397,7 @@ one in [Transports](#transports-streamable-http-sse-or-stdio).
 
 ## Ready-made connectors
 
-Three servers ship with the package. They are built on the same `@server.tool`
+Five servers ship with the package. They are built on the same `@server.tool`
 decorator you use, so everything above (validation, scopes, rate limits,
 timeouts, sanitized errors, audit log) applies to them unchanged.
 
@@ -406,18 +406,22 @@ timeouts, sanitized errors, audit log) applies to them unchanged.
 | GitHub | `easy-mcp-github` | `GITHUB_TOKEN` (optional; public data without it) | `list_repos`, `get_repo`, `list_issues`, `get_issue`, `list_pull_requests`, `get_pull_request`, `get_file`, and with `--allow-write`: `create_issue`, `comment_on_issue` |
 | Postgres | `easy-mcp-postgres` | `DATABASE_URL` | `list_schemas`, `list_tables`, `describe_table`, `query` |
 | SQLite | `easy-mcp-sqlite` | `--database` or `SQLITE_PATH` (a file path, not a secret) | `list_tables`, `describe_table`, `query` |
+| MySQL / MariaDB | `easy-mcp-mysql` | `MYSQL_URL` | `list_databases`, `list_tables`, `describe_table`, `query` |
+| MongoDB | `easy-mcp-mongodb` | `MONGODB_URI` (+ `--database`) | `list_collections`, `describe_collection`, `find`, `count`, `aggregate` |
 
 ```bash
-pip install "easy-mcp-kit[postgres]"   # GitHub and SQLite need no extra
+pip install "easy-mcp-kit[postgres]"   # also [mysql] and [mongodb]; GitHub and SQLite need none
 
 GITHUB_TOKEN=github_pat_... easy-mcp-github --transport stdio
 DATABASE_URL=postgresql://user:pass@host/db easy-mcp-postgres --port 8011
 easy-mcp-sqlite --database shop.db --transport stdio
+MYSQL_URL=mysql://reader:pass@host/shop easy-mcp-mysql --port 8013
+MONGODB_URI=mongodb://reader:pass@host/shop easy-mcp-mongodb --port 8014
 ```
 
-All three take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
+All of them take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
 and `--debug`, and load API keys from `EASY_MCP_API_KEYS` when it is set.
-`python -m easy_mcp.connectors.github`, `... .postgres` and `... .sqlite` work as well, and
+`python -m easy_mcp.connectors.<name>` works as well, and
 each module's `build_server(...)` returns a normal `MCPServer` for embedding.
 
 **GitHub** is read-only by default. `--allow-write` registers `create_issue`
@@ -452,6 +456,34 @@ Postgres. `describe_table` also lists foreign keys, BLOB values come back as
 base64, and infinite REALs as the strings `"Infinity"` / `"-Infinity"`. A file
 that is not a readable SQLite database is refused at startup.
 
+**MySQL** (and MariaDB) runs each statement on its own connection in a
+`READ ONLY` transaction that is always rolled back. A read-only transaction
+does not stop everything a privileged account can do: `SET GLOBAL`
+reconfigures the server, and `SELECT ... INTO OUTFILE` writes a file on its
+disk. So `query` also admits only statements that begin with a reading
+keyword (`SELECT`, `WITH`, `SHOW`, `EXPLAIN`, `DESCRIBE`, `TABLE`, `VALUES`),
+and refuses `INTO OUTFILE`/`INTO DUMPFILE` and MySQL's executable `/*! */`
+comments. The checks read the statement with strings and comments stripped.
+MySQL's own `max_execution_time` covers only `SELECT`, so a watchdog sends
+`KILL QUERY` once `--statement-timeout` passes. Multi-statement strings and
+`LOAD DATA LOCAL` are off in the driver. Connect with a `SELECT`-only
+account all the same.
+
+**MongoDB** has no read-only session, so the connector only offers reading
+operations: `find`, `count`, `aggregate` and discovery. `aggregate` accepts
+only reading stages, checked recursively through `$facet`, `$lookup` and
+`$unionWith`, so `$out`, `$merge`, `$currentOp` and `$changeStream` are
+refused, and lookups cannot reach another database. Server-side JavaScript
+(`$where`, `$function`, `$accumulator`) is refused anywhere in a query. Every
+query carries `maxTimeMS` (the discovery commands, which MongoDB gives none,
+are bounded by the socket timeout), results are row-capped, and `system.*`
+collections are off limits. Values use relaxed Extended JSON, so an id comes
+back as `{"$oid": "..."}` and can be sent back the same way, dates outside
+Python's range included; malformed Extended JSON is reported as such.
+`describe_collection` works on views too (they have no indexes of their own).
+A `mongodb+srv://` URI is resolved on first use, not at startup. Connect as a
+user with only the `read` role.
+
 ## Architecture
 
 ```
@@ -472,7 +504,9 @@ easy_mcp/
 │   ├── _cli.py      shared --transport/--host/--port options
 │   ├── github.py    GitHub connector (stdlib HTTP; read-only unless --allow-write)
 │   ├── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
-│   └── sqlite.py    SQLite connector (stdlib; read-only open + authorizer, timeout, row cap)
+│   ├── sqlite.py    SQLite connector (stdlib; read-only open + authorizer, timeout, row cap)
+│   ├── mysql.py     MySQL/MariaDB connector (PyMySQL; READ ONLY + read-statement check, KILL QUERY)
+│   └── mongodb.py   MongoDB connector (pymongo; read ops only, stage allow-list, maxTimeMS)
 ├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail

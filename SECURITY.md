@@ -85,6 +85,23 @@ the client is untrusted, the credential in the environment is trusted.
   on the host. A deadline aborts long statements, and results are
   row-capped. Anyone who can reach the server can read the whole file, so
   expose only files meant for those clients.
+- **MySQL / MariaDB** — `READ ONLY` transactions stop data and schema
+  changes, but not everything a privileged account can do: live testing
+  against MySQL 8.0 showed `SET GLOBAL` and `SELECT ... INTO OUTFILE`
+  succeeding inside one. `query` therefore also admits only statements that
+  begin with a reading keyword, and refuses `INTO OUTFILE`/`DUMPFILE` and
+  executable `/*! */` comments. It judges them with strings and comments
+  stripped, with the session's `sql_mode` set to a fixed value (no
+  `NO_BACKSLASH_ESCAPES`, no `ANSI_QUOTES`) so the server reads string
+  boundaries the same way. A `KILL QUERY` watchdog enforces the time limit on
+  every statement type. Connect with an account holding only `SELECT` (no
+  `FILE`, no admin privileges); the statement check is the second layer.
+- **MongoDB** — there is no read-only session, so the connector's own checks
+  are what keep it reading. Only read operations are exposed, aggregation
+  stages come from a reading allow-list checked through nested pipelines, no
+  stage may reach another database or a `system.*` collection, and
+  server-side JavaScript is refused. Connect as a user with only the `read`
+  role on the one database served.
 
 ## Known limitations (v0.2)
 
