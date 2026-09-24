@@ -62,7 +62,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   OUTFILE`/`DUMPFILE` and executable `/*! */` comments, judged with strings and
   comments stripped. A `KILL QUERY` watchdog enforces `--statement-timeout` on
   every statement type, since `max_execution_time` covers only `SELECT`.
-  Decimals come back as exact strings and BLOBs as base64.
+  The session's `sql_mode` is set to a fixed value, so a server running with
+  `ANSI_QUOTES` or `NO_BACKSLASH_ESCAPES` cannot read string boundaries
+  differently from the check. Decimals come back as exact strings and BLOBs
+  as base64.
 
 - `easy-mcp-mongodb` (new `[mongodb]` extra, pymongo): `list_collections`,
   `describe_collection` (estimated count, indexes, field types from a sample),
@@ -70,8 +73,12 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   stages are admitted, checked through `$facet`, `$lookup` and `$unionWith`,
   so `$out` and `$merge` are refused and no stage can reach another database.
   Server-side JavaScript (`$where`, `$function`, `$accumulator`) is refused
-  anywhere. Every operation carries `maxTimeMS`, and values travel as relaxed
-  Extended JSON.
+  anywhere. Every query carries `maxTimeMS`; the discovery commands, which
+  MongoDB gives none, are bounded by the socket timeout. Values travel as
+  relaxed Extended JSON both ways, including dates outside Python's range, and
+  malformed Extended JSON is a clear tool error. `describe_collection` also
+  describes views, and a `mongodb+srv://` URI is resolved on first use rather
+  than at startup.
 
 ### Changed
 

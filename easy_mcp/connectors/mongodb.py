@@ -12,7 +12,10 @@ clients to reading:
   reach into another database.
 * Server-side JavaScript (``$where``, ``$function``, ``$accumulator``) is
   refused anywhere in a filter, projection or pipeline.
-* Every operation carries ``maxTimeMS`` and results are row-capped.
+* Every query (``find``, ``count``, ``aggregate`` and the sampling in
+  ``describe_collection``) carries ``maxTimeMS``, and results are row-capped.
+  The discovery commands, which MongoDB does not let carry ``maxTimeMS``, are
+  bounded by the socket timeout instead.
 * The tools see one database, and never its ``system.*`` collections.
 
 Still connect as a user holding only the ``read`` role on that database; the
@@ -38,8 +41,9 @@ import argparse
 import json
 import os
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..exceptions import ToolError
 from ..server import MCPServer
@@ -145,8 +149,6 @@ def _check_same_database(stage: str, spec: Any) -> None:
             raise ToolError("$unionWith may not reach another database")
     else:
         target = spec.get("from") if isinstance(spec, dict) else None
-    if target is None and stage == "$lookup" and isinstance(spec, dict) and "pipeline" in spec:
-        return  # a $lookup with only a pipeline (e.g. over $documents) reads no collection
     if not isinstance(target, str):
         raise ToolError(f"{stage} must name a collection of this database")
     _check_collection_name(target)
@@ -155,11 +157,32 @@ def _check_same_database(stage: str, spec: Any) -> None:
 # ---------------------------------------------------------- Extended JSON
 
 
-def _from_json(value: Any) -> Any:
-    """Client JSON (Extended JSON allowed) to BSON-ready Python values."""
-    from bson import json_util
+def _from_json(value: Any, what: str) -> Any:
+    """Client JSON (Extended JSON allowed) to BSON-ready Python values.
 
-    return json_util.loads(json.dumps(value))
+    Raises:
+        ToolError: *value* is not valid Extended JSON (``{"$date": "soon"}``).
+    """
+    from bson import json_util
+    from bson.codec_options import DatetimeConversion
+
+    # Dates outside Python's range come back as {"$date": {"$numberLong": ...}}
+    # (see _to_json); reading them the same way lets a client send them back.
+    options = json_util.DEFAULT_JSON_OPTIONS.with_options(
+        datetime_conversion=DatetimeConversion.DATETIME_AUTO
+    )
+    try:
+        return json_util.loads(json.dumps(value), json_options=options)
+    except Exception as exc:  # the decoder raises many kinds for bad input
+        raise ToolError(f"invalid Extended JSON in {what}: {exc}") from None
+
+
+def _object_from_json(value: Any, what: str) -> Mapping[str, Any]:
+    decoded = _from_json(value, what)
+    # {"$date": ...} or {"$code": ...} as the whole value decodes to a scalar.
+    if not isinstance(decoded, Mapping):
+        raise ToolError(f"{what} must be an object, not {type(decoded).__name__}")
+    return decoded
 
 
 def _to_json(value: Any) -> Any:
@@ -178,6 +201,7 @@ _TYPE_NAMES = {
     "float": "double",
     "Decimal128": "decimal",
     "datetime": "date",
+    "DatetimeMS": "date",  # a date outside Python's datetime range
     "dict": "object",
     "SON": "object",
     "list": "array",
@@ -195,6 +219,25 @@ def _bson_type(value: Any) -> str:
 
 
 # ------------------------------------------------------------------ server
+
+
+def _without_srv_lookup(uri: str) -> str:
+    """*uri* in a form ``parse_uri`` checks without a DNS query.
+
+    A ``mongodb+srv://`` URI is resolved through DNS as it is parsed, which
+    would make startup wait on the network and report an outage as a bad URI.
+    As a plain ``mongodb://`` URI it has the same syntax, credentials and
+    database; the client still resolves the real one on first use.
+    """
+    parts = urlsplit(uri)
+    if parts.scheme != "mongodb+srv":
+        return uri
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in ("srvservicename", "srvmaxhosts")
+    ]
+    return urlunsplit(("mongodb", parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _is_driver_error(exc: BaseException) -> bool:
@@ -254,7 +297,7 @@ def build_server(
         if not resolved:
             raise ValueError(f"no connection string: set {URI_ENV_VAR}")
         try:
-            parsed = parse_uri(resolved)
+            parsed = parse_uri(_without_srv_lookup(resolved))
         except Exception:
             # The driver's message may quote the URI, password included.
             raise ValueError(f"{URI_ENV_VAR} is not a valid MongoDB connection string") from None
@@ -279,6 +322,9 @@ def build_server(
                             serverSelectionTimeoutMS=CONNECT_TIMEOUT * 1000,
                             connectTimeoutMS=CONNECT_TIMEOUT * 1000,
                             socketTimeoutMS=max_time_ms + CONNECT_TIMEOUT * 1000,
+                            # A date outside Python's range would otherwise fail
+                            # the whole result; this keeps it as DatetimeMS.
+                            datetime_conversion="DATETIME_AUTO",
                         )
                     )
             return client[0][database_name]
@@ -288,6 +334,8 @@ def build_server(
             return operation(get_database())
         except ToolError:
             raise
+        except OverflowError:
+            raise ToolError("a number in the request is too large for BSON (64-bit)") from None
         except Exception as exc:
             if not _is_driver_error(exc):
                 raise
@@ -355,8 +403,10 @@ def build_server(
             raise ToolError("sample_size must be between 1 and 100")
 
         def operation(db: Any) -> dict[str, Any]:
-            if collection not in db.list_collection_names(filter={"name": collection}):
+            infos = list(db.list_collections(filter={"name": collection}))
+            if not infos:
                 raise ToolError(f"no collection named {collection}")
+            kind = infos[0].get("type", "collection")
             target = db[collection]
             fields: dict[str, set[str]] = {}
             sample = target.aggregate([{"$sample": {"size": sample_size}}], maxTimeMS=max_time_ms)
@@ -365,12 +415,19 @@ def build_server(
                 sampled += 1
                 for key, value in document.items():
                     fields.setdefault(key, set()).add(_bson_type(value))
-            indexes = [
-                {"name": name, "keys": [[field, direction] for field, direction in info["key"]]}
-                for name, info in sorted(target.index_information().items())
-            ]
+            # A view has no indexes of its own (MongoDB refuses to list them);
+            # the collection it reads from does.
+            indexes = (
+                []
+                if kind == "view"
+                else [
+                    {"name": name, "keys": [[field, order] for field, order in info["key"]]}
+                    for name, info in sorted(target.index_information().items())
+                ]
+            )
             return {
                 "collection": collection,
+                "type": kind,
                 "estimated_count": target.estimated_document_count(maxTimeMS=max_time_ms),
                 "sampled": sampled,
                 "fields": {key: sorted(kinds) for key, kinds in sorted(fields.items())},
@@ -404,10 +461,13 @@ def build_server(
         if sort is not None and any(direction not in (1, -1) for direction in sort.values()):
             raise ToolError("sort directions must be 1 or -1")
 
+        query = _object_from_json(filter or {}, "filter")
+        fields = _object_from_json(projection, "projection") if projection else None
+
         def operation(db: Any) -> dict[str, Any]:
             cursor = db[collection].find(
-                _from_json(filter or {}),
-                _from_json(projection) if projection else None,
+                query,
+                fields,
                 sort=list(sort.items()) if sort else None,
                 limit=limit + 1,
                 max_time_ms=max_time_ms,
@@ -428,11 +488,8 @@ def build_server(
         """
         _check_collection_name(collection)
         _check_operators(filter)
-        counted: int = run(
-            lambda db: db[collection].count_documents(
-                _from_json(filter or {}), maxTimeMS=max_time_ms
-            )
-        )
+        query = _object_from_json(filter or {}, "filter")
+        counted: int = run(lambda db: db[collection].count_documents(query, maxTimeMS=max_time_ms))
         return counted
 
     @server.tool
@@ -453,8 +510,9 @@ def build_server(
         check_limit(limit)
         check_pipeline(pipeline)
 
+        stages = _from_json(pipeline, "pipeline") + [{"$limit": limit + 1}]
+
         def operation(db: Any) -> dict[str, Any]:
-            stages = _from_json(pipeline) + [{"$limit": limit + 1}]
             cursor = db[collection].aggregate(stages, maxTimeMS=max_time_ms, allowDiskUse=False)
             documents, truncated = fetch(cursor, limit)
             return {"documents": documents, "count": len(documents), "truncated": truncated}
@@ -483,7 +541,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         type=float,
         default=DEFAULT_STATEMENT_TIMEOUT,
         metavar="SECONDS",
-        help="per-operation time limit (maxTimeMS)",
+        help="per-query time limit (maxTimeMS)",
     )
     parser.add_argument(
         "--max-rows",

@@ -91,7 +91,8 @@ the client is untrusted, the credential in the environment is trusted.
   succeeding inside one. `query` therefore also admits only statements that
   begin with a reading keyword, and refuses `INTO OUTFILE`/`DUMPFILE` and
   executable `/*! */` comments. It judges them with strings and comments
-  stripped, with `NO_BACKSLASH_ESCAPES` pinned off so the server reads string
+  stripped, with the session's `sql_mode` set to a fixed value (no
+  `NO_BACKSLASH_ESCAPES`, no `ANSI_QUOTES`) so the server reads string
   boundaries the same way. A `KILL QUERY` watchdog enforces the time limit on
   every statement type. Connect with an account holding only `SELECT` (no
   `FILE`, no admin privileges); the statement check is the second layer.

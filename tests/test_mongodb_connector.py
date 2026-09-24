@@ -39,7 +39,9 @@ class FakeCollection:
 
     def find(self, filter: Any, projection: Any = None, **options: Any) -> list[Any]:
         self.db.calls.append(("find", self.name, filter, projection, options))
-        return DOCS[: options["limit"]]
+        if self.db.fail is not None:
+            raise self.db.fail
+        return (self.db.docs or DOCS)[: options["limit"]]
 
     def aggregate(self, pipeline: list[Any], **options: Any) -> list[Any]:
         self.db.calls.append(("aggregate", self.name, pipeline, options))
@@ -55,23 +57,34 @@ class FakeCollection:
         return 3
 
     def index_information(self) -> dict[str, Any]:
+        if self.name == "big_orders":
+            # What MongoDB answers for a view (code 166).
+            raise FakeOperationFailure("Namespace shop.big_orders is a view, not a collection")
         return {"_id_": {"key": [("_id", 1)]}, "by_name": {"key": [("name", 1), ("total", -1)]}}
+
+
+class FakeOperationFailure(Exception):
+    pass
+
+
+FakeOperationFailure.__module__ = "pymongo.errors"
 
 
 class FakeDatabase:
     def __init__(self) -> None:
         self.calls: list[Any] = []
         self.fail: Exception | None = None
+        self.docs: list[Any] | None = None
 
-    def list_collections(self) -> list[dict[str, Any]]:
-        return [
+    def list_collections(self, filter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        infos = [
             {"name": "orders", "type": "collection"},
             {"name": "big_orders", "type": "view"},
             {"name": "system.views", "type": "collection"},
         ]
-
-    def list_collection_names(self, filter: dict[str, Any]) -> list[str]:
-        return [name for name in ("orders", "big_orders") if name == filter["name"]]
+        if filter is None:
+            return infos
+        return [info for info in infos if info["name"] == filter["name"]]
 
     def __getitem__(self, name: str) -> FakeCollection:
         return FakeCollection(self, name)
@@ -266,3 +279,74 @@ def test_configuration_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     # Building never touches the network: the client is created on first use.
     server = mongodb.build_server(uri="mongodb://127.0.0.1:1/shop", rate_limit_per_minute=None)
     assert server.name == "easy-mcp-mongodb"
+
+
+# ------------------------------------------------------ review regressions
+
+
+async def test_describe_a_view() -> None:
+    server, _ = make()
+    described = ok(await call(server, "describe_collection", {"collection": "big_orders"}))
+    assert described["type"] == "view"
+    assert described["indexes"] == []  # a view's indexes belong to its collection
+    assert described["sampled"] == 3
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "message"),
+    [
+        (
+            "find",
+            {"filter": {"created": {"$date": "yesterday"}}},
+            "invalid Extended JSON in filter",
+        ),
+        ("find", {"filter": {"n": {"$numberLong": "12x"}}}, "invalid Extended JSON in filter"),
+        ("count", {"filter": {"d": {"$uuid": "nope"}}}, "invalid Extended JSON in filter"),
+        ("find", {"filter": {"$date": "2026-01-02T00:00:00Z"}}, "filter must be an object"),
+        ("find", {"projection": {"$oid": "650000000000000000000001"}}, "projection must be"),
+        ("aggregate", {"pipeline": [{"$match": {"d": {"$date": "soon"}}}]}, "in pipeline"),
+    ],
+)
+async def test_bad_extended_json_is_a_tool_error(
+    tool: str, arguments: dict[str, Any], message: str
+) -> None:
+    server, db = make()
+    text = failure(await call(server, tool, {"collection": "orders", **arguments}))
+    assert message in text
+    assert db.calls == []  # refused before reaching the database
+
+
+async def test_out_of_range_dates_round_trip() -> None:
+    from bson.datetime_ms import DatetimeMS
+
+    server, db = make()
+    ancient = DatetimeMS(-100_000_000_000_000_000)
+    db.docs = [{"_id": 1, "born": ancient}]
+    extended = {"$date": {"$numberLong": "-100000000000000000"}}
+    result = ok(await call(server, "find", {"collection": "orders", "filter": {"born": extended}}))
+    assert db.calls[0][2] == {"born": ancient}  # what came back can be sent back
+    assert result["documents"] == [{"_id": 1, "born": extended}]
+    assert mongodb._bson_type(ancient) == "date"
+
+
+async def test_numbers_too_large_for_bson_are_a_tool_error() -> None:
+    server, db = make()
+    db.fail = OverflowError("MongoDB can only handle up to 8-byte ints")
+    assert "too large for BSON" in failure(await call(server, "find", {"collection": "orders"}))
+
+
+def test_every_lookup_must_name_a_collection() -> None:
+    with pytest.raises(ToolError, match="must name a collection"):
+        check_pipeline([{"$lookup": {"as": "x", "pipeline": [{"$match": {}}]}}])
+
+
+def test_srv_uris_are_not_resolved_at_startup() -> None:
+    import time
+
+    started = time.monotonic()
+    server = mongodb.build_server(
+        uri="mongodb+srv://u:pw@cluster0.does-not-exist.invalid/shop?srvMaxHosts=2",
+        rate_limit_per_minute=None,
+    )
+    assert server.name == "easy-mcp-mongodb"
+    assert time.monotonic() - started < 2  # no DNS query was made

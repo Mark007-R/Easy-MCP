@@ -60,6 +60,14 @@ _SYSTEM_DATABASES = ("information_schema", "mysql", "performance_schema", "sys")
 _READ_KEYWORDS = frozenset(
     {"select", "with", "show", "explain", "describe", "desc", "table", "values"}
 )
+# The session's sql_mode, set outright rather than edited: NO_BACKSLASH_ESCAPES
+# or ANSI_QUOTES (which combined modes such as ANSI switch back on) would change
+# where a string ends, and so what check_read_statement() saw.  This is MySQL
+# 8's default, and MariaDB knows every flag in it.
+_SQL_MODE = (
+    "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,"
+    "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+)
 _FILE_WRITE = re.compile(r"\binto\s+(outfile|dumpfile)\b", re.IGNORECASE)
 
 
@@ -78,8 +86,8 @@ def _strip_literals(sql: str) -> str:
     while i < n:
         ch = sql[i]
         if ch in "'\"`":
-            # Backslash escapes apply inside ' and "; the session's sql_mode
-            # is pinned so the server agrees (see connect()).
+            # Both ' and " delimit strings with backslash escapes; _SQL_MODE
+            # pins the session so the server reads them the same way.
             i += 1
             while i < n:
                 if sql[i] == "\\" and ch != "`":
@@ -238,11 +246,7 @@ def _run(
                 watchdog.daemon = True
                 watchdog.start()
             with connection.cursor() as cursor:
-                # NO_BACKSLASH_ESCAPES would change where a string literal
-                # ends, and with it what check_read_statement() saw; pin it off.
-                cursor.execute(
-                    "SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_BACKSLASH_ESCAPES', '')"
-                )
+                cursor.execute(f"SET SESSION sql_mode = '{_SQL_MODE}'")
                 cursor.execute("START TRANSACTION READ ONLY")
                 cursor.execute(sql, tuple(params) or None)
                 columns = [column[0] for column in cursor.description or ()]

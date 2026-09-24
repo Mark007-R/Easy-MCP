@@ -313,3 +313,14 @@ def test_fast_statements_are_not_killed() -> None:
     )
     assert rows == [[1]]
     assert killed == []
+
+
+async def test_sql_mode_is_set_outright_not_edited() -> None:
+    # Editing the server's mode cannot remove ANSI_QUOTES when a combined mode
+    # such as ANSI switches it back on; a fixed value can.
+    server, opened = make(lambda sql, params: (["x"], [(1,)]))
+    ok(await call(server, "query", {"sql": "SELECT 1"}))
+    first = opened[0].executed[0][0]
+    assert first == f"SET SESSION sql_mode = '{mysql._SQL_MODE}'"
+    for flag in ("ANSI", "NO_BACKSLASH_ESCAPES"):
+        assert flag not in mysql._SQL_MODE

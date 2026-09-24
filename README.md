@@ -475,10 +475,14 @@ only reading stages, checked recursively through `$facet`, `$lookup` and
 `$unionWith`, so `$out`, `$merge`, `$currentOp` and `$changeStream` are
 refused, and lookups cannot reach another database. Server-side JavaScript
 (`$where`, `$function`, `$accumulator`) is refused anywhere in a query. Every
-operation carries `maxTimeMS`, results are row-capped, and `system.*`
+query carries `maxTimeMS` (the discovery commands, which MongoDB gives none,
+are bounded by the socket timeout), results are row-capped, and `system.*`
 collections are off limits. Values use relaxed Extended JSON, so an id comes
-back as `{"$oid": "..."}` and can be sent back the same way. Connect as a user
-with only the `read` role.
+back as `{"$oid": "..."}` and can be sent back the same way, dates outside
+Python's range included; malformed Extended JSON is reported as such.
+`describe_collection` works on views too (they have no indexes of their own).
+A `mongodb+srv://` URI is resolved on first use, not at startup. Connect as a
+user with only the `read` role.
 
 ## Architecture
 
