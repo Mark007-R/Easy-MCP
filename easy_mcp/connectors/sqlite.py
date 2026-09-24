@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import math
 import os
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from ..exceptions import ToolError
 from ..server import MCPServer
@@ -77,9 +79,18 @@ def _authorizer(action: int, arg1: str | None, arg2: str | None, db: str | None,
     return sqlite3.SQLITE_DENY
 
 
+def _read_only_uri(path: Path) -> str:
+    """A ``file:`` URI opening *path* read-only."""
+    if path.drive.startswith("\\\\"):
+        # A UNC path (\\server\share\...): as_uri() would put the server in
+        # the URI's authority, which SQLite refuses, so it goes into the path.
+        return f"file:{quote('//' + path.as_posix())}?mode=ro"
+    return f"{path.as_uri()}?mode=ro"
+
+
 def connect(path: Path, statement_timeout: float) -> sqlite3.Connection:
     """Open *path* read-only, with the authorizer and deadline installed."""
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(_read_only_uri(path), uri=True)
     connection.execute("PRAGMA query_only = ON")
     connection.set_authorizer(_authorizer)
     deadline = time.monotonic() + statement_timeout
@@ -92,6 +103,10 @@ def _jsonable(value: Any) -> Any:
     # BLOBs have no JSON form; base64 keeps them lossless and printable.
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
+    # Neither has infinity (SQLite turns NaN into NULL): a bare Infinity token
+    # would make the whole response invalid JSON.
+    if isinstance(value, float) and math.isinf(value):
+        return "Infinity" if value > 0 else "-Infinity"
     return value
 
 
@@ -159,6 +174,16 @@ def build_server(
     database = Path(raw).expanduser().resolve()
     if not database.is_file():
         raise ValueError(f"no SQLite database at {database}")
+    try:
+        # Fail at startup, not on every call, for a file SQLite cannot open or
+        # that is not a database (opening alone reads nothing).
+        probe = connect(database, statement_timeout)
+        try:
+            probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        finally:
+            probe.close()
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot open the SQLite database at {database}: {exc}") from None
 
     def open_connection() -> sqlite3.Connection:
         return connect(database, statement_timeout)

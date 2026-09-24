@@ -375,3 +375,158 @@ def test_http_disconnect_cancels_the_call(live_server: LiveServer) -> None:
     while not cancelled.is_set() and time.time() < deadline:
         time.sleep(0.05)
     assert cancelled.is_set()
+
+
+# ------------------------------------------------ requests without an id
+
+
+def test_http_id_less_tools_call_never_runs(live_server: LiveServer) -> None:
+    server = make_server()
+    ran: list[str] = []
+
+    @server.tool
+    def dangerous(tag: str) -> str:
+        """Records every call."""
+        ran.append(tag)
+        return "done"
+
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        for tag, headers in [
+            ("mismatched-name", {"Mcp-Name": "add"}),
+            ("no-headers-but-version", {"Mcp-Method": "tools/list"}),
+        ]:
+            call = modern("tools/call", {"name": "dangerous", "arguments": {"tag": tag}})
+            del call["id"]
+            response = post(client, call, **headers)
+            assert response.status_code == 400, tag
+            assert response.json()["error"]["code"] == -32600
+    assert ran == []
+
+
+async def test_dispatch_never_runs_a_tool_for_a_notification() -> None:
+    server = make_server()
+    ran: list[int] = []
+
+    @server.tool
+    def side_effect() -> str:
+        """Records every call."""
+        ran.append(1)
+        return "done"
+
+    message = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "side_effect"}}
+    assert await server.dispatch(message, make_context()) is None
+    assert ran == []
+
+
+async def test_a_request_naming_a_notification_method_is_unknown() -> None:
+    server = make_server()
+    response = await server.dispatch(modern("notifications/cancelled"), make_context())
+    assert response is not None
+    assert response["error"]["code"] == METHOD_NOT_FOUND
+
+
+def test_http_notification_methods_with_an_id_answer_404(live_server: LiveServer) -> None:
+    base = live_server(make_server())
+    with httpx.Client(base_url=base, timeout=10) as client:
+        response = post(client, modern("notifications/initialized"))
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == METHOD_NOT_FOUND
+
+
+def test_http_one_client_cannot_cancel_anothers_call(live_server: LiveServer) -> None:
+    server = make_server()
+    started = threading.Event()
+
+    @server.tool
+    async def slow() -> str:
+        """Takes a moment."""
+        started.set()
+        await asyncio.sleep(1.0)
+        return "finished"
+
+    base = live_server(server)
+    results: list[httpx.Response | BaseException] = []
+
+    def victim() -> None:
+        try:
+            with httpx.Client(base_url=base, timeout=60) as client:
+                results.append(post(client, modern("tools/call", {"name": "slow"}, msg_id=1)))
+        except BaseException as exc:  # surfaced by the assertion below
+            results.append(exc)
+
+    thread = threading.Thread(target=victim)
+    thread.start()
+    # Generous waits: a loaded CI machine can be slow to start the call.
+    assert started.wait(30)
+    # Same address, guessable id: HTTP defines no cancel notification in this
+    # era, so it must not reach the victim's call.
+    cancel = notification("notifications/cancelled", {"requestId": 1, "_meta": meta()})
+    with httpx.Client(base_url=base, timeout=60) as client:
+        assert post(client, cancel).status_code == 202
+    thread.join(60)
+    assert len(results) == 1, results
+    (response,) = results
+    assert isinstance(response, httpx.Response), response
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["content"][0]["text"] == "finished", response.text
+
+
+def test_http_duplicated_mirrored_headers_are_refused(live_server: LiveServer) -> None:
+    base = live_server(make_server())
+    call = modern("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}})
+    with httpx.Client(base_url=base, timeout=10) as client:
+        for name in ("Mcp-Name", "Mcp-Method", "MCP-Protocol-Version"):
+            headers = list(headers_for(call).items())
+            value = dict(headers)[name]
+            headers.append((name, value))  # the same value twice is still ambiguous
+            response = client.post("/mcp", json=call, headers=headers)
+            assert response.status_code == 400, name
+            assert response.json()["error"]["code"] == HEADER_MISMATCH
+
+
+def test_http_per_client_limits_lapse_like_a_session(live_server: LiveServer) -> None:
+    from easy_mcp import StreamableHTTPTransport
+
+    server = make_server()
+    base = live_server(StreamableHTTPTransport(server, session_idle_timeout=0.5).build_app())
+    call = modern("tools/call", {"name": "scarce"})
+    with httpx.Client(base_url=base, timeout=10) as client:
+        assert "result" in post(client, call).json()
+        assert "result" in post(client, call).json()
+        assert post(client, call).json()["error"]["code"] == SESSION_LIMIT_EXCEEDED
+        time.sleep(0.8)
+        assert "result" in post(client, call).json()
+
+
+async def test_cancelling_the_handler_cancels_the_call() -> None:
+    from easy_mcp import StreamableHTTPTransport
+
+    server = make_server()
+    cancelled = asyncio.Event()
+
+    @server.tool
+    async def slow() -> str:
+        """Waits until cancelled."""
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "finished"
+
+    class StillConnected:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    transport = StreamableHTTPTransport(server)
+    handler = asyncio.ensure_future(
+        transport._dispatch_until_disconnect(
+            modern("tools/call", {"name": "slow"}),
+            make_context(),
+            StillConnected(),  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.sleep(0.3)
+    handler.cancel()
+    await asyncio.wait_for(cancelled.wait(), 5)

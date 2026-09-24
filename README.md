@@ -213,8 +213,9 @@ endpoints, so older clients connect unchanged.
 MCP `2026-07-28` is stateless: there is no handshake and no session. Each
 request carries its protocol version and client capabilities in `_meta`, and a
 client can ask `server/discover` what the server speaks. Over HTTP the
-`MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers must match the body
-(`400` / `-32020` otherwise), and closing the connection cancels the call.
+`MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers must each appear
+once and match the body (`400` / `-32020` otherwise), every request needs an
+`id`, and closing the connection cancels the call.
 Clients that open with `initialize` get the handshake era instead:
 `2024-11-05` through `2025-11-25` are negotiated there, and the
 `MCP-Session-Id` header the client echoes on later requests identifies the
@@ -335,7 +336,8 @@ async def expensive(query: str) -> str:
 Clients can also cancel long-running calls with the standard MCP
 `notifications/cancelled` message, or on a stateless HTTP request by closing
 the connection. Stateless requests have no session, so `max_calls_per_session`
-counts per client there (per API key, or per address for anonymous callers).
+counts per client there (per API key, or per address for anonymous callers),
+and the count lapses after the same idle time that would expire a session.
 
 ### Error handling
 
@@ -450,8 +452,9 @@ other database file on disk), extension loading and every `PRAGMA` except the
 schema-inspecting ones are refused before they run. SQLite has no statement
 timeout, so the connector aborts a statement that runs past
 `--statement-timeout` (default 10 s), and `--max-rows` caps results as for
-Postgres. `describe_table` also lists foreign keys, and BLOB values come back
-as base64.
+Postgres. `describe_table` also lists foreign keys, BLOB values come back as
+base64, and infinite REALs as the strings `"Infinity"` / `"-Infinity"`. A file
+that is not a readable SQLite database is refused at startup.
 
 **MySQL** (and MariaDB) runs each statement on its own connection in a
 `READ ONLY` transaction that is always rolled back. A read-only transaction

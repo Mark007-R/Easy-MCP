@@ -24,15 +24,20 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 
   Over Streamable HTTP a stateless request must mirror its version, method and
   tool name into the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
-  headers. A missing or disagreeing header is rejected with `400` and
-  `HeaderMismatch` (`-32020`), since an intermediary may act on the headers
-  while the server executes the body. Unknown methods answer `404`. A client
-  that closes the connection cancels its call. `max_calls_per_session` is
-  counted per client for these requests, since there is no session to count it
-  on.
+  headers, each exactly once. A missing, repeated or disagreeing header is
+  rejected with `400` and `HeaderMismatch` (`-32020`), since an intermediary
+  may act on the headers while the server executes the body. A message
+  without an `id` is refused (`400`, `-32600`) unless it is a notification,
+  and notifications are not acted on: this revision defines none from client
+  to server over HTTP. Unknown methods answer `404`. A client that closes the
+  connection cancels its call. `max_calls_per_session` is counted per client
+  for these requests, since there is no session to count it on, and the count
+  lapses after `session_idle_timeout` like a session would.
 
-  Clients that send `initialize` keep the exact behaviour of 0.2.5, so older
-  clients need no change. Verified against the official Python SDK 2.2
+  Clients that send `initialize` keep the behaviour of 0.2.5, so older clients
+  need no change. The one difference is on every transport: a `tools/call`
+  sent as a notification, without an `id`, no longer runs the tool, since
+  nobody could receive its answer. Verified against the official Python SDK 2.2
   client in its auto-detecting, pinned and legacy modes, over both HTTP and
   stdio.
 
@@ -44,7 +49,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `PRAGMA` is limited to the schema-inspecting ones. A deadline aborts
   statements past `--statement-timeout`, since SQLite has none of its own, and
   `--max-rows` caps results. The path comes from `--database` or
-  `SQLITE_PATH`.
+  `SQLITE_PATH`, UNC paths included, and a file that is not a readable
+  database is refused at startup. Infinite REALs come back as the strings
+  `"Infinity"` / `"-Infinity"`, since JSON has no infinity.
 
 - `easy-mcp-mysql` (new `[mysql]` extra, PyMySQL), for MySQL and MariaDB:
   `list_databases`, `list_tables`, `describe_table` and `query`. Each statement
