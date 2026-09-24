@@ -4,6 +4,44 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- The stateless MCP revision `2026-07-28`, served next to the `initialize` era
+  on every transport. A request whose `_meta` carries
+  `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` is served
+  without a handshake or session. Its result carries `resultType: "complete"`
+  and the server's identity in `_meta`. `server/discover` reports the supported
+  versions, capabilities and instructions, and `tools/list` and
+  `server/discover` carry `ttlMs`/`cacheScope` cache hints. The tool list is
+  marked `private` when auth is configured, because it depends on the caller.
+
+  A request that names an unsupported version gets
+  `UnsupportedProtocolVersionError` (`-32022`) listing the versions to retry
+  with. A request missing a required field is `-32602`. `ping` and
+  `initialize` do not exist in the stateless era.
+
+  Over Streamable HTTP a stateless request must mirror its version, method and
+  tool name into the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
+  headers. A missing or disagreeing header is rejected with `400` and
+  `HeaderMismatch` (`-32020`), since an intermediary may act on the headers
+  while the server executes the body. Unknown methods answer `404`. A client
+  that closes the connection cancels its call. `max_calls_per_session` is
+  counted per client for these requests, since there is no session to count it
+  on.
+
+  Clients that send `initialize` keep the exact behaviour of 0.2.5, so older
+  clients need no change. Verified against the official Python SDK 2.2
+  client in its auto-detecting, pinned and legacy modes, over both HTTP and
+  stdio.
+
+### Changed
+
+- `PROTOCOL_VERSION` and `SUPPORTED_PROTOCOL_VERSIONS[0]` are now
+  `"2026-07-28"`. `initialize` still negotiates only handshake-era versions
+  and answers a request for `2026-07-28` with `2025-11-25`.
+
 ## [0.2.5] - 2026-09-23
 
 ### Fixed

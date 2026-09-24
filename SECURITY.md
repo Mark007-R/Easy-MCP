@@ -33,6 +33,7 @@ Consequences:
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
 | Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise) |
+| Header/body disagreement (stateless HTTP) | A proxy may route or rate-limit on the mirrored `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers while the server executes the body, so the server rejects any request whose headers are missing or disagree with its body (`400`, `-32020`); Base64-encoded names are decoded before comparing |
 | DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
@@ -86,9 +87,11 @@ the client is untrusted, the credential in the environment is trusted.
   or external workers.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx, a cloud LB).
   API keys travel in headers and must not cross the network in plaintext.
-- **Single-process sessions.** SSE and Streamable HTTP sessions live in process
-  memory; running multiple workers requires sticky routing (roadmap: shared
-  session store).
+- **Single-process sessions.** Handshake-era SSE and Streamable HTTP sessions
+  live in process memory; running multiple workers requires sticky routing
+  (roadmap: shared session store). Stateless `2026-07-28` requests need no
+  routing, but rate limits and per-client call caps are still counted per
+  process.
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
   values; OAuth2 support is on the roadmap.
 

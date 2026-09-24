@@ -29,6 +29,11 @@ TOOL_TIMEOUT = -32005
 SESSION_LIMIT_EXCEEDED = -32006
 TOO_MANY_SESSIONS = -32007
 
+# --- Codes the MCP spec defines (its reserved -32020..-32099 sub-range) -------
+HEADER_MISMATCH = -32020
+MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
+UNSUPPORTED_PROTOCOL_VERSION = -32022
+
 
 class EasyMCPError(Exception):
     """Base class for every easy_mcp exception."""
