@@ -395,7 +395,7 @@ one in [Transports](#transports-streamable-http-sse-or-stdio).
 
 ## Ready-made connectors
 
-Two servers ship with the package. They are built on the same `@server.tool`
+Three servers ship with the package. They are built on the same `@server.tool`
 decorator you use, so everything above (validation, scopes, rate limits,
 timeouts, sanitized errors, audit log) applies to them unchanged.
 
@@ -403,17 +403,19 @@ timeouts, sanitized errors, audit log) applies to them unchanged.
 |---|---|---|---|
 | GitHub | `easy-mcp-github` | `GITHUB_TOKEN` (optional; public data without it) | `list_repos`, `get_repo`, `list_issues`, `get_issue`, `list_pull_requests`, `get_pull_request`, `get_file`, and with `--allow-write`: `create_issue`, `comment_on_issue` |
 | Postgres | `easy-mcp-postgres` | `DATABASE_URL` | `list_schemas`, `list_tables`, `describe_table`, `query` |
+| SQLite | `easy-mcp-sqlite` | `--database` or `SQLITE_PATH` (a file path, not a secret) | `list_tables`, `describe_table`, `query` |
 
 ```bash
-pip install "easy-mcp-kit[postgres]"   # the GitHub connector needs no extra
+pip install "easy-mcp-kit[postgres]"   # GitHub and SQLite need no extra
 
 GITHUB_TOKEN=github_pat_... easy-mcp-github --transport stdio
 DATABASE_URL=postgresql://user:pass@host/db easy-mcp-postgres --port 8011
+easy-mcp-sqlite --database shop.db --transport stdio
 ```
 
-Both take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
+All three take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
 and `--debug`, and load API keys from `EASY_MCP_API_KEYS` when it is set.
-`python -m easy_mcp.connectors.github` and `... .postgres` work as well, and
+`python -m easy_mcp.connectors.github`, `... .postgres` and `... .sqlite` work as well, and
 each module's `build_server(...)` returns a normal `MCPServer` for embedding.
 
 **GitHub** is read-only by default. `--allow-write` registers `create_issue`
@@ -437,6 +439,16 @@ parsing SQL. Still connect with a dedicated role holding only `SELECT`
 grants: a read-only transaction does not stop side-effecting functions that
 role is allowed to call.
 
+**SQLite** needs no install and no server: point it at an existing database
+file. The file is opened read-only (`mode=ro`), and an authorizer allows
+only reads. Writes, schema changes, `ATTACH` (which could otherwise open any
+other database file on disk), extension loading and every `PRAGMA` except the
+schema-inspecting ones are refused before they run. SQLite has no statement
+timeout, so the connector aborts a statement that runs past
+`--statement-timeout` (default 10 s), and `--max-rows` caps results as for
+Postgres. `describe_table` also lists foreign keys, and BLOB values come back
+as base64.
+
 ## Architecture
 
 ```
@@ -456,7 +468,8 @@ easy_mcp/
 ├── connectors/
 │   ├── _cli.py      shared --transport/--host/--port options
 │   ├── github.py    GitHub connector (stdlib HTTP; read-only unless --allow-write)
-│   └── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
+│   ├── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
+│   └── sqlite.py    SQLite connector (stdlib; read-only open + authorizer, timeout, row cap)
 ├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail

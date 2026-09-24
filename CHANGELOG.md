@@ -36,6 +36,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   client in its auto-detecting, pinned and legacy modes, over both HTTP and
   stdio.
 
+- `easy-mcp-sqlite`, a ready-made connector for SQLite database files, with
+  `list_tables`, `describe_table` (columns, primary key, foreign keys) and
+  `query`. It uses the standard library's `sqlite3`, so it needs no extra and
+  no database server. The file is opened read-only, and an authorizer admits
+  only reads, which also stops `ATTACH` from opening other files on disk.
+  `PRAGMA` is limited to the schema-inspecting ones. A deadline aborts
+  statements past `--statement-timeout`, since SQLite has none of its own, and
+  `--max-rows` caps results. The path comes from `--database` or
+  `SQLITE_PATH`.
+
 ### Changed
 
 - `PROTOCOL_VERSION` and `SUPPORTED_PROTOCOL_VERSIONS[0]` are now

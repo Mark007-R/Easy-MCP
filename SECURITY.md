@@ -78,6 +78,13 @@ the client is untrusted, the credential in the environment is trusted.
   with a role that holds only `SELECT` on the schemas you want exposed.
   Error messages from the database are forwarded (they are what a client
   needs to fix its query); the connection string never is.
+- **SQLite** — the file is opened read-only and an authorizer admits only
+  reads, so writes, schema changes, `ATTACH`, extension loading and
+  state-changing `PRAGMA`s are refused before they run, and `ATTACH` in
+  particular cannot turn the connector into a reader of other database files
+  on the host. A deadline aborts long statements, and results are
+  row-capped. Anyone who can reach the server can read the whole file, so
+  expose only files meant for those clients.
 
 ## Known limitations (v0.2)
 
