@@ -46,6 +46,26 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `--max-rows` caps results. The path comes from `--database` or
   `SQLITE_PATH`.
 
+- `easy-mcp-mysql` (new `[mysql]` extra, PyMySQL), for MySQL and MariaDB:
+  `list_databases`, `list_tables`, `describe_table` and `query`. Each statement
+  runs on its own connection in a `READ ONLY` transaction that is always
+  rolled back. Because such a transaction still lets a privileged account run
+  `SET GLOBAL` or `SELECT ... INTO OUTFILE`, `query` also admits only
+  statements that begin with a reading keyword. It refuses `INTO
+  OUTFILE`/`DUMPFILE` and executable `/*! */` comments, judged with strings and
+  comments stripped. A `KILL QUERY` watchdog enforces `--statement-timeout` on
+  every statement type, since `max_execution_time` covers only `SELECT`.
+  Decimals come back as exact strings and BLOBs as base64.
+
+- `easy-mcp-mongodb` (new `[mongodb]` extra, pymongo): `list_collections`,
+  `describe_collection` (estimated count, indexes, field types from a sample),
+  `find`, `count` and `aggregate` over one database. Only reading aggregation
+  stages are admitted, checked through `$facet`, `$lookup` and `$unionWith`,
+  so `$out` and `$merge` are refused and no stage can reach another database.
+  Server-side JavaScript (`$where`, `$function`, `$accumulator`) is refused
+  anywhere. Every operation carries `maxTimeMS`, and values travel as relaxed
+  Extended JSON.
+
 ### Changed
 
 - `PROTOCOL_VERSION` and `SUPPORTED_PROTOCOL_VERSIONS[0]` are now

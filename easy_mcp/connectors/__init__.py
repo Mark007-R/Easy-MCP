@@ -7,6 +7,8 @@ Each connector exposes a ``build_server(...)`` factory returning a regular
     easy-mcp-github --transport stdio          # or: python -m easy_mcp.connectors.github
     easy-mcp-postgres --port 8010              # or: python -m easy_mcp.connectors.postgres
     easy-mcp-sqlite --database shop.db         # or: python -m easy_mcp.connectors.sqlite
+    easy-mcp-mysql --transport stdio           # or: python -m easy_mcp.connectors.mysql
+    easy-mcp-mongodb --database shop           # or: python -m easy_mcp.connectors.mongodb
 
 Credentials are read from the environment, never from arguments (a SQLite
 file path is not a secret, so it may also be passed as ``--database``):
@@ -15,6 +17,8 @@ file path is not a secret, so it may also be passed as ``--database``):
   and tightly rate limited by GitHub).
 * Postgres: ``DATABASE_URL`` (a libpq connection string / URI).
 * SQLite: ``SQLITE_PATH`` (the database file).
+* MySQL / MariaDB: ``MYSQL_URL`` (``mysql://user:password@host:3306/db``).
+* MongoDB: ``MONGODB_URI`` (a standard ``mongodb://`` / ``mongodb+srv://`` URI).
 
 Protected tools (GitHub writes) and per-client scopes use the usual
 ``EASY_MCP_API_KEYS`` / ``EASY_MCP_STDIO_API_KEY`` mechanism.
