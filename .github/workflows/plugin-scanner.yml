@@ -1,0 +1,24 @@
+name: Plugin Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Scan AI plugin repository
+        uses: hashgraph-online/ai-plugin-scanner-action@ff72bdc87402c9751fe9be6977de41c0cfcc514b # v1.2.706
+        with:
+          plugin_dir: "."
+          format: sarif
+          output: ai-plugin-scanner.sarif
+          upload_sarif: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          fail_on_severity: high
