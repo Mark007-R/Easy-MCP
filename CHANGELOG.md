@@ -4,6 +4,61 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- The stateless MCP revision `2026-07-28`, served next to the `initialize` era
+  on every transport. A request whose `_meta` carries
+  `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` is served
+  without a handshake or session. Its result carries `resultType: "complete"`
+  and the server's identity in `_meta`. `server/discover` reports the supported
+  versions, capabilities and instructions, and `tools/list` and
+  `server/discover` carry `ttlMs`/`cacheScope` cache hints. The tool list is
+  marked `private` when auth is configured, because it depends on the caller.
+
+  A request that names an unsupported version gets
+  `UnsupportedProtocolVersionError` (`-32022`) listing the versions to retry
+  with. A request missing a required field is `-32602`. `ping` and
+  `initialize` do not exist in the stateless era.
+
+  Over Streamable HTTP a stateless request must mirror its version, method and
+  tool name into the `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`
+  headers, each exactly once. A missing, repeated or disagreeing header is
+  rejected with `400` and `HeaderMismatch` (`-32020`), since an intermediary
+  may act on the headers while the server executes the body. A message
+  without an `id` is refused (`400`, `-32600`) unless it is a notification,
+  and notifications are not acted on: this revision defines none from client
+  to server over HTTP. Unknown methods answer `404`. A client that closes the
+  connection cancels its call. `max_calls_per_session` is counted per client
+  for these requests, since there is no session to count it on, and the count
+  lapses after `session_idle_timeout` like a session would.
+
+  Clients that send `initialize` keep the behaviour of 0.2.5, so older clients
+  need no change. The one difference is on every transport: a `tools/call`
+  sent as a notification, without an `id`, no longer runs the tool, since
+  nobody could receive its answer. Verified against the official Python SDK 2.2
+  client in its auto-detecting, pinned and legacy modes, over both HTTP and
+  stdio.
+
+- `easy-mcp-sqlite`, a ready-made connector for SQLite database files, with
+  `list_tables`, `describe_table` (columns, primary key, foreign keys) and
+  `query`. It uses the standard library's `sqlite3`, so it needs no extra and
+  no database server. The file is opened read-only, and an authorizer admits
+  only reads, which also stops `ATTACH` from opening other files on disk.
+  `PRAGMA` is limited to the schema-inspecting ones. A deadline aborts
+  statements past `--statement-timeout`, since SQLite has none of its own, and
+  `--max-rows` caps results. The path comes from `--database` or
+  `SQLITE_PATH`, UNC paths included, and a file that is not a readable
+  database is refused at startup. Infinite REALs come back as the strings
+  `"Infinity"` / `"-Infinity"`, since JSON has no infinity.
+
+### Changed
+
+- `PROTOCOL_VERSION` and `SUPPORTED_PROTOCOL_VERSIONS[0]` are now
+  `"2026-07-28"`. `initialize` still negotiates only handshake-era versions
+  and answers a request for `2026-07-28` with `2025-11-25`.
+
 ## [0.2.5] - 2026-09-23
 
 ### Fixed

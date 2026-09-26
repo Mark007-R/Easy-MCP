@@ -206,11 +206,21 @@ server.run("stdio")   # stdin/stdout — desktop apps, CLI agents, local MCP hos
 
 **Streamable HTTP** is the MCP spec's current HTTP transport. One endpoint,
 `/mcp`, takes one JSON-RPC message per `POST` and answers requests in the
-response body. `initialize` opens a session whose `MCP-Session-Id` header the
-client echoes on later requests; `DELETE /mcp` ends it, and sessions idle for
-an hour expire. The same app keeps serving the legacy `/sse` + `/messages`
-endpoints, so older clients connect unchanged. Protocol versions `2024-11-05`
-through `2025-11-25` are negotiated during `initialize`.
+response body. The same app keeps serving the legacy `/sse` + `/messages`
+endpoints, so older clients connect unchanged.
+
+**Both protocol eras are served, on every transport, with nothing to configure.**
+MCP `2026-07-28` is stateless: there is no handshake and no session. Each
+request carries its protocol version and client capabilities in `_meta`, and a
+client can ask `server/discover` what the server speaks. Over HTTP the
+`MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers must each appear
+once and match the body (`400` / `-32020` otherwise), every request needs an
+`id`, and closing the connection cancels the call.
+Clients that open with `initialize` get the handshake era instead:
+`2024-11-05` through `2025-11-25` are negotiated there, and the
+`MCP-Session-Id` header the client echoes on later requests identifies the
+session. `DELETE /mcp` ends a session, and sessions idle for an hour expire.
+The era is chosen per request, so old and new clients can share one server.
 
 ```python
 from easy_mcp import StreamableHTTPTransport
@@ -324,7 +334,10 @@ async def expensive(query: str) -> str:
 ```
 
 Clients can also cancel long-running calls with the standard MCP
-`notifications/cancelled` message.
+`notifications/cancelled` message, or on a stateless HTTP request by closing
+the connection. Stateless requests have no session, so `max_calls_per_session`
+counts per client there (per API key, or per address for anonymous callers),
+and the count lapses after the same idle time that would expire a session.
 
 ### Error handling
 
@@ -336,6 +349,8 @@ Clients can also cancel long-running calls with the standard MCP
 | Tool exceeds its timeout | `-32005` timeout error |
 | Rate limit exceeded | `-32003` with `retry_after_seconds` |
 | Session cap reached | `-32006` |
+| Stateless request names a version the server does not speak | `-32022` with `supported` and `requested` |
+| HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The
 `error_id` in production responses matches the server-side log entry that
@@ -382,7 +397,7 @@ one in [Transports](#transports-streamable-http-sse-or-stdio).
 
 ## Ready-made connectors
 
-Two servers ship with the package. They are built on the same `@server.tool`
+Three servers ship with the package. They are built on the same `@server.tool`
 decorator you use, so everything above (validation, scopes, rate limits,
 timeouts, sanitized errors, audit log) applies to them unchanged.
 
@@ -390,17 +405,19 @@ timeouts, sanitized errors, audit log) applies to them unchanged.
 |---|---|---|---|
 | GitHub | `easy-mcp-github` | `GITHUB_TOKEN` (optional; public data without it) | `list_repos`, `get_repo`, `list_issues`, `get_issue`, `list_pull_requests`, `get_pull_request`, `get_file`, and with `--allow-write`: `create_issue`, `comment_on_issue` |
 | Postgres | `easy-mcp-postgres` | `DATABASE_URL` | `list_schemas`, `list_tables`, `describe_table`, `query` |
+| SQLite | `easy-mcp-sqlite` | `--database` or `SQLITE_PATH` (a file path, not a secret) | `list_tables`, `describe_table`, `query` |
 
 ```bash
-pip install "easy-mcp-kit[postgres]"   # the GitHub connector needs no extra
+pip install "easy-mcp-kit[postgres]"   # GitHub and SQLite need no extra
 
 GITHUB_TOKEN=github_pat_... easy-mcp-github --transport stdio
 DATABASE_URL=postgresql://user:pass@host/db easy-mcp-postgres --port 8011
+easy-mcp-sqlite --database shop.db --transport stdio
 ```
 
-Both take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
+All three take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
 and `--debug`, and load API keys from `EASY_MCP_API_KEYS` when it is set.
-`python -m easy_mcp.connectors.github` and `... .postgres` work as well, and
+`python -m easy_mcp.connectors.github`, `... .postgres` and `... .sqlite` work as well, and
 each module's `build_server(...)` returns a normal `MCPServer` for embedding.
 
 **GitHub** is read-only by default. `--allow-write` registers `create_issue`
@@ -424,6 +441,17 @@ parsing SQL. Still connect with a dedicated role holding only `SELECT`
 grants: a read-only transaction does not stop side-effecting functions that
 role is allowed to call.
 
+**SQLite** needs no install and no server: point it at an existing database
+file. The file is opened read-only (`mode=ro`), and an authorizer allows
+only reads. Writes, schema changes, `ATTACH` (which could otherwise open any
+other database file on disk), extension loading and every `PRAGMA` except the
+schema-inspecting ones are refused before they run. SQLite has no statement
+timeout, so the connector aborts a statement that runs past
+`--statement-timeout` (default 10 s), and `--max-rows` caps results as for
+Postgres. `describe_table` also lists foreign keys, BLOB values come back as
+base64, and infinite REALs as the strings `"Infinity"` / `"-Infinity"`. A file
+that is not a readable SQLite database is refused at startup.
+
 ## Architecture
 
 ```
@@ -443,7 +471,8 @@ easy_mcp/
 ├── connectors/
 │   ├── _cli.py      shared --transport/--host/--port options
 │   ├── github.py    GitHub connector (stdlib HTTP; read-only unless --allow-write)
-│   └── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
+│   ├── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
+│   └── sqlite.py    SQLite connector (stdlib; read-only open + authorizer, timeout, row cap)
 ├── protocol.py      supported MCP protocol versions + negotiation
 ├── exceptions.py    error hierarchy + stable JSON-RPC error codes
 └── logging.py       JSON logs + audit trail
@@ -471,9 +500,10 @@ prefer returning compact structures over huge strings.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
 - Browser-based clients on other origins must be listed in `allowed_origins`.
-- For multiple workers: `uvicorn "myapp:server.build_app" --factory` won't share
-  sessions across processes — run one process, or route each `MCP-Session-Id`
-  to the same worker.
+- For multiple workers: stateless (`2026-07-28`) requests can go to any worker.
+  Handshake-era sessions are not shared across processes — run one process,
+  or route each `MCP-Session-Id` to the same worker. Rate limits and
+  `max_calls_per_session` counters are per process either way.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development
