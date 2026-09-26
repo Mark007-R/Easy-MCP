@@ -3,6 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/easy-mcp-kit)](https://pypi.org/project/easy-mcp-kit/)
 [![Python versions](https://img.shields.io/pypi/pyversions/easy-mcp-kit)](https://pypi.org/project/easy-mcp-kit/)
 [![CI](https://github.com/Mark007-R/Easy-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Mark007-R/Easy-MCP/actions/workflows/ci.yml)
+[![Plugin Scanner](https://github.com/Mark007-R/Easy-MCP/actions/workflows/plugin-scanner.yml/badge.svg)](https://github.com/Mark007-R/Easy-MCP/actions/workflows/plugin-scanner.yml)
 [![License](https://img.shields.io/pypi/l/easy-mcp-kit)](https://github.com/Mark007-R/Easy-MCP/blob/main/LICENSE)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/easy-mcp-kit?period=total&units=INTERNATIONAL_SYSTEM&left_color=GREY&right_color=BLUE&left_text=downloads)](https://pepy.tech/projects/easy-mcp-kit)
 
