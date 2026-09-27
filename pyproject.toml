@@ -42,12 +42,15 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1"]
+mongodb = ["pymongo>=4.6"]
 pydantic = ["pydantic>=2.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
     "pydantic>=2.0",
+    "pymongo>=4.6",  # bson, for the MongoDB connector's Extended JSON tests
     "ruff>=0.5",
     "mypy>=1.10",
 ]
@@ -56,6 +59,8 @@ dev = [
 easy-mcp = "easy_mcp.cli:main"
 easy-mcp-github = "easy_mcp.connectors.github:main"
 easy-mcp-postgres = "easy_mcp.connectors.postgres:main"
+easy-mcp-mysql = "easy_mcp.connectors.mysql:main"
+easy-mcp-mongodb = "easy_mcp.connectors.mongodb:main"
 easy-mcp-sqlite = "easy_mcp.connectors.sqlite:main"
 
 [project.urls]
@@ -89,6 +94,7 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-# Optional driver behind the [postgres] extra; imported lazily by the connector.
-module = "psycopg"
+# Optional drivers behind the [postgres], [mysql] and [mongodb] extras; the
+# connectors import them lazily.
+module = ["psycopg", "pymysql", "pymongo", "pymongo.*", "bson", "bson.*"]
 ignore_missing_imports = true
