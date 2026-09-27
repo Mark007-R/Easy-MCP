@@ -103,7 +103,7 @@ the client is untrusted, the credential in the environment is trusted.
   server-side JavaScript is refused. Connect as a user with only the `read`
   role on the one database served.
 
-## Known limitations (v0.2)
+## Known limitations (v0.3)
 
 - **Sync tool timeouts are cooperative.** A timed-out or cancelled sync tool's
   worker thread cannot be force-killed by Python; the response is discarded
