@@ -5,11 +5,21 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
 * ``POST`` delivers exactly one JSON-RPC message.  A request is answered in
   the HTTP response body as ``application/json``; notifications and client
   responses get ``202 Accepted``.
-* ``initialize`` opens a session: its response carries an ``MCP-Session-Id``
-  header that the client echoes on every later request.
-* ``DELETE`` with that header ends the session.
 * ``GET`` answers ``405``: every server message is the reply to a client
   request, so there is nothing to push on a standalone stream.
+
+Two protocol eras share the endpoint, chosen per request:
+
+* **Stateless** (``2026-07-28``): the request names its protocol version in
+  the ``MCP-Protocol-Version`` header and in ``params._meta``.  There is no
+  session and no handshake.  The ``MCP-Protocol-Version``, ``Mcp-Method`` and
+  (for ``tools/call``) ``Mcp-Name`` headers must match the body, since a
+  proxy may route on the headers while this server executes the body; a
+  mismatch is ``400`` with ``-32020``.  Closing the connection cancels the
+  request.
+* **Session** (``2025-11-25`` and earlier): ``initialize`` opens a session
+  whose ``MCP-Session-Id`` response header the client echoes on every later
+  request, and ``DELETE`` with that header ends it.
 
 By default the legacy HTTP+SSE endpoints (``/sse`` + ``/messages``) are
 served from the same app, the spec's recommended setup for older clients.
@@ -30,10 +40,14 @@ Security handled here (before anything reaches the dispatcher):
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import secrets
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -45,14 +59,23 @@ from starlette.routing import Route
 from ..exceptions import (
     AUTHENTICATION_REQUIRED,
     FORBIDDEN,
+    HEADER_MISMATCH,
     INVALID_REQUEST,
+    METHOD_NOT_FOUND,
     PARSE_ERROR,
     PAYLOAD_TOO_LARGE,
     TOO_MANY_SESSIONS,
     AuthenticationError,
+    ProtocolError,
 )
 from ..logging import audit
-from ..protocol import SUPPORTED_PROTOCOL_VERSIONS
+from ..protocol import (
+    META_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    check_request_meta,
+    is_modern_request,
+)
 from ..security.auth import ClientIdentity
 from ._http import BaseHTTPTransport, rpc_error
 from .base import ClientContext
@@ -63,6 +86,20 @@ if TYPE_CHECKING:
 
 SESSION_HEADER = "MCP-Session-Id"
 PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version"
+METHOD_HEADER = "Mcp-Method"
+NAME_HEADER = "Mcp-Name"
+
+# Methods whose Mcp-Name header mirrors a body field, and that field.
+_NAME_FIELDS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+
+# Stateless requests have no session to hang per-client accounting on
+# (max_calls_per_session), so it is kept per client id instead, for at most
+# this many recently seen clients.  Like a session, it lapses once the client
+# has been idle for session_idle_timeout.
+_STATELESS_CLIENTS_MAX = 4096
+
+# How often a running stateless request checks whether its client hung up.
+_DISCONNECT_POLL_SECONDS = 0.25
 
 _TRANSPORT = "streamable-http"
 
@@ -76,6 +113,14 @@ class _Session:
     identity_fp: str | None
     last_seen: float
     active: int = 0  # requests currently being dispatched
+
+
+@dataclass(slots=True)
+class _StatelessClient:
+    """Per-client call counts for stateless requests; the stand-in for a session."""
+
+    tool_calls: dict[str, int]
+    last_seen: float
 
 
 def _media_type(value: str | None) -> str:
@@ -104,9 +149,72 @@ async def _read_body(request: Request, max_bytes: int) -> bytes | None:
     return bytes(body)
 
 
-def _json_response(payload: dict[str, Any], headers: dict[str, str] | None = None) -> Response:
+def _json_response(
+    payload: dict[str, Any], headers: dict[str, str] | None = None, status: int = 200
+) -> Response:
     body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-    return Response(body, media_type="application/json", headers=headers)
+    return Response(body, status_code=status, media_type="application/json", headers=headers)
+
+
+def _rpc_error_body(msg_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": msg_id, "error": error}
+
+
+def _decode_header_value(value: str) -> str | None:
+    """A mirrored header's value, Base64 sentinel decoded; ``None`` if invalid."""
+    if value.startswith("=?base64?") and value.endswith("?=") and len(value) >= 11:
+        try:
+            return base64.b64decode(value[9:-2], validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return None
+    return value
+
+
+def _check_mirrored_headers(request: Request, message: dict[str, Any]) -> str | None:
+    """Why the request's mirrored headers disagree with its body, if they do."""
+    for name in (PROTOCOL_VERSION_HEADER, METHOD_HEADER, NAME_HEADER):
+        # Components that read only the first (or the last) copy of a repeated
+        # header would each see a different value.
+        if len(request.headers.getlist(name)) > 1:
+            return f"Header mismatch: {name} header appears more than once"
+    params = message.get("params")
+    params = params if isinstance(params, dict) else {}
+    meta = params.get("_meta")
+    body_version = meta.get(META_PROTOCOL_VERSION) if isinstance(meta, dict) else None
+    header_version = request.headers.get(PROTOCOL_VERSION_HEADER)
+    if header_version is None:
+        return f"Header mismatch: missing {PROTOCOL_VERSION_HEADER} header"
+    if isinstance(body_version, str) and header_version != body_version:
+        return (
+            f"Header mismatch: {PROTOCOL_VERSION_HEADER} header value {header_version!r} "
+            f"does not match body value {body_version!r}"
+        )
+    method = message.get("method")
+    header_method = request.headers.get(METHOD_HEADER)
+    if header_method is None:
+        return f"Header mismatch: missing {METHOD_HEADER} header"
+    if header_method != method:
+        return (
+            f"Header mismatch: {METHOD_HEADER} header value {header_method!r} "
+            f"does not match body value {method!r}"
+        )
+    field = _NAME_FIELDS.get(method) if isinstance(method, str) else None
+    if field is not None:
+        raw_name = request.headers.get(NAME_HEADER)
+        if raw_name is None:
+            return f"Header mismatch: missing {NAME_HEADER} header"
+        header_name = _decode_header_value(raw_name)
+        if header_name is None:
+            return f"Header mismatch: {NAME_HEADER} header is not valid Base64 UTF-8"
+        if header_name != params.get(field):
+            return (
+                f"Header mismatch: {NAME_HEADER} header value {header_name!r} "
+                f"does not match body value {params.get(field)!r}"
+            )
+    return None
 
 
 class StreamableHTTPTransport(BaseHTTPTransport):
@@ -119,7 +227,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             ``/messages``) so clients that predate Streamable HTTP still connect.
         session_idle_timeout: Seconds without a request after which a session
             expires (its id then gets 404 and the client re-initializes);
-            ``None`` keeps sessions until the client deletes them.
+            ``None`` keeps sessions until the client deletes them.  Stateless
+            clients' per-client call counts lapse after the same idle time.
     """
 
     def __init__(
@@ -142,6 +251,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._idle_timeout = session_idle_timeout
         self._legacy = SSETransport(server) if legacy_sse else None
         self._sessions: dict[str, _Session] = {}
+        self._stateless: OrderedDict[str, _StatelessClient] = OrderedDict()
 
     def describe(self) -> str:
         legacy = " (+ legacy sse)" if self._legacy is not None else ""
@@ -218,6 +328,12 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         except AuthenticationError:
             return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
 
+        params = message.get("params")
+        if request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
+            isinstance(params, dict) and is_modern_request(message.get("method"), params)
+        ):
+            return await self._handle_stateless(message, identity, request)
+
         if message.get("method") == "initialize" and "id" in message:
             return await self._initialize(message, identity, request)
 
@@ -240,6 +356,112 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # MCP sends a reply to neither.
             return Response(status_code=202)
         return _json_response(response)
+
+    async def _handle_stateless(
+        self, message: dict[str, Any], identity: ClientIdentity | None, request: Request
+    ) -> Response:
+        """Serve one request of the stateless era; no session is read or made."""
+        msg_id = message.get("id")
+        client_id = self._client_id(identity, request)
+        method = message.get("method")
+        if "id" not in message:
+            if isinstance(method, str) and method.startswith("notifications/"):
+                # This revision defines no client-to-server notifications over
+                # HTTP: closing the connection is how a request is cancelled.
+                # Acting on notifications/cancelled here would let anyone who
+                # shares an address or key cancel someone else's call.
+                return Response(status_code=202)
+            # Anything else without an id would be a request that skips the
+            # header checks below; refuse it rather than run it.
+            return _json_response(
+                _rpc_error_body(None, INVALID_REQUEST, "Invalid request: a request needs an id"),
+                status=400,
+            )
+        if "method" in message:
+            mismatch = _check_mirrored_headers(request, message)
+            if mismatch is not None:
+                audit("header_mismatch", client_id=client_id, transport=_TRANSPORT)
+                return _json_response(
+                    _rpc_error_body(msg_id, HEADER_MISMATCH, mismatch), status=400
+                )
+            params = message.get("params")
+            try:
+                check_request_meta(params if isinstance(params, dict) else {})
+            except ProtocolError as exc:
+                # The spec makes these 400s, and their JSON-RPC body is what
+                # tells a probing client this is a modern server rather than
+                # a legacy one rejecting the request.
+                return _json_response(
+                    _rpc_error_body(msg_id, exc.code, str(exc), exc.data), status=400
+                )
+
+        # A context of its own, so nothing in flight is shared with other
+        # requests; only the per-client call counts are.
+        context = ClientContext(
+            client_id=client_id,
+            session_id="stateless",
+            identity=identity,
+            tool_calls=self._stateless_calls(client_id),
+        )
+        response = await self._dispatch_until_disconnect(message, context, request)
+        if response is None:
+            return Response(status_code=202)
+        error = response.get("error")
+        not_found = isinstance(error, dict) and error.get("code") == METHOD_NOT_FOUND
+        return _json_response(response, status=404 if not_found else 200)
+
+    async def _dispatch_until_disconnect(
+        self, message: dict[str, Any], context: ClientContext, request: Request
+    ) -> dict[str, Any] | None:
+        """Dispatch, cancelling the work if the client closes the connection.
+
+        In the stateless era a closed connection is the cancellation signal:
+        nobody is left to read the answer.
+        """
+        task = asyncio.ensure_future(self._server.dispatch(message, context))
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+                if done:
+                    return task.result()
+                if await request.is_disconnected():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    audit(
+                        "request_abandoned",
+                        client_id=context.client_id,
+                        request_id=message.get("id"),
+                        transport=_TRANSPORT,
+                    )
+                    return None
+        finally:
+            # Our own caller may be cancelled too (shutdown, a timeout in a
+            # wrapping app): the call must not outlive its request.
+            if not task.done():
+                task.cancel()
+
+    @staticmethod
+    def _client_id(identity: ClientIdentity | None, request: Request) -> str:
+        if identity is not None:
+            return identity.fingerprint
+        return f"ip:{request.client.host if request.client else 'unknown'}"
+
+    def _stateless_calls(self, client_id: str) -> dict[str, int]:
+        """The per-client call counts a stateless request is charged to."""
+        now = time.monotonic()
+        entry = self._stateless.get(client_id)
+        if entry is None or (
+            self._idle_timeout is not None and now - entry.last_seen > self._idle_timeout
+        ):
+            # New, or idle long enough that a session would have expired.
+            entry = _StatelessClient(tool_calls={}, last_seen=now)
+            self._stateless[client_id] = entry
+        entry.last_seen = now
+        self._stateless.move_to_end(client_id)
+        if len(self._stateless) > _STATELESS_CLIENTS_MAX:
+            self._stateless.popitem(last=False)
+        return entry.tool_calls
 
     async def _handle_delete(self, request: Request) -> Response:
         try:

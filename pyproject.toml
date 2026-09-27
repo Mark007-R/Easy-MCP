@@ -56,6 +56,7 @@ dev = [
 easy-mcp = "easy_mcp.cli:main"
 easy-mcp-github = "easy_mcp.connectors.github:main"
 easy-mcp-postgres = "easy_mcp.connectors.postgres:main"
+easy-mcp-sqlite = "easy_mcp.connectors.sqlite:main"
 
 [project.urls]
 Homepage = "https://github.com/Mark007-R/Easy-MCP"

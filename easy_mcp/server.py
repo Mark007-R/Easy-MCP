@@ -32,7 +32,15 @@ from .exceptions import (
     ValidationError,
 )
 from .logging import audit, configure_logging
-from .protocol import LATEST_PROTOCOL_VERSION, negotiate_protocol_version
+from .protocol import (
+    DISCOVER_METHOD,
+    LATEST_PROTOCOL_VERSION,
+    META_SERVER_INFO,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    check_request_meta,
+    is_modern_request,
+    negotiate_protocol_version,
+)
 from .schema import build_param_models, dump_model, validate_arguments, validate_result
 from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
 from .security.ratelimit import SlidingWindowRateLimiter
@@ -44,6 +52,13 @@ from .transport.streamable_http import StreamableHTTPTransport
 
 # The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
 PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
+
+# Cache hints (ttlMs) on stateless results.  What server/discover reports is
+# fixed for the life of the process, so clients may keep it for an hour.  The
+# tool list is not: tools can be registered at runtime and no listChanged
+# notification announces it yet, so a cached copy is stale immediately.
+DISCOVER_TTL_MS = 3_600_000
+TOOLS_LIST_TTL_MS = 0
 
 
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
@@ -149,7 +164,8 @@ class MCPServer:
             e.g. ``["https://app.example.com"]``; ``"*"`` allows any.  The
             default (``None``) allows loopback origins only.  Requests that
             carry no ``Origin`` header (non-browser clients) are unaffected.
-        instructions: Optional usage hints sent to clients at initialize.
+        instructions: Optional usage hints sent to clients at initialize and
+            in server/discover.
         json_logs: Emit structured JSON logs (recommended) or plain text.
     """
 
@@ -328,18 +344,38 @@ class MCPServer:
             audit("rate_limited", client_id=context.client_id, method=method)
             return None if is_notification else _protocol_error_response(msg_id, exc)
 
+        if is_notification and not method.startswith("notifications/"):
+            # Only requests invoke methods.  A tools/call without an id would
+            # run a tool whose answer nobody can receive, and over HTTP it
+            # would skip the header checks that apply to requests.
+            return None
+
+        # A request carrying the modern per-request _meta is served statelessly
+        # (2026-07-28); anything else keeps the initialize-era behaviour.
+        modern = not is_notification and is_modern_request(method, params)
         try:
-            if method == "initialize":
-                result: Any = self._handle_initialize(params)
+            if modern:
+                check_request_meta(params)
+            if method.startswith("notifications/"):
+                if modern:
+                    # A notification has no id; a request naming one of these
+                    # methods is asking for a method that does not exist.
+                    raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+                self._handle_notification(method, params, context)
+                return None
+            if method == "tools/call":
+                response = await self._handle_tools_call(params, context, msg_id, is_notification)
+                if modern and response is not None and "result" in response:
+                    response["result"] = self._modern_result(response["result"])
+                return response
+            if modern:
+                result: Any = self._dispatch_modern(method, context)
+            elif method == "initialize":
+                result = self._handle_initialize(params)
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
                 result = self._handle_tools_list(context)
-            elif method == "tools/call":
-                return await self._handle_tools_call(params, context, msg_id, is_notification)
-            elif method.startswith("notifications/"):
-                self._handle_notification(method, params, context)
-                return None
             else:
                 if is_notification:
                     return None
@@ -355,17 +391,57 @@ class MCPServer:
             return _error_response(
                 msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
+        if modern:
+            result = self._modern_result(result)
         return None if is_notification else _result_response(msg_id, result)
+
+    def _capabilities(self) -> dict[str, Any]:
+        return {"tools": {"listChanged": False}}
+
+    def _server_info(self) -> dict[str, Any]:
+        return {"name": self.name, "version": self.version}
 
     def _handle_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {
             "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": self.name, "version": self.version},
+            "capabilities": self._capabilities(),
+            "serverInfo": self._server_info(),
         }
         if self.instructions:
             result["instructions"] = self.instructions
         return result
+
+    def _dispatch_modern(self, method: str, context: ClientContext) -> dict[str, Any]:
+        """Serve a stateless request other than ``tools/call``.
+
+        ``initialize``, ``ping`` and ``notifications/initialized`` do not
+        exist in this era, so they are unknown methods here.
+        """
+        if method == DISCOVER_METHOD:
+            result: dict[str, Any] = {
+                "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
+                "capabilities": self._capabilities(),
+                "ttlMs": DISCOVER_TTL_MS,
+                "cacheScope": "public",
+            }
+            if self.instructions:
+                result["instructions"] = self.instructions
+            return result
+        if method == "tools/list":
+            result = self._handle_tools_list(context)
+            result["ttlMs"] = TOOLS_LIST_TTL_MS
+            # With auth configured the list depends on who asks (protected
+            # tools are hidden from callers who cannot use them), so a shared
+            # cache must not hand one caller's list to another.
+            result["cacheScope"] = "private" if self.auth is not None else "public"
+            return result
+        raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+
+    def _modern_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Stamp a stateless result with its ``resultType`` and our identity."""
+        meta = dict(result.get("_meta") or {})
+        meta[META_SERVER_INFO] = self._server_info()
+        return {**result, "resultType": "complete", "_meta": meta}
 
     def _handle_tools_list(self, context: ClientContext) -> dict[str, Any]:
         # Protected tools are omitted for callers who could not invoke them.
