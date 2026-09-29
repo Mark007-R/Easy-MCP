@@ -375,6 +375,15 @@ same. `server.run()` closes open legacy SSE streams as shutdown begins, since
 uvicorn waits for every connection to close before it shuts the app down. When
 you serve `server.build_app()` with your own uvicorn and SSE clients connect,
 pass `--timeout-graceful-shutdown`, or shutdown waits for those clients to leave.
+When you mount `server.build_app()` inside another Starlette or FastAPI app,
+its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
+the host app's shutdown.
+
+A thread takes its daemon flag from the thread that starts it, so a
+`threading.Thread` or `threading.Timer` that a sync tool starts is a daemon
+too. It stops, mid-way, when the process exits, and the shutdown wait does
+not cover it. Work that must outlive its call needs `daemon=False`, or a
+`ThreadPoolExecutor`, which the interpreter waits for at exit.
 
 ### Error handling
 

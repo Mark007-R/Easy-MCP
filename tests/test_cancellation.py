@@ -1014,3 +1014,60 @@ async def test_a_failing_callback_registered_after_the_cancel_is_audited(
         await asyncio.sleep(0.02)
     (event,) = logs.events("cancel_callback_failed")
     assert event["tool"] == "late"
+
+
+async def test_a_tool_that_leaves_a_cancel_on_its_task_still_times_out() -> None:
+    # The pre-3.11 idiom (and async-timeout <= 4.0.2): cancel the current
+    # task later, catch the CancelledError, never uncancel.  The server's
+    # timeout must still answer with -32005, not vanish as a cancellation.
+    server = MCPServer(port=0, rate_limit_per_minute=None, default_timeout=0.3)
+
+    @server.tool
+    async def legacy() -> str:
+        """Times itself out the old way, then overruns."""
+        task = asyncio.current_task()
+        assert task is not None
+        asyncio.get_running_loop().call_later(0.05, task.cancel)
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass  # its own timeout, handled
+        await asyncio.sleep(1)  # past the server's deadline
+        return "late"
+
+    response = await server.dispatch(rpc("tools/call", {"name": "legacy"}), make_context())
+    assert response is not None and response["error"]["code"] == TOOL_TIMEOUT
+
+
+async def test_an_error_raced_by_a_cancel_does_not_keep_the_tools_frames_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import easy_mcp.server as server_module
+
+    server = MCPServer(port=0, rate_limit_per_minute=None, default_timeout=None)
+    held: list[weakref.ref[Payload]] = []
+
+    def fail() -> str:
+        payload = Payload()
+        held.append(weakref.ref(payload))
+        raise ValueError("just as the cancel lands")
+
+    server.register_tool(fail, name="fail", description="Fails.")
+    context = make_context()
+    settle = server_module._settle
+
+    def settle_then_cancel(*args: Any) -> None:
+        settle(*args)
+        context.in_flight[7].cancel()
+
+    monkeypatch.setattr(server_module, "_settle", settle_then_cancel)
+    logging.disable(logging.CRITICAL)  # see the on-time retention test
+    gc.disable()
+    try:
+        assert await server.dispatch(rpc("tools/call", {"name": "fail"}, 7), context) is None
+        assert await server.wait_for_tool_threads(5) == 0
+        await asyncio.sleep(0.05)
+        assert [ref for ref in held if ref() is not None] == []
+    finally:
+        gc.enable()
+        logging.disable(logging.NOTSET)

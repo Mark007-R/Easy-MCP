@@ -19,12 +19,13 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   function directly. Tools that ignore the token behave as before.
 - `max_sync_workers` (default 32) caps the sync tools running at once. A call
   beyond it is refused with the new `ServerBusyError` (`-32008`), and does not
-  count against `max_calls_per_session`. A worker is free again before a
-  finished call's answer is sent, so a client that never has more than
-  `max_sync_workers` sync calls running is not refused. A call that timed out
-  or was cancelled keeps its worker until the tool returns: briefly for a tool
-  that acts on its token, until it finishes for one that does not. A retry
-  sent right away may therefore get `-32008`.
+  count against `max_calls_per_session`. The cap is shared by every client of
+  the server. A worker is free again before a finished call's answer is sent,
+  so a call is never refused because of its client's previous call, once that
+  call has finished. A call that timed out or was cancelled keeps its worker
+  until the tool returns: briefly for a tool that acts on its token, until it
+  finishes for one that does not. A retry sent right away may therefore get
+  `-32008`.
 - The audit event `tool_finished_after_cancel` records a sync tool that
   finished after its call was cancelled or timed out, with its outcome.
 - `MCPServer.wait_for_tool_threads(timeout)` gives sync tool threads and
@@ -42,15 +43,22 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   shared default executor. A thread left behind by a cancelled call no longer
   holds up unrelated calls queued behind it. At exit the transports wait for
   such threads only for the bounded time above. 0.3.0 waited until they
-  finished, however long that took.
+  finished, however long that took. A thread takes its daemon flag from the
+  thread that starts it, so a `threading.Thread` or `threading.Timer` that a
+  sync tool starts without `daemon=` is now a daemon too. It is stopped at
+  exit without running its `finally`, and nothing waits for it. 0.3.0 waited.
+  Pass `daemon=False`, or use a `ThreadPoolExecutor`, for work that must
+  outlive the call. A mounted `build_app()` runs no lifespan, so the host app
+  should call `wait_for_tool_threads` on shutdown.
 - `server.run()` over HTTP closes open legacy SSE streams as shutdown begins.
   Before, uvicorn waited for SSE clients to disconnect before it would shut
   the app down, so Ctrl-C with a client connected hung until a second one
   forced the exit.
 - Sync calls beyond `max_sync_workers` are refused with `-32008` at once.
   0.3.0 queued them on the default executor, which held at most
-  min(32, CPUs + 4) threads. A client that fires more than 32 sync calls at
-  once should retry the refused ones.
+  min(32, CPUs + 4) threads. The workers are shared by all clients, so a
+  refused call should be retried after a short delay, even by a client with
+  few calls of its own.
 - The database connectors warn at startup when the server's `default_timeout`
   is not longer than their statement timeout.
 - The MongoDB connector passes `session=` to every operation except

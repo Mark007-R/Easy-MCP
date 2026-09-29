@@ -100,6 +100,21 @@ def _settle(future: asyncio.Future[Any], ok: bool, value: Any) -> None:
         future.set_exception(value)
 
 
+def _drop_unreported_error(awaitable: Any) -> None:
+    """Free the frames of an error the tool raised but nobody will report.
+
+    A tool can fail in the same loop turn as the deadline or a cancel: its
+    error is settled on the future, then replaced by the cancellation.  The
+    error's traceback holds the worker's frame, which holds the future, which
+    holds the error, so the failed tool's frames would wait for a full
+    collection.
+    """
+    if isinstance(awaitable, asyncio.Future) and awaitable.done() and not awaitable.cancelled():
+        error = awaitable.exception()
+        if error is not None:
+            error.__traceback__ = None
+
+
 def _tool_failure(text: str) -> dict[str, Any]:
     """An MCP CallToolResult marking a tool-level (not protocol-level) error."""
     return {"content": [{"type": "text", "text": text}], "isError": True}
@@ -598,10 +613,15 @@ class MCPServer:
         token = CancelToken()
         token._on_error = self._callback_failed(name, context)
         deadline: asyncio.Timeout | None = None
+        awaitable: Any = None
         try:
             with cancel_scope(token):
                 if definition.is_async:
-                    awaitable: Any = definition.fn(**arguments)
+                    # A task of its own, as asyncio.wait_for gave it on 3.11:
+                    # a cancel request the tool leaves on its task (an old
+                    # async-timeout, say) must not turn this call's timeout
+                    # into a cancellation that answers nobody.
+                    awaitable = asyncio.ensure_future(definition.fn(**arguments))
                 else:
                     # Sync tools run in a worker thread so they cannot block
                     # the event loop.  Python cannot kill that thread, so a
@@ -618,6 +638,7 @@ class MCPServer:
                 # The tool raised it (a socket read timing out, say): a tool
                 # failure like any other, not the server's deadline.
                 return self._tool_failed(name, context, exc, _duration_ms())
+            _drop_unreported_error(awaitable)
             self._stop_tool(token, TIMEOUT, name, context)
             audit(
                 "tool_call",
@@ -630,6 +651,7 @@ class MCPServer:
                 f"Tool '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
             ) from None
         except asyncio.CancelledError:
+            _drop_unreported_error(awaitable)
             self._stop_tool(token, CANCELLED, name, context)
             raise
         except ToolError as exc:
