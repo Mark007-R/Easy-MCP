@@ -596,6 +596,8 @@ class MCPServer:
         # The tool (and, for a sync tool, its thread) finds this through
         # current_cancel_token(); a cancel or timeout below triggers it.
         token = CancelToken()
+        token._on_error = self._callback_failed(name, context)
+        deadline: asyncio.Timeout | None = None
         try:
             with cancel_scope(token):
                 if definition.is_async:
@@ -605,12 +607,17 @@ class MCPServer:
                     # the event loop.  Python cannot kill that thread, so a
                     # cancel or timeout reaches the tool through the token.
                     awaitable = self._start_sync_tool(definition, arguments, token, context)
-                result = await asyncio.wait_for(awaitable, timeout)
+                async with asyncio.timeout(timeout) as deadline:
+                    result = await awaitable
         except ServerBusyError:
             context.tool_calls[name] -= 1  # it never ran
             audit("tool_call", tool=name, client_id=context.client_id, status="busy")
             raise
-        except TimeoutError:
+        except TimeoutError as exc:
+            if deadline is None or not deadline.expired():
+                # The tool raised it (a socket read timing out, say): a tool
+                # failure like any other, not the server's deadline.
+                return self._tool_failed(name, context, exc, _duration_ms())
             self._stop_tool(token, TIMEOUT, name, context)
             audit(
                 "tool_call",
@@ -627,30 +634,19 @@ class MCPServer:
             raise
         except ToolError as exc:
             # Intentional, safe-to-show tool error raised by the tool author.
-            audit(
-                "tool_call",
-                tool=name,
-                client_id=context.client_id,
-                duration_ms=_duration_ms(),
-                status="tool_error",
-            )
-            return _tool_failure(str(exc))
+            try:
+                audit(
+                    "tool_call",
+                    tool=name,
+                    client_id=context.client_id,
+                    duration_ms=_duration_ms(),
+                    status="tool_error",
+                )
+                return _tool_failure(str(exc))
+            finally:
+                exc.__traceback__ = None  # see _tool_failed
         except Exception as exc:
-            error_id = uuid.uuid4().hex[:12]
-            self._logger.error("tool %r failed error_id=%s", name, error_id, exc_info=True)
-            audit(
-                "tool_call",
-                tool=name,
-                client_id=context.client_id,
-                duration_ms=_duration_ms(),
-                status="error",
-                error_id=error_id,
-            )
-            if self.debug:
-                detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-                return _tool_failure(f"Tool execution failed (error_id={error_id}): {detail}")
-            # Production: opaque message only — no exception text, no trace.
-            return _tool_failure(f"Tool execution failed (error_id={error_id})")
+            return self._tool_failed(name, context, exc, _duration_ms())
 
         try:
             text, structured = _render_result(definition, result)
@@ -692,6 +688,52 @@ class MCPServer:
             status="ok",
         )
         return payload
+
+    def _tool_failed(
+        self, name: str, context: ClientContext, exc: BaseException, duration_ms: float
+    ) -> dict[str, Any]:
+        """The CallToolResult for a tool that raised; logs and audits it."""
+        error_id = uuid.uuid4().hex[:12]
+        try:
+            self._logger.error("tool %r failed error_id=%s", name, error_id, exc_info=exc)
+            audit(
+                "tool_call",
+                tool=name,
+                client_id=context.client_id,
+                duration_ms=duration_ms,
+                status="error",
+                error_id=error_id,
+            )
+            if self.debug:
+                trace = "".join(traceback.format_exception(exc))
+                detail = f"{type(exc).__name__}: {exc}\n{trace}"
+                return _tool_failure(f"Tool execution failed (error_id={error_id}): {detail}")
+            # Production: opaque message only — no exception text, no trace.
+            return _tool_failure(f"Tool execution failed (error_id={error_id})")
+        finally:
+            # The traceback holds this call's frames, which hold the future
+            # that holds the exception: without this, every frame of the
+            # failed tool, locals and all, waits for a full collection.
+            exc.__traceback__ = None
+
+    def _callback_failed(
+        self, name: str, context: ClientContext
+    ) -> Callable[[BaseException], None]:
+        """How a failing cancel callback of tool *name* is reported."""
+
+        def failed(exc: BaseException) -> None:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.warning(
+                "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
+            )
+            audit(
+                "cancel_callback_failed",
+                tool=name,
+                client_id=context.client_id,
+                error_id=error_id,
+            )
+
+        return failed
 
     def _start_sync_tool(
         self,
@@ -785,21 +827,17 @@ class MCPServer:
         callbacks = token._trigger(reason)
         if not callbacks:
             return
+        failed = token._on_error or self._callback_failed(name, context)
 
-        def failed(exc: BaseException) -> None:
-            error_id = uuid.uuid4().hex[:12]
-            self._logger.warning(
-                "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
-            )
-            audit(
-                "cancel_callback_failed",
-                tool=name,
-                client_id=context.client_id,
-                error_id=error_id,
-            )
+        def run() -> None:
+            # The token stays alive while its callbacks run (the call may be
+            # long gone): they can read its reason, or find it through
+            # current_cancel_token().
+            with cancel_scope(token):
+                _run_callbacks(callbacks, failed)
 
         try:
-            self._spawn(f"easy-mcp-cancel:{name}", lambda: _run_callbacks(callbacks, failed))
+            self._spawn(f"easy-mcp-cancel:{name}", run)
         except Exception as exc:
             # No thread to run them on.  Running them here would block the
             # event loop, so they are dropped, loudly.

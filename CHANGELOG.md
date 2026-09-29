@@ -53,6 +53,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   once should retry the refused ones.
 - The database connectors warn at startup when the server's `default_timeout`
   is not longer than their statement timeout.
+- The MongoDB connector passes `session=` to every operation except
+  `estimated_document_count`. A `database_factory` test double therefore needs
+  methods that accept it. Its `client` needs `start_session()` and
+  `admin.command()` for a cancel to reach the server. A double without
+  `start_session` (or one raising `NotImplementedError`, like mongomock) runs
+  calls without a session.
+- A `TimeoutError` raised by a tool itself, such as a socket read timing out,
+  is now reported as a tool failure (`isError`, "Tool execution failed"). It
+  used to be reported as the server's `-32005` timeout. The tool timeout is
+  measured with `asyncio.timeout`, which tells the two apart.
 
 ### Fixed
 

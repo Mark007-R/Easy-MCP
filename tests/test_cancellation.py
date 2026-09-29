@@ -6,6 +6,7 @@ import asyncio
 import gc
 import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from easy_mcp import (
     cancel_scope,
     current_cancel_token,
 )
-from easy_mcp.exceptions import SERVER_BUSY, TOOL_TIMEOUT
+from easy_mcp.exceptions import SERVER_BUSY, TOOL_TIMEOUT, ToolError
 
 LiveServer = Callable[[Any], str]
 
@@ -887,3 +888,129 @@ def test_run_shuts_down_with_an_sse_client_connected(transport: str) -> None:
             server._transport._uvicorn.force_exit = True  # type: ignore[union-attr]
             serving.join(5)
         client.close()
+
+
+async def test_the_late_audit_keeps_its_reason_behind_a_slow_callback(
+    monkeypatch: pytest.MonkeyPatch, logs: LogCapture
+) -> None:
+    # A tool leaves a slow cancel callback registered; by the time the audit
+    # hook behind it runs, the call itself is long finished.
+    import easy_mcp.server as server_module
+
+    server = MCPServer(port=0, rate_limit_per_minute=None, default_timeout=None)
+    seen: list[CancelToken | None] = []
+
+    @server.tool
+    def write() -> str:
+        """Writes something."""
+        token = current_cancel_token()
+        assert token is not None
+        token.on_cancel(lambda: (time.sleep(0.2), seen.append(current_cancel_token())))
+        return "written"
+
+    context = make_context()
+    settle = server_module._settle
+
+    def settle_then_cancel(*args: Any) -> None:
+        settle(*args)
+        context.in_flight[7].cancel()
+
+    monkeypatch.setattr(server_module, "_settle", settle_then_cancel)
+    assert await server.dispatch(rpc("tools/call", {"name": "write"}, 7), context) is None
+    deadline = time.monotonic() + 3
+    while not logs.events("tool_finished_after_cancel") and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    (event,) = logs.events("tool_finished_after_cancel")
+    assert event["reason"] == "cancelled"
+    # Callbacks run with their call's token current.
+    assert seen and seen[0] is not None and seen[0].reason == "cancelled"
+
+
+@pytest.mark.parametrize("timeout", [None, 30.0])
+async def test_an_error_on_time_does_not_keep_the_tools_frames_alive(
+    timeout: float | None,
+) -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None, default_timeout=timeout)
+    held: list[weakref.ref[Payload]] = []
+
+    def fail() -> str:
+        payload = Payload()
+        held.append(weakref.ref(payload))
+        raise ValueError("on time")
+
+    def refuse() -> str:
+        payload = Payload()
+        held.append(weakref.ref(payload))
+        raise ToolError("refused")
+
+    server.register_tool(fail, name="fail", description="Fails.")
+    server.register_tool(refuse, name="refuse", description="Refuses.")
+    # A log record keeps its traceback, and pytest keeps the records it
+    # captures (a production handler formats a record and lets it go): log
+    # nothing, so only the server's own references are left to test.
+    logging.disable(logging.CRITICAL)
+    gc.disable()
+    try:
+        for n, tool in enumerate(["fail", "refuse", "fail", "refuse"]):
+            response = await server.dispatch(rpc("tools/call", {"name": tool}, n), make_context())
+            assert response is not None and response["result"]["isError"] is True
+        await asyncio.sleep(0.05)
+        assert [ref for ref in held if ref() is not None] == []
+    finally:
+        gc.enable()
+        logging.disable(logging.NOTSET)
+
+
+async def test_a_timeout_error_raised_by_the_tool_is_a_tool_failure(logs: LogCapture) -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    tokens: list[CancelToken] = []
+
+    @server.tool
+    def read() -> str:
+        """A socket read that times out on its own."""
+        token = current_cancel_token()
+        assert token is not None
+        tokens.append(token)
+        raise TimeoutError("timed out reading from the socket")
+
+    response = await server.dispatch(rpc("tools/call", {"name": "read"}), make_context())
+    assert response is not None
+    assert response["result"]["isError"] is True
+    assert "Tool execution failed" in response["result"]["content"][0]["text"]
+    assert not tokens[0].cancelled
+    await asyncio.sleep(0.05)
+    assert logs.events("tool_finished_after_cancel") == []
+
+
+async def test_a_failing_callback_registered_after_the_cancel_is_audited(
+    logs: LogCapture,
+) -> None:
+    # A connector still connecting when the cancel lands registers its stop
+    # after the fact; it runs at once, in the tool's thread, and a failure
+    # must still be on record.
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    started = threading.Event()
+
+    def boom() -> None:
+        raise RuntimeError("KILL QUERY failed")
+
+    @server.tool
+    def late() -> str:
+        """Registers its cancel callback only after the cancel."""
+        token = current_cancel_token()
+        assert token is not None
+        started.set()
+        token.wait(10)
+        token.on_cancel(boom)
+        return "done"
+
+    context = make_context()
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "late"}, 1), context))
+    assert await wait_for(started)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 1}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    deadline = time.monotonic() + 3
+    while not logs.events("cancel_callback_failed") and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    (event,) = logs.events("cancel_callback_failed")
+    assert event["tool"] == "late"

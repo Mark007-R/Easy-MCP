@@ -582,3 +582,31 @@ def test_describe_collection_stops_between_steps_once_cancelled() -> None:
     assert not [c for c in db.calls if c[0] == "aggregate"]
     (session,) = db.client.sessions
     assert session.server_session.dirty and client_pool_empty(db)
+
+
+class SessionlessDatabase(FakeDatabase):
+    """A 0.3.0-era test double: no client, methods that take no session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        del self.client
+
+
+async def test_a_database_without_sessions_still_works() -> None:
+    db = SessionlessDatabase()
+    server = mongodb.build_server(
+        database="shop", database_factory=lambda: db, rate_limit_per_minute=None
+    )
+    assert ok(await call(server, "count", {"collection": "orders"})) == 3
+    assert db.calls[0][3].get("session") is None
+
+
+async def test_a_client_whose_start_session_is_not_implemented_still_works() -> None:
+    server, db = make()
+
+    def not_implemented(**options: Any) -> Any:
+        raise NotImplementedError("mongomock has no sessions")
+
+    db.client.start_session = not_implemented  # type: ignore[method-assign]
+    assert ok(await call(server, "count", {"collection": "orders"})) == 3
+    assert db.calls[0][3].get("session") is None

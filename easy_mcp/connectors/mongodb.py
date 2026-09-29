@@ -276,9 +276,15 @@ def _discard(session: Any) -> None:
         mark_dirty()
 
 
+class _NoSessions(Exception):
+    """The client offers no sessions at all (a test double, say)."""
+
+
 def _sessions_unsupported(exc: BaseException) -> bool:
     # pymongo refuses an explicit session, before sending anything, when the
     # deployment does not advertise logicalSessionTimeoutMinutes.
+    if isinstance(exc, _NoSessions):
+        return True
     return type(exc).__name__ == "ConfigurationError" and "Sessions are not supported" in str(exc)
 
 
@@ -311,6 +317,11 @@ def build_server(
         max_rows: Hard cap on documents returned by ``find``/``aggregate``.
         database_factory: Injectable zero-argument factory returning a
             pymongo-style ``Database`` (tests).  Skips the driver check.
+            For a cancel to reach the server, its ``client`` must offer
+            ``start_session()`` (a context manager with ``session_id``) and
+            ``admin.command()``, and its methods must accept ``session=``;
+            a ``Database`` without them runs calls without a session, as in
+            0.3.0.
         **server_options: Passed to :class:`~easy_mcp.server.MCPServer`.
 
     Raises:
@@ -370,8 +381,15 @@ def build_server(
     warned_no_sessions = False
 
     def in_session(db: Any, operation: Callable[[Any, Any], Any], stopped: threading.Event) -> Any:
-        client = db.client
-        with client.start_session(causal_consistency=False) as session:
+        client = getattr(db, "client", None)
+        start_session = getattr(client, "start_session", None)
+        if not callable(start_session):
+            raise _NoSessions
+        try:
+            opened = start_session(causal_consistency=False)
+        except NotImplementedError:  # e.g. mongomock
+            raise _NoSessions from None
+        with opened as session:
             # Read here, not in the cancelling thread: the driver creates the
             # id lazily.
             session_id = session.session_id
