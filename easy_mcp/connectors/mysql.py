@@ -18,7 +18,10 @@ connection for long, or pull an unbounded result set.
 * Multi-statement strings and ``LOAD DATA LOCAL`` are disabled in the driver.
 * MySQL's own ``max_execution_time`` covers only ``SELECT``, so a watchdog
   issues ``KILL QUERY`` from a second connection once the deadline passes;
-  that stops every kind of statement, ``DO SLEEP(...)`` included.
+  that stops every kind of statement, ``DO SLEEP(...)`` included.  The same
+  ``KILL QUERY`` goes out as soon as the tool call is cancelled or hits the
+  server's tool timeout, so an abandoned call does not keep its statement
+  running until the deadline.
 
 Credentials: ``MYSQL_URL`` (``mysql://user:password@host:3306/database``).
 The URL is never logged and never appears in an error.
@@ -47,7 +50,7 @@ from urllib.parse import unquote, urlsplit
 
 from ..exceptions import ToolError
 from ..server import MCPServer
-from . import _cli
+from . import _cancel, _cli
 
 URL_ENV_VAR = "MYSQL_URL"
 DEFAULT_STATEMENT_TIMEOUT = 10.0
@@ -229,9 +232,17 @@ def _run(
     limit: int,
     timeout: float,
 ) -> tuple[list[str], list[list[Any]], bool]:
-    """Execute *sql* read-only; returns ``(columns, rows, truncated)``."""
+    """Execute *sql* read-only; returns ``(columns, rows, truncated)``.
+
+    *killer* ends the statement on this connection's thread id (``KILL
+    QUERY``): when the deadline passes, and when the tool call is cancelled
+    or times out on the server.
+    """
+    _cancel.raise_if_cancelled()
     timed_out = threading.Event()
+    stopped = threading.Event()  # killed because the call was cancelled
     watchdog: threading.Timer | None = None
+    remove_stop = _cancel.on_cancel(stopped.set)
     try:
         connection = connector()
         try:
@@ -242,24 +253,37 @@ def _run(
                     timed_out.set()
                     killer(thread_id)
 
+                def stop() -> None:
+                    stopped.set()
+                    killer(thread_id)
+
                 watchdog = threading.Timer(timeout, expire)
                 watchdog.daemon = True
                 watchdog.start()
+                remove_stop()
+                remove_stop = _cancel.on_cancel(stop)
             with connection.cursor() as cursor:
                 cursor.execute(f"SET SESSION sql_mode = '{_SQL_MODE}'")
                 cursor.execute("START TRANSACTION READ ONLY")
+                if stopped.is_set():
+                    # Cancelled before the statement began: a KILL QUERY
+                    # sent now would find nothing to kill.
+                    raise _cancel.cancelled_error()
                 cursor.execute(sql, tuple(params) or None)
                 columns = [column[0] for column in cursor.description or ()]
                 fetched = cursor.fetchmany(limit + 1) if columns else []
+                # A killed SLEEP() returns normally; its result is still the
+                # product of an interrupted statement.
                 if timed_out.is_set():
-                    # A killed SLEEP() returns normally; its result is still
-                    # the product of an interrupted statement.
                     raise ToolError(
                         f"Database error: statement exceeded the {timeout:g}s time limit"
                     )
+                if stopped.is_set():
+                    raise _cancel.cancelled_error()
                 rows = [[_jsonable(value) for value in row] for row in fetched[:limit]]
                 return columns, rows, len(fetched) > limit
         finally:
+            remove_stop()
             if watchdog is not None:
                 watchdog.cancel()
             try:
@@ -273,6 +297,8 @@ def _run(
             raise ToolError(
                 f"Database error: statement exceeded the {timeout:g}s time limit"
             ) from None
+        if stopped.is_set():
+            raise _cancel.cancelled_error() from None
         # Server messages (syntax errors, unknown columns, a write refused in
         # a read-only transaction) are what the client needs to fix its
         # query; the URL never appears.
@@ -299,7 +325,8 @@ def build_server(
         max_rows: Hard cap on rows returned by ``query`` (its ``limit``
             argument cannot exceed this).
         connector: Injectable zero-argument factory returning a DB-API style
-            connection (tests).  Skips the driver check and the watchdog.
+            connection (tests).  Skips the driver check, the watchdog and
+            the kill on cancel.
         **server_options: Passed to :class:`~easy_mcp.server.MCPServer`.
 
     Raises:
@@ -356,6 +383,7 @@ def build_server(
     )
     server_options.setdefault("default_timeout", statement_timeout + CONNECT_TIMEOUT + 5)
     server = MCPServer(**server_options)
+    _cancel.warn_if_server_gives_up_first(server, statement_timeout)
 
     @server.tool
     def list_databases() -> list[str]:

@@ -105,10 +105,19 @@ the client is untrusted, the credential in the environment is trusted.
 
 ## Known limitations (v0.3)
 
-- **Sync tool timeouts are cooperative.** A timed-out or cancelled sync tool's
-  worker thread cannot be force-killed by Python; the response is discarded
-  but the thread runs to completion. Long-running work belongs in async tools
-  or external workers.
+- **Sync tool cancellation is cooperative.** Python cannot force-kill a
+  thread. When a sync tool's call is cancelled or times out, the response is
+  discarded and the call's cancel token is triggered (`current_cancel_token()`),
+  but the thread itself stops only if the tool acts on the token. The
+  database connectors do: they stop the running statement on the database
+  (`KILL QUERY`, a Postgres cancel request, SQLite `interrupt()`, MongoDB
+  `killSessions`). A tool that ignores its token runs to completion. Its
+  thread counts against `max_sync_workers` until then, so such tools cannot
+  pile up without limit, and the audit log records `tool_finished_after_cancel`
+  when one finishes. A write that already went out, such as the GitHub
+  connector's `create_issue`, cannot be recalled by a cancel and may still
+  complete. Long-running work that cannot watch the token belongs in async
+  tools or external workers.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx, a cloud LB).
   API keys travel in headers and must not cross the network in plaintext.
 - **Single-process sessions.** Handshake-era SSE and Streamable HTTP sessions

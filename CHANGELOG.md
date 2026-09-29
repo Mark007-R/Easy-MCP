@@ -4,6 +4,48 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- Cancellation reaches sync tools. Every tool call has a `CancelToken`,
+  available inside the tool as `easy_mcp.current_cancel_token()`. It is
+  triggered when the call is cancelled (`notifications/cancelled`, a closed
+  stateless connection, a deleted session, stdio shutdown) or runs past its
+  timeout. A tool registers callbacks with `token.on_cancel(...)`; they run on
+  a thread of their own, off the event loop, and a failing one is logged and
+  audited as `cancel_callback_failed`. `token.cancelled` and `token.reason`
+  can be polled. `cancel_scope(token)` sets a token for code that calls a tool
+  function directly. Tools that ignore the token behave as before.
+- `max_sync_workers` (default 32) caps the sync tools running at once. A call
+  beyond it is refused with the new `ServerBusyError` (`-32008`) instead of
+  being queued, and does not count against `max_calls_per_session`.
+- The audit event `tool_finished_after_cancel` records a sync tool that
+  finished after its call was cancelled or timed out, with its outcome.
+
+### Changed
+
+- Each sync tool call runs on a daemon thread of its own instead of asyncio's
+  shared default executor. A thread left behind by a cancelled call no longer
+  holds up unrelated calls queued behind it, or the interpreter at exit.
+- The database connectors warn at startup when the server's `default_timeout`
+  is not longer than their statement timeout.
+
+### Fixed
+
+- A cancelled or timed-out call no longer leaves its query running on the
+  database until the statement deadline. MySQL sends `KILL QUERY` at once;
+  before, only the deadline watchdog did. Postgres sends a cancel request
+  (`cancel_safe` on psycopg 3.2+, `cancel` on 3.1). SQLite interrupts the
+  statement, and its progress handler also catches a cancel that lands just
+  before a statement starts. MongoDB runs each call in a session of its own
+  and ends it with `killSessions`, which needs no privilege beyond `read` for
+  one's own sessions. The killed session is not reused from the driver's
+  pool. A call cancelled before its statement starts never sends it.
+- The GitHub connector sends no request for a call that has already been
+  cancelled or timed out. A write that was already sent may still complete;
+  this is documented, and audited as `tool_finished_after_cancel`.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added

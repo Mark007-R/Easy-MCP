@@ -3,7 +3,8 @@
 Every tool runs inside a ``READ ONLY`` transaction with a statement timeout
 and a row cap, so a client (or the LLM driving it) can explore and query a
 database but cannot modify it, hold a connection for long, or pull an
-unbounded result set.
+unbounded result set.  A tool call that is cancelled, or hits the server's
+tool timeout, sends Postgres a cancel request for its running statement.
 
 Credentials: ``DATABASE_URL`` (a libpq URI or key=value connection string).
 The connection string is never logged and never appears in an error.
@@ -20,12 +21,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..exceptions import ToolError
 from ..server import MCPServer
-from . import _cli
+from . import _cancel, _cli
 
 DSN_ENV_VAR = "DATABASE_URL"
 DEFAULT_STATEMENT_TIMEOUT = 10.0
@@ -73,22 +75,51 @@ def _is_driver_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".", 1)[0] == "psycopg"
 
 
+def cancel_statement(connection: Any) -> None:
+    """Ask Postgres to cancel *connection*'s running statement (thread-safe).
+
+    ``cancel_safe`` (psycopg 3.2+) uses libpq 17's cancellation API when it
+    can and gives up after a timeout; psycopg 3.1 has only ``cancel``.
+    """
+    cancel_safe = getattr(connection, "cancel_safe", None)
+    if cancel_safe is not None:
+        cancel_safe(timeout=CONNECT_TIMEOUT)
+    else:
+        connection.cancel()
+
+
 def _run(
     connector: Callable[[], Any], sql: str, params: Sequence[Any] = (), *, limit: int
 ) -> tuple[list[str], list[list[Any]], bool]:
     """Execute *sql* read-only; returns ``(columns, rows, truncated)``."""
+    _cancel.raise_if_cancelled()
+    stopped = threading.Event()  # cancelled because the call was
     try:
-        with connector() as connection, connection.cursor() as cursor:
-            cursor.execute(sql, params)
-            if cursor.description is None:
-                return [], [], False
-            columns = [column.name for column in cursor.description]
-            fetched = cursor.fetchmany(limit + 1)
-            rows = [list(row) for row in fetched[:limit]]
-            return columns, rows, len(fetched) > limit
+        with connector() as connection:
+
+            def stop() -> None:
+                stopped.set()
+                cancel_statement(connection)
+
+            remove_stop = _cancel.on_cancel(stop)
+            try:
+                if stopped.is_set():
+                    raise _cancel.cancelled_error()
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    if cursor.description is None:
+                        return [], [], False
+                    columns = [column.name for column in cursor.description]
+                    fetched = cursor.fetchmany(limit + 1)
+                    rows = [list(row) for row in fetched[:limit]]
+                    return columns, rows, len(fetched) > limit
+            finally:
+                remove_stop()
     except Exception as exc:
         if not _is_driver_error(exc):
             raise
+        if stopped.is_set():
+            raise _cancel.cancelled_error() from None
         # Database messages (syntax errors, unknown columns) are what the
         # client needs to fix its query; the connection string never appears.
         detail = getattr(getattr(exc, "diag", None), "message_primary", None) or str(exc)
@@ -146,6 +177,7 @@ def build_server(
     )
     server_options.setdefault("default_timeout", statement_timeout + CONNECT_TIMEOUT + 5)
     server = MCPServer(**server_options)
+    _cancel.warn_if_server_gives_up_first(server, statement_timeout)
 
     @server.tool
     def list_schemas() -> list[str]:

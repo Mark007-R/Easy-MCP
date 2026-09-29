@@ -5,6 +5,13 @@ Read-only by default.  The write tools (``create_issue``,
 ``--allow-write``) and are additionally gated by the ``github:write`` scope,
 so a client needs an API key carrying that scope to see or call them.
 
+Cancellation: a request is never started for a tool call that has already
+been cancelled or timed out.  One already sent cannot be taken back, so a
+write that is cancelled mid-flight may still create its issue or comment
+after the client was told the call was cancelled; the server's audit log
+records it as ``tool_finished_after_cancel``.  Reads are bounded by
+``REQUEST_TIMEOUT`` and simply finish in the background.
+
 Credentials: ``GITHUB_TOKEN`` (a fine-grained personal access token or an
 installation token).  The token travels only in the ``Authorization`` header
 to ``GITHUB_API_URL`` (default ``https://api.github.com``); it is never
@@ -33,6 +40,7 @@ import urllib.request
 from collections.abc import Sequence
 from typing import Any, Literal
 
+from ..cancellation import current_cancel_token
 from ..exceptions import ToolError
 from ..server import MCPServer
 from . import _cli
@@ -90,6 +98,11 @@ class GitHubClient:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        token = current_cancel_token()
+        if token is not None and token.cancelled:
+            # Nobody is waiting for the answer, and a write sent now would
+            # act on a call its client believes is over.
+            raise ToolError("GitHub request not sent: the tool call was cancelled")
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
                 raw = response.read()

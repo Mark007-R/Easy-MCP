@@ -327,6 +327,7 @@ server = MCPServer(
     rate_limit_per_minute=120,     # per client; None disables
     max_request_bytes=1_048_576,   # enforced while reading the body
     default_timeout=30.0,          # per tool call; override per tool
+    max_sync_workers=32,           # sync tools running at once; None removes the cap
 )
 
 @server.tool(timeout=2.0, max_calls_per_session=5)
@@ -340,6 +341,32 @@ the connection. Stateless requests have no session, so `max_calls_per_session`
 counts per client there (per API key, or per address for anonymous callers),
 and the count lapses after the same idle time that would expire a session.
 
+A cancelled async tool gets `CancelledError`. A sync tool runs in a thread,
+which Python cannot stop from outside, so it gets a cancel token instead: a
+cancel, a timeout, a deleted session and stdio shutdown all trigger it. Use it
+to stop whatever the tool started, or leave it alone and nothing changes:
+
+```python
+from easy_mcp import current_cancel_token
+
+@server.tool
+def report(query: str) -> list[dict]:
+    token = current_cancel_token()
+    connection = open_connection()
+    remove = token.on_cancel(connection.cancel) if token else None  # runs off the event loop
+    try:
+        return run(connection, query)
+    finally:
+        if remove:
+            remove()
+```
+
+`token.cancelled` and `token.reason` (`"cancelled"` or `"timeout"`) can be
+polled between steps too. Each sync call has a thread of its own, and a tool
+that ignores its token keeps that thread until it returns, so at most
+`max_sync_workers` sync tools run at once; a call beyond that is refused with
+`-32008` at once rather than queued behind them.
+
 ### Error handling
 
 | Situation | What the client sees |
@@ -350,6 +377,7 @@ and the count lapses after the same idle time that would expire a session.
 | Tool exceeds its timeout | `-32005` timeout error |
 | Rate limit exceeded | `-32003` with `retry_after_seconds` |
 | Session cap reached | `-32006` |
+| Every sync-tool worker busy (`max_sync_workers`) | `-32008`; retry shortly |
 | Stateless request names a version the server does not speak | `-32022` with `supported` and `requested` |
 | HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
 
@@ -368,6 +396,12 @@ SHA-256 fingerprints ever appear):
  "message": "tool_call", "event": {"type": "tool_call", "tool": "add",
  "client_id": "3f9c2a71b04d", "duration_ms": 0.42, "status": "ok"}}
 ```
+
+Cancellation leaves a trail as well: `tool_cancelled` when a client cancels,
+`cancel_callback_failed` when a tool's cancel callback raised (the detail is
+in the log under its `error_id`), and `tool_finished_after_cancel` when a sync
+tool finished after its call was cancelled or timed out. That last one is
+worth watching for tools that write.
 
 ## Connecting a client
 
@@ -402,6 +436,15 @@ Five servers ship with the package. They are built on the same `@server.tool`
 decorator you use, so everything above (validation, scopes, rate limits,
 timeouts, sanitized errors, audit log) applies to them unchanged.
 
+A database connector stops the statement on the database itself when its
+call is cancelled or runs past the server's tool timeout: `KILL QUERY` on
+MySQL, a cancel request on Postgres, `interrupt()` on SQLite, `killSessions`
+on MongoDB. An abandoned call does not keep a query running until
+`--statement-timeout`. The connectors set the server's `default_timeout`
+longer than the statement timeout, so the database's own limit is what
+normally ends a slow statement; one built with a shorter `default_timeout`
+logs a warning at startup.
+
 | Connector | Command | Credential | Tools |
 |---|---|---|---|
 | GitHub | `easy-mcp-github` | `GITHUB_TOKEN` (optional; public data without it) | `list_repos`, `get_repo`, `list_issues`, `get_issue`, `list_pull_requests`, `get_pull_request`, `get_file`, and with `--allow-write`: `create_issue`, `comment_on_issue` |
@@ -431,6 +474,10 @@ client presenting a key that holds it can see or call them, and starting
 with `--allow-write` but no keys is refused. The token is sent only to
 `GITHUB_API_URL` (default `https://api.github.com`) and never appears in logs
 or errors. Use a fine-grained token scoped to the repositories you need.
+No request is sent for a call that has already been cancelled or timed out,
+but one already sent cannot be recalled: a write cancelled mid-flight may
+still open its issue or post its comment. The audit log records that as
+`tool_finished_after_cancel`.
 
 ```bash
 export EASY_MCP_API_KEYS="a-long-random-key:github:write"   # key : scope
@@ -490,6 +537,7 @@ user with only the `read` role.
 ```
 easy_mcp/
 ├── server.py        MCPServer: registration, dispatch, execution, lifecycle
+├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
 ├── decorators.py    @tool machinery, ToolDefinition, thread-safe registry
 ├── schema.py        type hints → JSON Schema; docstring parsing; validation
 ├── security/
@@ -503,6 +551,7 @@ easy_mcp/
 │   └── stdio.py     stdin/stdout transport (desktop MCP hosts, local agents)
 ├── connectors/
 │   ├── _cli.py      shared --transport/--host/--port options
+│   ├── _cancel.py   stopping a connector's statement when its call is cancelled
 │   ├── github.py    GitHub connector (stdlib HTTP; read-only unless --allow-write)
 │   ├── postgres.py  Postgres connector (psycopg; READ ONLY, timeout, row cap)
 │   ├── sqlite.py    SQLite connector (stdlib; read-only open + authorizer, timeout, row cap)
@@ -523,8 +572,9 @@ WebSocket transport cannot silently bypass one.
 identical inputs produce byte-identical responses — useful for reproducible
 agent runs and caching.
 
-**Performance notes:** sync tools run in a worker thread pool so they never
-block the event loop; async tools run natively. Schema validation is a small
+**Performance notes:** each sync tool call runs in a worker thread of its own
+(at most `max_sync_workers` at once) so it never blocks the event loop; async
+tools run natively. Schema validation is a small
 hand-written walker (no dependency, ~microseconds for typical payloads). The
 per-message overhead is dominated by JSON encode/decode; for large results
 prefer returning compact structures over huge strings.

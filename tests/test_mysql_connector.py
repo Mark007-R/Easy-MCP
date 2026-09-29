@@ -6,13 +6,15 @@ from __future__ import annotations
 import datetime
 import decimal
 import json
+import logging
 import threading
+import time
 from typing import Any
 
 import pytest
 from conftest import make_context, rpc
 
-from easy_mcp import MCPServer
+from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import mysql
 from easy_mcp.connectors.mysql import ConnectionSettings, check_read_statement
 from easy_mcp.exceptions import ToolError
@@ -324,3 +326,134 @@ async def test_sql_mode_is_set_outright_not_edited() -> None:
     assert first == f"SET SESSION sql_mode = '{mysql._SQL_MODE}'"
     for flag in ("ANSI", "NO_BACKSLASH_ESCAPES"):
         assert flag not in mysql._SQL_MODE
+
+
+# ------------------------------------------------------------ cancellation
+
+
+def run_in_thread(target: Any) -> tuple[threading.Thread, list[Any]]:
+    """A thread that runs *target* and records its result or error in *outcome*."""
+    outcome: list[Any] = []
+
+    def work() -> None:
+        try:
+            outcome.append(target())
+        except Exception as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=work)
+    return thread, outcome
+
+
+def test_a_cancelled_call_kills_its_statement_at_once() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    killed: list[int] = []
+    opened: list[FakeConnection] = []
+
+    def answer(sql: str, params: Any) -> Any:
+        started.set()
+        release.wait(10)  # SELECT SLEEP(30), until killed
+        return ["SLEEP(30)"], [(1,)]
+
+    def connector() -> FakeConnection:
+        opened.append(FakeConnection(answer))
+        return opened[-1]
+
+    def killer(thread_id: int) -> None:
+        killed.append(thread_id)
+        release.set()
+
+    token = CancelToken()
+
+    def query() -> Any:
+        with cancel_scope(token):
+            return mysql._run(connector, killer, "SELECT SLEEP(30)", limit=5, timeout=30)
+
+    thread, outcome = run_in_thread(query)
+    thread.start()
+    assert started.wait(5)
+    began = time.perf_counter()
+    token.cancel()
+    thread.join(5)
+    assert time.perf_counter() - began < 1.0  # not the 30s statement deadline
+    assert killed == [42]
+    (error,) = outcome
+    assert isinstance(error, ToolError) and "cancelled" in str(error)
+    assert opened[0].rolled_back and opened[0].closed
+
+
+def test_a_timed_out_call_kills_its_statement_and_says_so() -> None:
+    release = threading.Event()
+    killed: list[int] = []
+    token = CancelToken()
+
+    def answer(sql: str, params: Any) -> Any:
+        token.cancel("timeout")  # the server gave up while it ran
+        release.wait(5)
+        raise FakeDriverError(1317, "Query execution was interrupted")
+
+    def killer(thread_id: int) -> None:
+        killed.append(thread_id)
+        release.set()
+
+    with cancel_scope(token), pytest.raises(ToolError, match="timed out"):
+        mysql._run(lambda: FakeConnection(answer), killer, "SELECT 1", limit=5, timeout=30)
+    assert killed == [42]
+
+
+def test_a_call_cancelled_before_it_starts_never_connects() -> None:
+    token = CancelToken()
+    token.cancel()
+    opened: list[object] = []
+    with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+        mysql._run(lambda: opened.append(1), None, "SELECT 1", limit=5, timeout=5)
+    assert opened == []
+
+
+def test_a_call_cancelled_while_connecting_skips_its_statement() -> None:
+    token = CancelToken()
+    killed: list[int] = []
+    connection = FakeConnection(lambda sql, params: (["x"], [(1,)]))
+
+    def connector() -> FakeConnection:
+        token.cancel()  # arrives while the connection is being opened
+        return connection
+
+    with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+        mysql._run(connector, killed.append, "SELECT 1", limit=5, timeout=5)
+    assert all(sql != "SELECT 1" for sql, _ in connection.executed)
+    assert connection.closed
+
+
+def test_a_finished_statement_is_not_killed_by_a_later_cancel() -> None:
+    token = CancelToken()
+    killed: list[int] = []
+    with cancel_scope(token):
+        mysql._run(
+            lambda: FakeConnection(lambda sql, params: (["x"], [(1,)])),
+            killed.append,
+            "SELECT 1",
+            limit=5,
+            timeout=5,
+        )
+    token.cancel()
+    assert killed == []
+
+
+def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        mysql.build_server(
+            url="mysql://u:p@h/db",
+            connector=lambda: None,
+            statement_timeout=20,
+            default_timeout=10,
+            rate_limit_per_minute=None,
+        )
+    assert "default_timeout (10s) is not longer than the statement timeout (20s)" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        mysql.build_server(url="mysql://u:p@h/db", connector=lambda: None)
+    assert "default_timeout" not in caplog.text
