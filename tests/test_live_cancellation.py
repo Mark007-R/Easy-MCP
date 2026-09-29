@@ -4,10 +4,14 @@ These run against real servers and are skipped unless their variable is set:
 
 * ``EASY_MCP_LIVE_MYSQL_URL``     e.g. ``mysql://root:pw@127.0.0.1:3306/test``
 * ``EASY_MCP_LIVE_POSTGRES_URL``  e.g. ``postgresql://postgres:pw@127.0.0.1/postgres``
-* ``EASY_MCP_LIVE_MONGODB_URI``   e.g. ``mongodb://root:pw@127.0.0.1:27017/test?authSource=admin``
+* ``EASY_MCP_LIVE_MONGODB_URI``   e.g. ``mongodb://reader:pw@127.0.0.1:27017/shop``
 
-The MongoDB test writes a scratch collection to set up its slow read, so its
-account needs write access there (the connector itself still only reads).
+Connect the connector as the least-privileged account you would deploy with
+(``SELECT``-only, ``read`` role): stopping a query must work for it.  The
+MongoDB test also needs a scratch collection with data in it, so it seeds one
+through ``EASY_MCP_LIVE_MONGODB_SETUP_URI`` (an account that may write and
+see every operation; the connector URI is used when it is unset).
+
 Each test starts a query through the dispatcher, cancels it the way a client
 does, and then asks the server's own activity view whether it is still there.
 """
@@ -28,6 +32,8 @@ from easy_mcp import MCPServer
 MYSQL_URL = os.environ.get("EASY_MCP_LIVE_MYSQL_URL")
 POSTGRES_URL = os.environ.get("EASY_MCP_LIVE_POSTGRES_URL")
 MONGODB_URI = os.environ.get("EASY_MCP_LIVE_MONGODB_URI")
+MONGODB_ADMIN_URI = os.environ.get("EASY_MCP_LIVE_MONGODB_SETUP_URI")
+MONGODB_SETUP_URI = MONGODB_ADMIN_URI or MONGODB_URI
 
 # Far longer than any test waits: the query only ends early if it is stopped.
 STATEMENT_TIMEOUT = 60
@@ -134,20 +140,22 @@ async def test_mongodb_cancel_removes_the_operation_from_current_op() -> None:
     from easy_mcp.connectors import mongodb
 
     assert MONGODB_URI is not None
-    client: Any = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    database = client.get_default_database()
+    client: Any = MongoClient(MONGODB_SETUP_URI, serverSelectionTimeoutMS=5000)
+    database = client[MongoClient(MONGODB_URI, connect=False).get_default_database().name]
     probe = "easy_mcp_cancel_probe"
     database[probe].drop()
     database[probe].insert_many([{"n": n} for n in range(20_000)])
     server = mongodb.build_server(
         uri=MONGODB_URI, statement_timeout=STATEMENT_TIMEOUT, rate_limit_per_minute=None
     )
-    # A self-join with no index: every document scans every other one.
+    # A correlated self-join with no index: every document scans every other
+    # one.  (An uncorrelated sub-pipeline would be run once and cached.)
     pipeline = [
         {
             "$lookup": {
                 "from": probe,
-                "pipeline": [{"$match": {"$expr": {"$gte": ["$n", 0]}}}, {"$count": "c"}],
+                "let": {"m": "$n"},
+                "pipeline": [{"$match": {"$expr": {"$gte": ["$n", "$$m"]}}}, {"$count": "c"}],
                 "as": "all",
             }
         },
@@ -157,7 +165,8 @@ async def test_mongodb_cancel_removes_the_operation_from_current_op() -> None:
     def running() -> bool:
         ops = client.admin.aggregate(
             [
-                {"$currentOp": {}},
+                # Other users' operations need the admin account's inprog.
+                {"$currentOp": {"allUsers": bool(MONGODB_ADMIN_URI)}},
                 {"$match": {"command.aggregate": probe, "ns": f"{database.name}.{probe}"}},
             ]
         )
