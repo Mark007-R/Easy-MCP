@@ -522,12 +522,66 @@ async def test_a_finished_call_returns_its_session_to_the_pool() -> None:
     assert db.client.pool == [session.session_id]
 
 
-async def test_deployments_without_sessions_still_work_without_the_kill() -> None:
+async def test_deployments_without_sessions_still_work_without_the_kill(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     server, db = make()
     db.client.supports_sessions = False
-    first = ok(await call(server, "find", {"collection": "orders"}))
-    second = ok(await call(server, "find", {"collection": "orders"}))
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        first = ok(await call(server, "find", {"collection": "orders"}))
+        second = ok(await call(server, "find", {"collection": "orders"}))
     assert first["count"] == second["count"] == 3
-    # Tried once, refused before anything was sent, then never again.
-    assert len(db.client.sessions) == 1
-    assert [c[4].get("session") for c in db.calls] == [db.client.sessions[0], None, None]
+    # Each call asks for a session (a member may become readable), is
+    # refused before anything is sent, and runs without one.
+    one, two = db.client.sessions
+    assert [c[4].get("session") for c in db.calls] == [one, None, two, None]
+    assert caplog.text.count("MongoDB refused a session") == 1  # said once
+
+
+async def test_sessions_are_used_again_once_the_deployment_allows_them() -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    ok(await call(server, "find", {"collection": "orders"}))
+    db.client.supports_sessions = True
+    ok(await call(server, "find", {"collection": "orders"}))
+    assert db.calls[-1][4]["session"] is db.client.sessions[-1]
+
+
+def test_a_call_cancelled_while_its_session_is_refused_is_not_retried() -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    token = CancelToken()
+    real_find = FakeCollection.find
+
+    def find(self: FakeCollection, *args: Any, **options: Any) -> Any:
+        if options.get("session") is not None:
+            token.cancel()  # arrives while the connection is being set up
+        return real_find(self, *args, **options)
+
+    tool = next(t for t in server.tools if t.name == "find")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeCollection, "find", find)
+        with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+            tool.fn(collection="orders")
+    assert [c[4].get("session") for c in db.calls] == [db.client.sessions[0]]  # no retry
+
+
+def test_describe_collection_stops_between_steps_once_cancelled() -> None:
+    # A kill ends only the operation running when it lands; the next step
+    # must not start.
+    server, db = make()
+    token = CancelToken()
+    real_list = FakeDatabase.list_collections
+
+    def list_collections(self: FakeDatabase, *args: Any, **kwargs: Any) -> Any:
+        token.cancel()  # lands while listCollections is answering
+        return real_list(self, *args, **kwargs)
+
+    tool = next(t for t in server.tools if t.name == "describe_collection")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeDatabase, "list_collections", list_collections)
+        with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+            tool.fn(collection="orders")
+    assert not [c for c in db.calls if c[0] == "aggregate"]
+    (session,) = db.client.sessions
+    assert session.server_session.dirty and client_pool_empty(db)

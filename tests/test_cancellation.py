@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -698,3 +700,118 @@ async def test_a_tool_finishing_between_the_deadline_and_the_trigger_is_audited(
             await asyncio.sleep(0.02)
     (event,) = audit_events(caplog, "tool_finished_after_cancel")
     assert event["reason"] == "timeout" and event["status"] == "ok"
+
+
+class Rows(list):  # type: ignore[type-arg]
+    """A result that can be watched with a weak reference."""
+
+
+async def test_a_finished_call_does_not_keep_its_result_alive() -> None:
+    # With the cyclic collector off, only reference counting can free the
+    # result: nothing (the late-audit hook included) may still hold it.
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    produced: list[weakref.ref[Rows]] = []
+
+    @server.tool
+    def rows() -> list[int]:
+        """A result to watch."""
+        result = Rows(range(1000))
+        produced.append(weakref.ref(result))
+        return result
+
+    gc.disable()
+    try:
+        for n in range(20):
+            response = await server.dispatch(rpc("tools/call", {"name": "rows"}, n), make_context())
+            assert response is not None and response["result"]["isError"] is False
+            del response
+        await asyncio.sleep(0.05)  # let the last worker thread let go
+        alive = [ref for ref in produced if ref() is not None]
+        assert alive == []
+    finally:
+        gc.enable()
+
+
+async def test_the_lifespan_waits_for_an_async_tools_cancel_callback() -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    started = asyncio.Event()
+    callback_done = threading.Event()
+
+    def stop() -> None:
+        time.sleep(0.2)
+        callback_done.set()
+
+    @server.tool
+    async def slow() -> str:
+        """An async tool with a slow cancel callback."""
+        token = current_cancel_token()
+        assert token is not None
+        token.on_cancel(stop)
+        started.set()
+        await asyncio.sleep(30)
+        return "done"
+
+    app = server.build_app()
+    async with app.router.lifespan_context(app):
+        call = asyncio.create_task(
+            server.dispatch(rpc("tools/call", {"name": "slow"}, 1), make_context())
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        call.cancel()
+    assert callback_done.is_set()
+
+
+async def lifespan_round_with_a_polling_tool() -> bool:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    started = threading.Event()
+    cleaned = threading.Event()
+
+    def clean() -> None:
+        time.sleep(0.05)
+        cleaned.set()
+
+    def poll() -> str:
+        token = current_cancel_token()
+        assert token is not None
+        token.on_cancel(clean)
+        started.set()
+        token.wait(30)
+        return "stopped"
+
+    server.register_tool(poll, name="poll", description="Polls its token.")
+    app = server.build_app()
+    async with app.router.lifespan_context(app):
+        call = asyncio.create_task(
+            server.dispatch(rpc("tools/call", {"name": "poll"}, 1), make_context())
+        )
+        assert await wait_for(started)
+        call.cancel()
+    return cleaned.is_set()
+
+
+async def test_the_lifespan_waits_for_a_polling_tools_cleanup() -> None:
+    # The tool polls its token, so its thread ends the moment the token
+    # fires; the cleanup callback is on a thread started just after.
+    for _ in range(20):
+        assert await lifespan_round_with_a_polling_tool()
+
+
+async def test_sse_shutdown_cancels_session_calls_right_away() -> None:
+    from easy_mcp.transport.sse import SSETransport
+
+    tool = SlowToStop(delay=0.1)
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    server.register_tool(lambda: tool(), name="slow", description="Stops slowly.")
+    transport = SSETransport(server)
+    app = transport.build_app()
+    async with app.router.lifespan_context(app):
+        from easy_mcp.transport.sse import _Session
+
+        session = _Session(id="s1", context=make_context(), identity_fp=None)
+        transport._sessions[session.id] = session
+        task = asyncio.create_task(
+            transport._deliver(session, rpc("tools/call", {"name": "slow"}, 1))
+        )
+        session.tasks.add(task)
+        assert await wait_for(tool.started)
+    assert tool.callback_done.is_set()

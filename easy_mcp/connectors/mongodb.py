@@ -19,10 +19,13 @@ clients to reading:
 * Each tool call runs its operations in a session of its own.  When the call
   is cancelled, or hits the server's tool timeout, ``killSessions`` ends that
   session's running operations and cursors on the server; users may always
-  kill their own sessions, so this needs no privilege beyond ``read``.  The
-  command goes to the primary, so with a ``readPreference`` that sends reads
-  to a secondary, a cancelled read there still runs until ``maxTimeMS``.  A
-  deployment without session support gets no sessions (and no kill).
+  kill their own sessions, so this needs no privilege beyond ``read``.  A
+  kill ends the operation running at that moment; multi-step tools check for
+  a cancel between steps.  The command goes to the primary, so with a
+  ``readPreference`` that sends reads to a secondary, a cancelled read there
+  still runs until ``maxTimeMS``.  A call the deployment will not give a
+  session (a server without session support, or a member that is not
+  readable yet) runs without one, as in 0.3.0, and cannot be killed.
 * The tools see one database, and never its ``system.*`` collections.
 
 Still connect as a user holding only the ``read`` role on that database; the
@@ -46,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -53,6 +57,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..exceptions import ToolError
+from ..logging import LOGGER_NAME
 from ..server import MCPServer
 from . import _cancel, _cli
 
@@ -362,7 +367,7 @@ def build_server(
                     )
             return client[0][database_name]
 
-    supports_sessions = True  # until the deployment says otherwise
+    warned_no_sessions = False
 
     def in_session(db: Any, operation: Callable[[Any, Any], Any], stopped: threading.Event) -> Any:
         client = db.client
@@ -390,19 +395,28 @@ def build_server(
 
     def run(operation: Callable[[Any, Any], Any]) -> Any:
         """Run *operation(db, session)* in a session a cancel can kill."""
-        nonlocal supports_sessions
+        nonlocal warned_no_sessions
         _cancel.raise_if_cancelled()
         stopped = threading.Event()  # killed because the call was cancelled
         try:
             db = get_database()
-            if supports_sessions:
-                try:
-                    return in_session(db, operation, stopped)
-                except Exception as exc:
-                    if not _sessions_unsupported(exc):
-                        raise
-                    # Nothing was sent; run it as 0.3.0 did, without a kill.
-                    supports_sessions = False
+            try:
+                return in_session(db, operation, stopped)
+            except Exception as exc:
+                if not _sessions_unsupported(exc):
+                    raise
+            # Refused on this connection before anything was sent.  Run the
+            # call as 0.3.0 did, without a kill; the next call tries again,
+            # since a member that was not readable yet may be by then.
+            if stopped.is_set():
+                raise _cancel.cancelled_error()
+            _cancel.raise_if_cancelled()
+            if not warned_no_sessions:
+                warned_no_sessions = True
+                logging.getLogger(LOGGER_NAME).warning(
+                    "MongoDB refused a session; calls without one cannot be stopped "
+                    "on the server when cancelled (they still end at maxTimeMS)"
+                )
             return operation(db, None)
         except ToolError:
             raise
@@ -484,6 +498,9 @@ def build_server(
             kind = infos[0].get("type", "collection")
             target = db[collection]
             fields: dict[str, set[str]] = {}
+            # A kill ends only the operation running when it lands, so each
+            # step checks whether the call is still wanted.
+            _cancel.raise_if_cancelled()
             sample = target.aggregate(
                 [{"$sample": {"size": sample_size}}], session=session, maxTimeMS=max_time_ms
             )
@@ -494,6 +511,7 @@ def build_server(
                     fields.setdefault(key, set()).add(_bson_type(value))
             # A view has no indexes of its own (MongoDB refuses to list them);
             # the collection it reads from does.
+            _cancel.raise_if_cancelled()
             indexes = (
                 []
                 if kind == "view"
@@ -502,6 +520,7 @@ def build_server(
                     for name, info in sorted(target.index_information(session=session).items())
                 ]
             )
+            _cancel.raise_if_cancelled()
             return {
                 "collection": collection,
                 "type": kind,

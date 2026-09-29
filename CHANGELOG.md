@@ -19,15 +19,20 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   function directly. Tools that ignore the token behave as before.
 - `max_sync_workers` (default 32) caps the sync tools running at once. A call
   beyond it is refused with the new `ServerBusyError` (`-32008`), and does not
-  count against `max_calls_per_session`. A worker is free again before its
-  call's answer is sent, so a client that never exceeds the cap is never
-  refused.
+  count against `max_calls_per_session`. A worker is free again before a
+  finished call's answer is sent, so a client that never has more than
+  `max_sync_workers` sync calls running is not refused. A call that timed out
+  or was cancelled keeps its worker until the tool returns: briefly for a tool
+  that acts on its token, until it finishes for one that does not. A retry
+  sent right away may therefore get `-32008`.
 - The audit event `tool_finished_after_cancel` records a sync tool that
   finished after its call was cancelled or timed out, with its outcome.
 - `MCPServer.wait_for_tool_threads(timeout)` gives sync tool threads and
-  cancel callbacks a bounded time to finish. Stdio calls it after its
+  cancel callbacks a bounded time to finish, including calls cancelled just
+  before that have yet to start their callbacks. Stdio calls it after its
   `shutdown_timeout` drain, with the same timeout. The HTTP and SSE transports
-  call it for 5 s when their app shuts down. Call it yourself before exiting
+  call it for 5 s when their app shuts down, after cancelling the calls of
+  the sessions they close. Call it yourself before exiting
   when you drive `dispatch` directly: the threads are daemons, so a process
   that exits first stops a callback before its `KILL QUERY` goes out.
 
@@ -55,11 +60,14 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   before a statement starts. MongoDB runs each call in a session of its own
   and ends it with `killSessions`, which needs no privilege beyond `read` for
   one's own sessions. A session that a kill may still target is never put
-  back in the driver's pool, so the kill cannot reach another call. The kill
-  goes to the primary: with a `readPreference` that sends reads to a
-  secondary, a cancelled read there runs on until `maxTimeMS`. A deployment
-  without session support gets no sessions and no kill, as in 0.3.0. A call
-  cancelled before its statement starts never sends it.
+  back in the driver's pool, so the kill cannot reach another call. A kill
+  ends the operation running when it lands, and `describe_collection` checks
+  for a cancel between its steps. The kill goes to the primary: with a
+  `readPreference` that sends reads to a secondary, a cancelled read there
+  runs on until `maxTimeMS`. A call that the deployment refuses a session (a
+  server without session support, or a member that is not readable yet) runs
+  without one and cannot be killed, as in 0.3.0; the next call tries again. A
+  call cancelled before its statement starts never sends it.
 - The GitHub connector sends no request for a call that has already been
   cancelled or timed out. A write that was already sent may still complete;
   this is documented, and audited as `tool_finished_after_cancel`.

@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ._version import __version__
-from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
+from .cancellation import CANCELLED, TIMEOUT, CancelToken, _noop, _run_callbacks, cancel_scope
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     INTERNAL_ERROR,
@@ -85,11 +85,14 @@ def _protocol_error_response(msg_id: Any, exc: ProtocolError) -> dict[str, Any]:
     return _error_response(msg_id, exc.code, str(exc), exc.data)
 
 
-def _settle(future: asyncio.Future[Any], ok: bool, value: Any) -> None:
+def _settle(
+    future: asyncio.Future[Any], ok: bool, value: Any, delivered: Callable[[], None]
+) -> None:
     # Runs on the event loop.  The future is already cancelled when the call
     # was cancelled or timed out; the late outcome then has nobody to go to.
     if future.done():
         return
+    delivered()
     if ok:
         future.set_result(value)
     elif isinstance(value, StopIteration):
@@ -234,9 +237,11 @@ class MCPServer:
         self._sync_slots = (
             threading.BoundedSemaphore(max_sync_workers) if max_sync_workers is not None else None
         )
-        # Sync tool and cancel-callback threads still running.
+        # Sync tool and cancel-callback threads still running, and the tool
+        # call tasks in flight (touched only on the event loop).
         self._threads: set[threading.Thread] = set()
         self._threads_lock = threading.Lock()
+        self._calls: set[asyncio.Task[Any]] = set()
         self.max_sessions = max_sessions
         self.allowed_origins = (
             normalize_origins(allowed_origins) if allowed_origins is not None else None
@@ -515,6 +520,8 @@ class MCPServer:
         task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
             self._execute_tool(params, context)
         )
+        self._calls.add(task)
+        task.add_done_callback(self._calls.discard)
         if msg_id is not None:
             context.in_flight[msg_id] = task
         try:
@@ -728,24 +735,30 @@ class MCPServer:
                 # the client's next call could find it still taken.
                 if slots is not None:
                     slots.release()
-            try:
-                # If the call was (or is about to be) cancelled or timed out,
-                # the client was told so; a tool that acts (a write, say) may
-                # have done so anyway, and this is the record of it.  Runs at
-                # once if the token has fired, or when it fires: the deadline
-                # can pass before the token is triggered.
-                token.on_cancel(
-                    lambda: audit(
-                        "tool_finished_after_cancel",
-                        tool=name,
-                        client_id=context.client_id,
-                        reason=token.reason,
-                        status="ok" if outcome[0] else "error",
-                    )
+            status = "ok" if outcome[0] else "error"
+
+            def finished_late() -> None:
+                # The client was told the call was cancelled or timed out; a
+                # tool that acts (a write, say) may have done so anyway, and
+                # this is the record of it.
+                audit(
+                    "tool_finished_after_cancel",
+                    tool=name,
+                    client_id=context.client_id,
+                    reason=token.reason,
+                    status=status,
                 )
+
+            # Runs at once if the token has fired, or when it fires: the
+            # deadline can pass before the token is triggered.  Unregistered
+            # when the answer is delivered, so a finished call keeps neither
+            # its result nor a token<->callback cycle alive.
+            delivered = _noop
+            try:
+                delivered = token.on_cancel(finished_late)
             finally:
                 with contextlib.suppress(RuntimeError):  # the loop has closed
-                    loop.call_soon_threadsafe(_settle, future, *outcome)
+                    loop.call_soon_threadsafe(_settle, future, *outcome, delivered)
 
         try:
             self._spawn(f"easy-mcp-tool:{name}", work)
@@ -815,37 +828,38 @@ class MCPServer:
         stops them where they are: a cancel callback that has not sent its
         ``KILL QUERY`` yet never sends it.  The transports call this as they
         shut down; call it yourself before exiting when you drive
-        :meth:`dispatch` directly.  Threads started while it waits (a
-        cancel's callbacks) are waited for too.
+        :meth:`dispatch` directly.  Calls cancelled just before (a session
+        ended at shutdown) are waited for until they have started their
+        callbacks, and those are waited for too.  It polls on the event
+        loop, so it needs no free worker thread.
 
         Returns:
             How many are still running when it gives up (logged as well).
         """
-        await asyncio.sleep(0)  # let calls cancelled just now start their callbacks
         deadline = time.monotonic() + max(timeout, 0.0)
-
-        def join() -> list[str]:
-            while True:
-                with self._threads_lock:
-                    alive = [thread for thread in self._threads if thread.is_alive()]
-                remaining = deadline - time.monotonic()
-                if not alive or remaining <= 0:
-                    return [thread.name for thread in alive]
-                # Short slices, so threads started meanwhile are picked up.
-                alive[0].join(min(remaining, 0.05))
-
-        with self._threads_lock:
-            if not self._threads:
-                return 0
-        left = await asyncio.to_thread(join)
+        while True:
+            left = self._still_running()
+            if not left or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.02)
         if left:
             self._logger.warning(
-                "%d tool thread(s) still running after %gs; stopping without them: %s",
+                "%d tool call(s) or thread(s) still running after %gs; stopping without them: %s",
                 len(left),
                 timeout,
                 ", ".join(sorted(left)),
             )
         return len(left)
+
+    def _still_running(self) -> list[str]:
+        # A call being cancelled has yet to trigger its token and start its
+        # callbacks' thread; _stop_tool does both in one step on this loop.
+        unwinding = [
+            "cancelled call" for task in self._calls if not task.done() and task.cancelling()
+        ]
+        with self._threads_lock:
+            threads = [t.name for t in self._threads if t.ident is None or t.is_alive()]
+        return unwinding + threads
 
     # -------------------------------------------------------------- lifecycle
 

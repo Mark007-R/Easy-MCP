@@ -111,8 +111,15 @@ class SSETransport(BaseHTTPTransport):
         )
 
     async def close_all_sessions(self) -> None:
-        """Unblock every open SSE stream so its connection can close."""
+        """Unblock every open SSE stream so its connection can close.
+
+        Calls still running have nobody left to answer; they are cancelled
+        now rather than when each stream winds down, so shutdown can wait
+        for their cancel callbacks.
+        """
         for session in list(self._sessions.values()):
+            for task in list(session.tasks):
+                task.cancel()
             await session.queue.put(_CLOSE)
 
     # ------------------------------------------------------------- endpoints
@@ -187,9 +194,7 @@ class SSETransport(BaseHTTPTransport):
         # Cheap header-based rejection first ...
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > max_bytes:
-            return JSONResponse(
-                {"error": f"request exceeds {max_bytes} bytes"}, status_code=413
-            )
+            return JSONResponse({"error": f"request exceeds {max_bytes} bytes"}, status_code=413)
 
         session_id = request.query_params.get("session_id", "")
         session = self._sessions.get(session_id)
@@ -218,9 +223,7 @@ class SSETransport(BaseHTTPTransport):
                 session_id=session_id,
                 client_id=session.context.client_id,
             )
-            return JSONResponse(
-                {"error": "credential does not match session"}, status_code=403
-            )
+            return JSONResponse({"error": "credential does not match session"}, status_code=403)
 
         try:
             message = json.loads(bytes(body).decode("utf-8"))
