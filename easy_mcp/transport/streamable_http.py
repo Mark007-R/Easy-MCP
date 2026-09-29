@@ -259,6 +259,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
     # ------------------------------------------------------------------ app
 
+    async def close_streams(self) -> None:
+        if self._legacy is not None:
+            await self._legacy.close_all_sessions()
+
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
         routes = [

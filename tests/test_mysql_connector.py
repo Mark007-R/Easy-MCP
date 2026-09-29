@@ -6,13 +6,12 @@ from __future__ import annotations
 import datetime
 import decimal
 import json
-import logging
 import threading
 import time
 from typing import Any
 
 import pytest
-from conftest import make_context, rpc
+from conftest import LogCapture, make_context, rpc
 
 from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import mysql
@@ -442,18 +441,16 @@ def test_a_finished_statement_is_not_killed_by_a_later_cancel() -> None:
 
 
 def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
-    caplog: pytest.LogCaptureFixture,
+    logs: LogCapture,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        mysql.build_server(
-            url="mysql://u:p@h/db",
-            connector=lambda: None,
-            statement_timeout=20,
-            default_timeout=10,
-            rate_limit_per_minute=None,
-        )
-    assert "default_timeout (10s) is not longer than the statement timeout (20s)" in caplog.text
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        mysql.build_server(url="mysql://u:p@h/db", connector=lambda: None)
-    assert "default_timeout" not in caplog.text
+    mysql.build_server(
+        url="mysql://u:p@h/db",
+        connector=lambda: None,
+        statement_timeout=20,
+        default_timeout=10,
+        rate_limit_per_minute=None,
+    )
+    assert "default_timeout (10s) is not longer than the statement timeout (20s)" in logs.text
+    logs.records.clear()
+    mysql.build_server(url="mysql://u:p@h/db", connector=lambda: None)
+    assert "default_timeout" not in logs.text

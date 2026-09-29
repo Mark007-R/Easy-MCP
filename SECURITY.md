@@ -124,10 +124,18 @@ the client is untrusted, the credential in the environment is trusted.
   (`MCPServer.wait_for_tool_threads`). That leaves time for a connector's
   `KILL QUERY` to reach the database. A thread still running after that dies
   with the process, without running its `finally` blocks. So does one in a
-  process that drives `dispatch` itself and exits without that wait.
-- **A MongoDB cancel reaches only the primary.** `killSessions` is sent to the
-  primary. With a `readPreference` that routes reads to a secondary, a
-  cancelled read there keeps running until its `maxTimeMS`.
+  process that drives `dispatch` itself and exits without that wait. Under
+  your own uvicorn (`build_app()`), set `--timeout-graceful-shutdown`: uvicorn
+  waits for open SSE streams to close before it shuts the app down, and a
+  forced exit skips that wait entirely. `server.run()` closes those streams
+  itself.
+- **A MongoDB cancel reaches only the primary, and only calls with a
+  session.** `killSessions` is sent to the primary. With a `readPreference`
+  that routes reads to a secondary, a cancelled read there keeps running until
+  its `maxTimeMS`. A call that the deployment will not give a session (no
+  session support, or a member that is not readable yet) runs without one and
+  cannot be killed. It ends at `maxTimeMS`, or for the discovery commands at
+  the socket timeout. The server logs this once.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx, a cloud LB).
   API keys travel in headers and must not cross the network in plaintext.
 - **Single-process sessions.** Handshake-era SSE and Streamable HTTP sessions

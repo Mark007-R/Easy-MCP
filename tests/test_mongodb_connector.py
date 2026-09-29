@@ -6,14 +6,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import logging
 import threading
 import time
 from typing import Any
 
 import pytest
 from bson import ObjectId
-from conftest import make_context, notification, rpc
+from conftest import LogCapture, make_context, notification, rpc
 
 from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import mongodb
@@ -483,11 +482,10 @@ async def test_a_call_cancelled_before_it_starts_opens_no_session() -> None:
 
 
 def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
-    caplog: pytest.LogCaptureFixture,
+    logs: LogCapture,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        make(statement_timeout=30, default_timeout=30)
-    assert "is not longer than the statement timeout" in caplog.text
+    make(statement_timeout=30, default_timeout=30)
+    assert "is not longer than the statement timeout" in logs.text
 
 
 def client_pool_empty(db: FakeDatabase) -> bool:
@@ -523,19 +521,18 @@ async def test_a_finished_call_returns_its_session_to_the_pool() -> None:
 
 
 async def test_deployments_without_sessions_still_work_without_the_kill(
-    caplog: pytest.LogCaptureFixture,
+    logs: LogCapture,
 ) -> None:
     server, db = make()
     db.client.supports_sessions = False
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        first = ok(await call(server, "find", {"collection": "orders"}))
-        second = ok(await call(server, "find", {"collection": "orders"}))
+    first = ok(await call(server, "find", {"collection": "orders"}))
+    second = ok(await call(server, "find", {"collection": "orders"}))
     assert first["count"] == second["count"] == 3
     # Each call asks for a session (a member may become readable), is
     # refused before anything is sent, and runs without one.
     one, two = db.client.sessions
     assert [c[4].get("session") for c in db.calls] == [one, None, two, None]
-    assert caplog.text.count("MongoDB refused a session") == 1  # said once
+    assert logs.text.count("MongoDB refused a session") == 1  # said once
 
 
 async def test_sessions_are_used_again_once_the_deployment_allows_them() -> None:

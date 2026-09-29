@@ -49,7 +49,7 @@ _current: contextvars.ContextVar[CancelToken | None] = contextvars.ContextVar(
 class CancelToken:
     """The cancellation signal for one tool call; thread-safe."""
 
-    __slots__ = ("_callbacks", "_event", "_lock", "_reason")
+    __slots__ = ("__weakref__", "_callbacks", "_event", "_lock", "_reason")
 
     def __init__(self) -> None:
         self._event = threading.Event()

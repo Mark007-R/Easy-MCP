@@ -110,6 +110,9 @@ class SSETransport(BaseHTTPTransport):
             lifespan=lifespan,
         )
 
+    async def close_streams(self) -> None:
+        await self.close_all_sessions()
+
     async def close_all_sessions(self) -> None:
         """Unblock every open SSE stream so its connection can close.
 

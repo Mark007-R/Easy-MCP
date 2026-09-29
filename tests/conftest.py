@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -72,3 +73,47 @@ def live_server() -> Iterator[Callable[[Any], str]]:
     for uv, thread in running:
         uv.should_exit = True
         thread.join(timeout=5)
+
+
+class LogCapture(logging.Handler):
+    """Records from the ``easy_mcp`` loggers, audit events included.
+
+    Attached to the ``easy_mcp`` logger itself: it does not propagate to the
+    root logger (``configure_logging``), so pytest's ``caplog`` sees its
+    records only by accident of test order.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(record.getMessage() for record in self.records)
+
+    def events(self, kind: str) -> list[dict[str, Any]]:
+        """The payloads of the audit events named *kind*."""
+        return [
+            record.event  # type: ignore[attr-defined]
+            for record in self.records
+            if record.name == "easy_mcp.audit" and record.getMessage() == kind
+        ]
+
+
+@pytest.fixture
+def logs() -> Iterator[LogCapture]:
+    """Capture what the server logs and audits during the test."""
+    logger = logging.getLogger("easy_mcp")
+    capture = LogCapture()
+    level = logger.level
+    if level == logging.NOTSET or level > logging.INFO:
+        logger.setLevel(logging.INFO)
+    logger.addHandler(capture)
+    try:
+        yield capture
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(level)

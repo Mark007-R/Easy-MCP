@@ -18,11 +18,12 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ._version import __version__
-from .cancellation import CANCELLED, TIMEOUT, CancelToken, _noop, _run_callbacks, cancel_scope
+from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     INTERNAL_ERROR,
@@ -85,14 +86,11 @@ def _protocol_error_response(msg_id: Any, exc: ProtocolError) -> dict[str, Any]:
     return _error_response(msg_id, exc.code, str(exc), exc.data)
 
 
-def _settle(
-    future: asyncio.Future[Any], ok: bool, value: Any, delivered: Callable[[], None]
-) -> None:
+def _settle(future: asyncio.Future[Any], ok: bool, value: Any) -> None:
     # Runs on the event loop.  The future is already cancelled when the call
     # was cancelled or timed out; the late outcome then has nobody to go to.
     if future.done():
         return
-    delivered()
     if ok:
         future.set_result(value)
     elif isinstance(value, StopIteration):
@@ -736,29 +734,35 @@ class MCPServer:
                 if slots is not None:
                     slots.release()
             status = "ok" if outcome[0] else "error"
+            token_ref = weakref.ref(token)
 
             def finished_late() -> None:
                 # The client was told the call was cancelled or timed out; a
                 # tool that acts (a write, say) may have done so anyway, and
                 # this is the record of it.
+                fired = token_ref()
                 audit(
                     "tool_finished_after_cancel",
                     tool=name,
                     client_id=context.client_id,
-                    reason=token.reason,
+                    reason=fired.reason if fired is not None else None,
                     status=status,
                 )
 
             # Runs at once if the token has fired, or when it fires: the
-            # deadline can pass before the token is triggered.  Unregistered
-            # when the answer is delivered, so a finished call keeps neither
-            # its result nor a token<->callback cycle alive.
-            delivered = _noop
+            # deadline, or a cancel, can land after the answer is ready but
+            # before the call takes it.  It stays registered for the token's
+            # life; it holds neither the result nor the token itself, so a
+            # finished call keeps nothing alive through it.
             try:
-                delivered = token.on_cancel(finished_late)
+                token.on_cancel(finished_late)
             finally:
                 with contextlib.suppress(RuntimeError):  # the loop has closed
-                    loop.call_soon_threadsafe(_settle, future, *outcome, delivered)
+                    loop.call_soon_threadsafe(_settle, future, *outcome)
+                # An exception's traceback holds this frame, and this frame
+                # the exception: break the cycle, or a late error keeps every
+                # frame of the failed tool alive until a full collection.
+                del outcome
 
         try:
             self._spawn(f"easy-mcp-tool:{name}", work)

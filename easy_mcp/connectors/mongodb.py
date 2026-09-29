@@ -415,7 +415,8 @@ def build_server(
                 warned_no_sessions = True
                 logging.getLogger(LOGGER_NAME).warning(
                     "MongoDB refused a session; calls without one cannot be stopped "
-                    "on the server when cancelled (they still end at maxTimeMS)"
+                    "on the server when cancelled (they still end at maxTimeMS, or for "
+                    "discovery commands at the socket timeout)"
                 )
             return operation(db, None)
         except ToolError:

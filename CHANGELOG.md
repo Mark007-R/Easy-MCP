@@ -43,6 +43,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   holds up unrelated calls queued behind it. At exit the transports wait for
   such threads only for the bounded time above. 0.3.0 waited until they
   finished, however long that took.
+- `server.run()` over HTTP closes open legacy SSE streams as shutdown begins.
+  Before, uvicorn waited for SSE clients to disconnect before it would shut
+  the app down, so Ctrl-C with a client connected hung until a second one
+  forced the exit.
 - Sync calls beyond `max_sync_workers` are refused with `-32008` at once.
   0.3.0 queued them on the default executor, which held at most
   min(32, CPUs + 4) threads. A client that fires more than 32 sync calls at
