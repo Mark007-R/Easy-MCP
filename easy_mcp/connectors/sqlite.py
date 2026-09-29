@@ -9,7 +9,9 @@ server: point it at a file and it serves.  Three layers keep it read-only:
 * ``PRAGMA query_only`` is set as well, for defence in depth.
 
 SQLite has no statement timeout, so a progress handler aborts any statement
-that runs past the deadline, and results are capped at a row limit.
+that runs past the deadline, and results are capped at a row limit.  A tool
+call that is cancelled, or hits the server's tool timeout, interrupts its
+statement at once.
 
 The database path comes from ``--database`` or the ``SQLITE_PATH``
 environment variable.
@@ -27,15 +29,17 @@ import base64
 import math
 import os
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from ..cancellation import CancelToken, current_cancel_token
 from ..exceptions import ToolError
 from ..server import MCPServer
-from . import _cli
+from . import _cancel, _cli
 
 PATH_ENV_VAR = "SQLITE_PATH"
 DEFAULT_STATEMENT_TIMEOUT = 10.0
@@ -88,14 +92,26 @@ def _read_only_uri(path: Path) -> str:
     return f"{path.as_uri()}?mode=ro"
 
 
-def connect(path: Path, statement_timeout: float) -> sqlite3.Connection:
-    """Open *path* read-only, with the authorizer and deadline installed."""
+def connect(
+    path: Path, statement_timeout: float, cancel_token: CancelToken | None = None
+) -> sqlite3.Connection:
+    """Open *path* read-only, with the authorizer and deadline installed.
+
+    With *cancel_token*, a cancelled call also aborts the statement.  The
+    caller interrupts it directly as well; this check covers a cancel that
+    lands just before a statement starts, which ``interrupt()`` would miss.
+    """
     connection = sqlite3.connect(_read_only_uri(path), uri=True)
     connection.execute("PRAGMA query_only = ON")
     connection.set_authorizer(_authorizer)
     deadline = time.monotonic() + statement_timeout
-    # A nonzero return aborts the running statement with "interrupted".
-    connection.set_progress_handler(lambda: int(time.monotonic() > deadline), _PROGRESS_STEPS)
+
+    def should_abort() -> int:
+        # A nonzero return aborts the running statement with "interrupted".
+        cancelled = cancel_token is not None and cancel_token.cancelled
+        return int(cancelled or time.monotonic() > deadline)
+
+    connection.set_progress_handler(should_abort, _PROGRESS_STEPS)
     return connection
 
 
@@ -119,10 +135,23 @@ def _run(
     timeout: float,
 ) -> tuple[list[str], list[list[Any]], bool]:
     """Execute *sql* read-only; returns ``(columns, rows, truncated)``."""
+    _cancel.raise_if_cancelled()
     try:
         connection = connector()
     except sqlite3.Error as exc:
         raise ToolError(f"Database error: cannot open the database ({exc})") from None
+    # interrupt() is the one Connection method safe to call from another
+    # thread; it aborts the running statement with "interrupted".  It must
+    # not overlap close(), hence the lock.
+    closing = threading.Lock()
+    closed = threading.Event()
+
+    def stop() -> None:
+        with closing:
+            if not closed.is_set():
+                connection.interrupt()
+
+    remove_stop = _cancel.on_cancel(stop)
     try:
         cursor = connection.execute(sql, params)
         if cursor.description is None:
@@ -133,13 +162,19 @@ def _run(
         return columns, rows, len(fetched) > limit
     except sqlite3.Error as exc:
         message = str(exc)
+        token = current_cancel_token()
+        if message == "interrupted" and token is not None and token.cancelled:
+            raise _cancel.cancelled_error() from None
         if message == "interrupted":
             message = f"statement exceeded the {timeout:g}s time limit"
         elif message in ("not authorized", "authorization denied"):
             message = "not authorized: this connector only reads"
         raise ToolError(f"Database error: {message}") from None
     finally:
-        connection.close()
+        remove_stop()
+        with closing:
+            closed.set()
+            connection.close()
 
 
 def build_server(
@@ -186,7 +221,7 @@ def build_server(
         raise ValueError(f"cannot open the SQLite database at {database}: {exc}") from None
 
     def open_connection() -> sqlite3.Connection:
-        return connect(database, statement_timeout)
+        return connect(database, statement_timeout, current_cancel_token())
 
     def run(sql: str, params: Sequence[Any] = (), *, limit: int) -> Any:
         return _run(open_connection, sql, params, limit=limit, timeout=statement_timeout)
@@ -201,6 +236,7 @@ def build_server(
     )
     server_options.setdefault("default_timeout", statement_timeout + 5)
     server = MCPServer(**server_options)
+    _cancel.warn_if_server_gives_up_first(server, statement_timeout)
 
     @server.tool
     def list_tables() -> list[dict[str, Any]]:

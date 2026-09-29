@@ -3,15 +3,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
+import logging
+import threading
+import time
 from typing import Any
 
 import pytest
 from bson import ObjectId
-from conftest import make_context, rpc
+from conftest import make_context, notification, rpc
 
-from easy_mcp import MCPServer
+from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import mongodb
 from easy_mcp.connectors.mongodb import check_pipeline
 from easy_mcp.exceptions import ToolError
@@ -39,6 +43,11 @@ class FakeCollection:
 
     def find(self, filter: Any, projection: Any = None, **options: Any) -> list[Any]:
         self.db.calls.append(("find", self.name, filter, projection, options))
+        if self.db.block is not None:
+            # A slow read: runs until its session is killed.
+            self.db.block.set()
+            if self.db.client.admin.killed.wait(10):
+                raise FakeOperationFailure("operation was interrupted")
         if self.db.fail is not None:
             raise self.db.fail
         return (self.db.docs or DOCS)[: options["limit"]]
@@ -56,7 +65,7 @@ class FakeCollection:
     def estimated_document_count(self, **options: Any) -> int:
         return 3
 
-    def index_information(self) -> dict[str, Any]:
+    def index_information(self, session: Any = None) -> dict[str, Any]:
         if self.name == "big_orders":
             # What MongoDB answers for a view (code 166).
             raise FakeOperationFailure("Namespace shop.big_orders is a view, not a collection")
@@ -70,13 +79,63 @@ class FakeOperationFailure(Exception):
 FakeOperationFailure.__module__ = "pymongo.errors"
 
 
+class FakeServerSession:
+    def __init__(self) -> None:
+        self.dirty = False
+
+    def mark_dirty(self) -> None:
+        self.dirty = True
+
+
+class FakeSession:
+    """What pymongo's ClientSession offers the connector."""
+
+    def __init__(self, number: int) -> None:
+        self.session_id = {"id": f"session-{number}"}
+        self.ended = False
+        self._server_session = FakeServerSession()
+
+    def __enter__(self) -> FakeSession:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.ended = True
+
+
+class FakeAdmin:
+    def __init__(self) -> None:
+        self.commands: list[Any] = []
+        self.killed = threading.Event()
+
+    def command(self, name: str, value: Any) -> dict[str, Any]:
+        self.commands.append((name, value))
+        if name == "killSessions":
+            self.killed.set()
+        return {"ok": 1}
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.admin = FakeAdmin()
+        self.sessions: list[FakeSession] = []
+
+    def start_session(self, **options: Any) -> FakeSession:
+        session = FakeSession(len(self.sessions) + 1)
+        self.sessions.append(session)
+        return session
+
+
 class FakeDatabase:
     def __init__(self) -> None:
         self.calls: list[Any] = []
         self.fail: Exception | None = None
         self.docs: list[Any] | None = None
+        self.block: threading.Event | None = None
+        self.client = FakeClient()
 
-    def list_collections(self, filter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def list_collections(
+        self, session: Any = None, filter: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
         infos = [
             {"name": "orders", "type": "collection"},
             {"name": "big_orders", "type": "view"},
@@ -214,7 +273,8 @@ async def test_find_speaks_extended_json_both_ways() -> None:
     assert name == "orders"
     assert filter == {"_id": OID}  # {"$oid": ...} became a real ObjectId
     assert projection == {"name": 1}
-    assert options == {"sort": [("total", -1)], "limit": 3, "max_time_ms": 3000}
+    session = db.client.sessions[0]
+    assert options == {"sort": [("total", -1)], "limit": 3, "max_time_ms": 3000, "session": session}
     assert result["count"] == 2
     assert result["truncated"] is True
     assert result["documents"][0]["_id"] == {"$oid": str(OID)}
@@ -229,7 +289,8 @@ async def test_aggregate_appends_the_row_cap_and_time_limit() -> None:
     )
     _, _, sent, options = db.calls[0]
     assert sent == [{"$match": {"total": {"$gt": 10}}}, {"$limit": 6}]
-    assert options == {"maxTimeMS": 10000, "allowDiskUse": False}
+    session = db.client.sessions[0]
+    assert options == {"maxTimeMS": 10000, "allowDiskUse": False, "session": session}
     assert result["count"] == 3 and result["truncated"] is False
 
 
@@ -350,3 +411,56 @@ def test_srv_uris_are_not_resolved_at_startup() -> None:
     )
     assert server.name == "easy-mcp-mongodb"
     assert time.monotonic() - started < 2  # no DNS query was made
+
+
+# ------------------------------------------------------------ cancellation
+
+
+async def test_a_cancelled_call_kills_its_session() -> None:
+    server, db = make()
+    db.block = threading.Event()
+    context = make_context()
+    call = asyncio.create_task(
+        server.dispatch(
+            rpc("tools/call", {"name": "find", "arguments": {"collection": "orders"}}, 9), context
+        )
+    )
+    assert await asyncio.to_thread(db.block.wait, 5)
+    began = time.perf_counter()
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 9}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    assert await asyncio.to_thread(db.client.admin.killed.wait, 1)
+    assert time.perf_counter() - began < 1.0
+    (session,) = db.client.sessions
+    assert db.client.admin.commands == [("killSessions", [session.session_id])]
+    assert session._server_session.dirty  # never reused from the driver's pool
+    # The find ran in that very session.
+    assert db.calls[0][4]["session"] is session
+
+
+async def test_every_call_runs_in_a_session_of_its_own() -> None:
+    server, db = make()
+    ok(await call(server, "find", {"collection": "orders"}))
+    ok(await call(server, "count", {"collection": "orders"}))
+    first, second = db.client.sessions
+    assert first is not second and first.ended and second.ended
+    assert db.calls[1][3]["session"] is second
+    assert db.client.admin.commands == []  # finished calls are never killed
+
+
+async def test_a_call_cancelled_before_it_starts_opens_no_session() -> None:
+    server, db = make()
+    token = CancelToken()
+    token.cancel()
+    tool = next(t for t in server.tools if t.name == "count")
+    with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+        tool.fn(collection="orders")
+    assert db.client.sessions == []
+
+
+def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        make(statement_timeout=30, default_timeout=30)
+    assert "is not longer than the statement timeout" in caplog.text

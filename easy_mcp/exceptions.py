@@ -28,6 +28,7 @@ PAYLOAD_TOO_LARGE = -32004
 TOOL_TIMEOUT = -32005
 SESSION_LIMIT_EXCEEDED = -32006
 TOO_MANY_SESSIONS = -32007
+SERVER_BUSY = -32008
 
 # --- Codes the MCP spec defines (its reserved -32020..-32099 sub-range) -------
 HEADER_MISMATCH = -32020
@@ -116,3 +117,9 @@ class SessionLimitError(ProtocolError):
     """A per-session tool usage limit was reached."""
 
     code = SESSION_LIMIT_EXCEEDED
+
+
+class ServerBusyError(ProtocolError):
+    """Every worker thread for sync tools is occupied; retry shortly."""
+
+    code = SERVER_BUSY

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sqlite3
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import make_context, rpc
+from conftest import make_context, notification, rpc
 
-from easy_mcp import MCPServer
+from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import sqlite
+from easy_mcp.exceptions import TOOL_TIMEOUT, ToolError
 
 
 @pytest.fixture
@@ -225,3 +230,76 @@ async def test_unc_paths_open(db: Path) -> None:
     assert "file:////localhost/" in sqlite._read_only_uri(unc)
     tables = ok(await call(make(unc), "list_tables"))
     assert {"name": "orders", "type": "table"} in tables
+
+
+# ------------------------------------------------------------ cancellation
+
+# Counts forever; only an interrupt ends it.
+RUNAWAY = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n"
+
+
+def query_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "easy-mcp-tool:query"]
+
+
+async def wait_until(predicate: Any, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+async def test_a_cancelled_query_stops_running(db: Path) -> None:
+    server = make(db, statement_timeout=60)
+    context = make_context()
+    call = asyncio.create_task(
+        server.dispatch(
+            rpc("tools/call", {"name": "query", "arguments": {"sql": RUNAWAY}}, 5), context
+        )
+    )
+    assert await wait_until(lambda: bool(query_threads()), 5)
+    await asyncio.sleep(0.2)  # well into the statement
+    began = time.perf_counter()
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 5}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    assert await wait_until(lambda: not query_threads(), 1.0)
+    assert time.perf_counter() - began < 1.0
+
+
+async def test_the_server_timeout_stops_the_query_too(db: Path) -> None:
+    # A server timeout below the statement limit (warned about at startup)
+    # still stops the statement, instead of leaving it to run.
+    server = make(db, statement_timeout=60, default_timeout=0.3)
+    response = await call(server, "query", {"sql": RUNAWAY})
+    assert response["error"]["code"] == TOOL_TIMEOUT
+    assert await wait_until(lambda: not query_threads(), 1.0)
+
+
+def test_a_cancel_just_before_the_statement_still_stops_it(db: Path) -> None:
+    # interrupt() is a no-op when no statement runs yet; the progress
+    # handler catches a cancel that lands in that gap.
+    token = CancelToken()
+    connection = sqlite.connect(db, 60, token)
+    token.cancel()
+    began = time.perf_counter()
+    with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+        connection.execute(RUNAWAY).fetchone()
+    assert time.perf_counter() - began < 1.0
+    connection.close()
+
+
+def test_the_deadline_is_still_reported_as_such(db: Path) -> None:
+    token = CancelToken()
+    with cancel_scope(token):
+        with pytest.raises(ToolError, match=r"exceeded the 0.2s time limit"):
+            sqlite._run(lambda: sqlite.connect(db, 0.2, token), RUNAWAY, limit=5, timeout=0.2)
+
+
+def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
+    db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        make(db, statement_timeout=10, default_timeout=5)
+    assert "is not longer than the statement timeout" in caplog.text

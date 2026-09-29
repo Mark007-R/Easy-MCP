@@ -16,6 +16,7 @@ Quickstart::
 """
 
 from ._version import __version__
+from .cancellation import CancelToken, cancel_scope, current_cancel_token
 from .decorators import ToolDefinition
 from .exceptions import (
     AuthenticationError,
@@ -25,6 +26,7 @@ from .exceptions import (
     ProtocolError,
     RateLimitError,
     SchemaError,
+    ServerBusyError,
     SessionLimitError,
     ToolError,
     ToolRegistrationError,
@@ -43,6 +45,7 @@ __all__ = [
     "APIKeyAuth",
     "AuthenticationError",
     "AuthorizationError",
+    "CancelToken",
     "ClientContext",
     "ClientIdentity",
     "EasyMCPError",
@@ -54,6 +57,7 @@ __all__ = [
     "SSETransport",
     "SUPPORTED_PROTOCOL_VERSIONS",
     "SchemaError",
+    "ServerBusyError",
     "SessionLimitError",
     "SlidingWindowRateLimiter",
     "StdioTransport",
@@ -64,4 +68,6 @@ __all__ = [
     "Transport",
     "ValidationError",
     "__version__",
+    "cancel_scope",
+    "current_cancel_token",
 ]

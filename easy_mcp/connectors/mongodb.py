@@ -16,6 +16,10 @@ clients to reading:
   ``describe_collection``) carries ``maxTimeMS``, and results are row-capped.
   The discovery commands, which MongoDB does not let carry ``maxTimeMS``, are
   bounded by the socket timeout instead.
+* Each tool call runs its operations in a session of its own.  When the call
+  is cancelled, or hits the server's tool timeout, ``killSessions`` ends that
+  session's running operations and cursors on the server; users may always
+  kill their own sessions, so this needs no privilege beyond ``read``.
 * The tools see one database, and never its ``system.*`` collections.
 
 Still connect as a user holding only the ``read`` role on that database; the
@@ -47,7 +51,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..exceptions import ToolError
 from ..server import MCPServer
-from . import _cli
+from . import _cancel, _cli
 
 URI_ENV_VAR = "MONGODB_URI"
 DEFAULT_STATEMENT_TIMEOUT = 10.0
@@ -244,6 +248,18 @@ def _is_driver_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".", 1)[0] in ("pymongo", "bson")
 
 
+def kill_session(client: Any, session: Any, session_id: Any) -> None:
+    """End every operation and cursor of *session* on the server.
+
+    ``killSessions`` needs no privilege for the caller's own sessions.
+    """
+    # A killed session must not go back to the driver's pool for reuse.
+    mark_dirty = getattr(getattr(session, "_server_session", None), "mark_dirty", None)
+    if mark_dirty is not None:
+        mark_dirty()
+    client.admin.command("killSessions", [session_id])
+
+
 def _require_driver() -> None:
     try:
         import pymongo  # noqa: F401
@@ -329,9 +345,29 @@ def build_server(
                     )
             return client[0][database_name]
 
-    def run(operation: Callable[[Any], Any]) -> Any:
+    def run(operation: Callable[[Any, Any], Any]) -> Any:
+        """Run *operation(db, session)* in a session a cancel can kill."""
+        _cancel.raise_if_cancelled()
+        stopped = threading.Event()  # killed because the call was cancelled
         try:
-            return operation(get_database())
+            db = get_database()
+            client = db.client
+            with client.start_session(causal_consistency=False) as session:
+                # Read here, not in the cancelling thread: the driver creates
+                # the id lazily.
+                session_id = session.session_id
+
+                def stop() -> None:
+                    stopped.set()
+                    kill_session(client, session, session_id)
+
+                remove_stop = _cancel.on_cancel(stop)
+                try:
+                    if stopped.is_set():
+                        raise _cancel.cancelled_error()
+                    return operation(db, session)
+                finally:
+                    remove_stop()
         except ToolError:
             raise
         except OverflowError:
@@ -339,6 +375,8 @@ def build_server(
         except Exception as exc:
             if not _is_driver_error(exc):
                 raise
+            if stopped.is_set():
+                raise _cancel.cancelled_error() from None
             kind = type(exc).__name__
             if kind in ("ExecutionTimeout", "NetworkTimeout") or "exceeded time limit" in str(exc):
                 raise ToolError(
@@ -369,15 +407,16 @@ def build_server(
     )
     server_options.setdefault("default_timeout", statement_timeout + CONNECT_TIMEOUT + 5)
     server = MCPServer(**server_options)
+    _cancel.warn_if_server_gives_up_first(server, statement_timeout)
 
     @server.tool
     def list_collections() -> list[dict[str, Any]]:
         """List the database's collections and views (system collections are omitted)."""
 
-        def operation(db: Any) -> list[dict[str, Any]]:
+        def operation(db: Any, session: Any) -> list[dict[str, Any]]:
             found = [
                 {"name": info["name"], "type": info.get("type", "collection")}
-                for info in db.list_collections()
+                for info in db.list_collections(session=session)
                 if not info["name"].startswith("system.")
             ]
             return sorted(found, key=lambda info: info["name"])
@@ -402,14 +441,16 @@ def build_server(
         if not 1 <= sample_size <= 100:
             raise ToolError("sample_size must be between 1 and 100")
 
-        def operation(db: Any) -> dict[str, Any]:
-            infos = list(db.list_collections(filter={"name": collection}))
+        def operation(db: Any, session: Any) -> dict[str, Any]:
+            infos = list(db.list_collections(session=session, filter={"name": collection}))
             if not infos:
                 raise ToolError(f"no collection named {collection}")
             kind = infos[0].get("type", "collection")
             target = db[collection]
             fields: dict[str, set[str]] = {}
-            sample = target.aggregate([{"$sample": {"size": sample_size}}], maxTimeMS=max_time_ms)
+            sample = target.aggregate(
+                [{"$sample": {"size": sample_size}}], session=session, maxTimeMS=max_time_ms
+            )
             sampled = 0
             for document in sample:
                 sampled += 1
@@ -422,12 +463,14 @@ def build_server(
                 if kind == "view"
                 else [
                     {"name": name, "keys": [[field, order] for field, order in info["key"]]}
-                    for name, info in sorted(target.index_information().items())
+                    for name, info in sorted(target.index_information(session=session).items())
                 ]
             )
             return {
                 "collection": collection,
                 "type": kind,
+                # The one operation MongoDB will not run in a session; it
+                # reads collection metadata and carries maxTimeMS.
                 "estimated_count": target.estimated_document_count(maxTimeMS=max_time_ms),
                 "sampled": sampled,
                 "fields": {key: sorted(kinds) for key, kinds in sorted(fields.items())},
@@ -464,13 +507,14 @@ def build_server(
         query = _object_from_json(filter or {}, "filter")
         fields = _object_from_json(projection, "projection") if projection else None
 
-        def operation(db: Any) -> dict[str, Any]:
+        def operation(db: Any, session: Any) -> dict[str, Any]:
             cursor = db[collection].find(
                 query,
                 fields,
                 sort=list(sort.items()) if sort else None,
                 limit=limit + 1,
                 max_time_ms=max_time_ms,
+                session=session,
             )
             documents, truncated = fetch(cursor, limit)
             return {"documents": documents, "count": len(documents), "truncated": truncated}
@@ -489,7 +533,11 @@ def build_server(
         _check_collection_name(collection)
         _check_operators(filter)
         query = _object_from_json(filter or {}, "filter")
-        counted: int = run(lambda db: db[collection].count_documents(query, maxTimeMS=max_time_ms))
+        counted: int = run(
+            lambda db, session: db[collection].count_documents(
+                query, session=session, maxTimeMS=max_time_ms
+            )
+        )
         return counted
 
     @server.tool
@@ -512,8 +560,10 @@ def build_server(
 
         stages = _from_json(pipeline, "pipeline") + [{"$limit": limit + 1}]
 
-        def operation(db: Any) -> dict[str, Any]:
-            cursor = db[collection].aggregate(stages, maxTimeMS=max_time_ms, allowDiskUse=False)
+        def operation(db: Any, session: Any) -> dict[str, Any]:
+            cursor = db[collection].aggregate(
+                stages, session=session, maxTimeMS=max_time_ms, allowDiskUse=False
+            )
             documents, truncated = fetch(cursor, limit)
             return {"documents": documents, "count": len(documents), "truncated": truncated}
 

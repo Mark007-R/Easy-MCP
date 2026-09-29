@@ -10,8 +10,11 @@ a protection.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import logging
+import threading
 import time
 import traceback
 import uuid
@@ -19,6 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ._version import __version__
+from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     INTERNAL_ERROR,
@@ -27,6 +31,7 @@ from .exceptions import (
     METHOD_NOT_FOUND,
     TOOL_TIMEOUT,
     ProtocolError,
+    ServerBusyError,
     SessionLimitError,
     ToolError,
     ValidationError,
@@ -60,6 +65,10 @@ PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 DISCOVER_TTL_MS = 3_600_000
 TOOLS_LIST_TTL_MS = 0
 
+# Sync tools that may run at once: the most asyncio's default executor, where
+# sync tools used to run, ever allowed.
+DEFAULT_MAX_SYNC_WORKERS = 32
+
 
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
@@ -74,6 +83,20 @@ def _error_response(msg_id: Any, code: int, message: str, data: Any = None) -> d
 
 def _protocol_error_response(msg_id: Any, exc: ProtocolError) -> dict[str, Any]:
     return _error_response(msg_id, exc.code, str(exc), exc.data)
+
+
+def _settle(future: asyncio.Future[Any], ok: bool, value: Any) -> None:
+    # Runs on the event loop.  The future is already cancelled when the call
+    # was cancelled or timed out; the late outcome then has nobody to go to.
+    if future.done():
+        return
+    if ok:
+        future.set_result(value)
+    elif isinstance(value, StopIteration):
+        # A future refuses StopIteration; the call would never settle.
+        future.set_exception(RuntimeError("tool raised StopIteration"))
+    else:
+        future.set_exception(value)
 
 
 def _tool_failure(text: str) -> dict[str, Any]:
@@ -158,6 +181,12 @@ class MCPServer:
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
             overrides it; ``None`` disables.
+        max_sync_workers: Cap on sync tools running at once.  Each runs in a
+            thread of its own, and a cancelled or timed-out call keeps its
+            thread until the tool returns, so the cap also bounds threads
+            left behind by tools that ignore their cancel token.  A call
+            beyond it is refused with ``-32008`` rather than queued.
+            ``None`` removes the cap.
         max_sessions: Cap on concurrent sessions, enforced by each HTTP
             endpoint (Streamable HTTP, legacy SSE); stdio has exactly one.
         allowed_origins: Browser origins allowed to call the HTTP endpoints,
@@ -181,6 +210,7 @@ class MCPServer:
         rate_limit_per_minute: int | None = 120,
         max_request_bytes: int = 1_048_576,
         default_timeout: float | None = 30.0,
+        max_sync_workers: int | None = DEFAULT_MAX_SYNC_WORKERS,
         max_sessions: int = 256,
         allowed_origins: Iterable[str] | None = None,
         instructions: str | None = None,
@@ -190,6 +220,8 @@ class MCPServer:
             raise ValueError("default_timeout must be positive or None")
         if max_request_bytes < 1:
             raise ValueError("max_request_bytes must be >= 1")
+        if max_sync_workers is not None and max_sync_workers < 1:
+            raise ValueError("max_sync_workers must be >= 1 or None")
         self.host = host
         self.port = port
         self.name = name
@@ -198,6 +230,10 @@ class MCPServer:
         self.auth = auth
         self.max_request_bytes = max_request_bytes
         self.default_timeout = default_timeout
+        self.max_sync_workers = max_sync_workers
+        self._sync_slots = (
+            threading.BoundedSemaphore(max_sync_workers) if max_sync_workers is not None else None
+        )
         self.max_sessions = max_sessions
         self.allowed_origins = (
             normalize_origins(allowed_origins) if allowed_origins is not None else None
@@ -549,16 +585,25 @@ class MCPServer:
         def _duration_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
 
+        # The tool (and, for a sync tool, its thread) finds this through
+        # current_cancel_token(); a cancel or timeout below triggers it.
+        token = CancelToken()
         try:
-            if definition.is_async:
-                awaitable: Any = definition.fn(**arguments)
-            else:
-                # Sync tools run in a worker thread so they cannot block the
-                # event loop.  NOTE: a timeout/cancel abandons the thread —
-                # Python cannot force-kill it (documented in SECURITY.md).
-                awaitable = asyncio.to_thread(definition.fn, **arguments)
-            result = await asyncio.wait_for(awaitable, timeout)
+            with cancel_scope(token):
+                if definition.is_async:
+                    awaitable: Any = definition.fn(**arguments)
+                else:
+                    # Sync tools run in a worker thread so they cannot block
+                    # the event loop.  Python cannot kill that thread, so a
+                    # cancel or timeout reaches the tool through the token.
+                    awaitable = self._start_sync_tool(definition, arguments, token, context)
+                result = await asyncio.wait_for(awaitable, timeout)
+        except ServerBusyError:
+            context.tool_calls[name] -= 1  # it never ran
+            audit("tool_call", tool=name, client_id=context.client_id, status="busy")
+            raise
         except TimeoutError:
+            self._stop_tool(token, TIMEOUT, name, context)
             audit(
                 "tool_call",
                 tool=name,
@@ -570,6 +615,7 @@ class MCPServer:
                 f"Tool '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
             ) from None
         except asyncio.CancelledError:
+            self._stop_tool(token, CANCELLED, name, context)
             raise
         except ToolError as exc:
             # Intentional, safe-to-show tool error raised by the tool author.
@@ -638,6 +684,98 @@ class MCPServer:
             status="ok",
         )
         return payload
+
+    def _start_sync_tool(
+        self,
+        definition: ToolDefinition,
+        arguments: dict[str, Any],
+        token: CancelToken,
+        context: ClientContext,
+    ) -> asyncio.Future[Any]:
+        """Run a sync tool on a thread of its own; returns its future.
+
+        A daemon thread rather than a shared pool: a tool that ignores its
+        token keeps its thread after the call is abandoned, and in a pool
+        that thread would hold up unrelated calls queued behind it (and, at
+        exit, the interpreter).  ``max_sync_workers`` bounds them instead.
+
+        Raises:
+            ServerBusyError: ``max_sync_workers`` tools are already running.
+        """
+        slots = self._sync_slots
+        if slots is not None and not slots.acquire(blocking=False):
+            raise ServerBusyError(
+                f"Server busy: all {self.max_sync_workers} tool workers are in use; retry shortly"
+            )
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        # Carries the cancel token (and any other context) into the thread,
+        # as asyncio.to_thread does.
+        run_in_context = contextvars.copy_context().run
+        name = definition.name
+
+        def work() -> None:
+            try:
+                try:
+                    outcome: tuple[bool, Any] = (True, run_in_context(definition.fn, **arguments))
+                except BaseException as exc:
+                    outcome = (False, exc)
+                if token.cancelled:
+                    # The client was told the call was cancelled or timed
+                    # out; a tool that acts (a write, say) may have done so
+                    # anyway, and this is the record of it.
+                    audit(
+                        "tool_finished_after_cancel",
+                        tool=name,
+                        client_id=context.client_id,
+                        reason=token.reason,
+                        status="ok" if outcome[0] else "error",
+                    )
+                with contextlib.suppress(RuntimeError):  # the loop has closed
+                    loop.call_soon_threadsafe(_settle, future, *outcome)
+            finally:
+                if slots is not None:
+                    slots.release()
+
+        try:
+            threading.Thread(target=work, name=f"easy-mcp-tool:{name}", daemon=True).start()
+        except BaseException:
+            if slots is not None:
+                slots.release()
+            raise
+        return future
+
+    def _stop_tool(
+        self, token: CancelToken, reason: str, name: str, context: ClientContext
+    ) -> None:
+        """Trigger *token* and run its callbacks off the event loop.
+
+        The flag is set at once, so a tool polling ``token.cancelled`` sees
+        it immediately; callbacks may block (a MySQL ``KILL QUERY`` opens a
+        connection), so they get a thread of their own.
+        """
+        callbacks = token._trigger(reason)
+        if not callbacks:
+            return
+
+        def failed(exc: Exception) -> None:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.warning(
+                "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
+            )
+            audit(
+                "cancel_callback_failed",
+                tool=name,
+                client_id=context.client_id,
+                error_id=error_id,
+            )
+
+        threading.Thread(
+            target=_run_callbacks,
+            args=(callbacks, failed),
+            name=f"easy-mcp-cancel:{name}",
+            daemon=True,
+        ).start()
 
     # -------------------------------------------------------------- lifecycle
 

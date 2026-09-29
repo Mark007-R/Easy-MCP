@@ -8,13 +8,15 @@ import email.message
 import io
 import json
 import sys
+import threading
+import time
 import urllib.error
 from typing import Any
 
 import pytest
 from conftest import make_context, rpc
 
-from easy_mcp import APIKeyAuth, MCPServer
+from easy_mcp import APIKeyAuth, CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import github, postgres
 from easy_mcp.connectors.github import GitHubClient
 from easy_mcp.exceptions import ToolError
@@ -349,3 +351,107 @@ def test_postgres_cli_reports_configuration_errors(monkeypatch: pytest.MonkeyPat
     with pytest.raises(SystemExit) as excinfo:
         postgres.main(["--transport", "stdio"])
     assert excinfo.value.code == 2  # argparse usage error, not a traceback
+
+
+# ------------------------------------------------------------ cancellation
+
+
+class BlockingCursor:
+    """A cursor whose statement runs until Postgres is asked to cancel it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+        self.description: list[Any] | None = None
+
+    def __enter__(self) -> BlockingCursor:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.started.set()
+        if self.cancelled.wait(10):  # SELECT pg_sleep(30), until cancelled
+            raise FakeDriverError("canceling statement due to user request")
+
+    def fetchmany(self, size: int) -> list[Any]:
+        return []
+
+
+class CancellableConnection(FakeConnection):
+    """Records cancel requests; psycopg 3.2+ has cancel_safe, 3.1 only cancel."""
+
+    def __init__(self, cursor: Any, *, safe: bool = True) -> None:
+        super().__init__(cursor)
+        self.cancel_requests: list[str] = []
+        if safe:
+            self.cancel_safe = self._cancel_safe
+
+    def _cancel_safe(self, *, timeout: float) -> None:
+        self.cancel_requests.append(f"cancel_safe(timeout={timeout:g})")
+        self._release()
+
+    def cancel(self) -> None:
+        self.cancel_requests.append("cancel()")
+        self._release()
+
+    def _release(self) -> None:
+        cancelled = getattr(self._cursor, "cancelled", None)
+        if cancelled is not None:
+            cancelled.set()
+
+
+@pytest.mark.parametrize("safe", [True, False], ids=["cancel_safe", "cancel"])
+def test_postgres_a_cancelled_call_cancels_its_statement(safe: bool) -> None:
+    cursor = BlockingCursor()
+    connection = CancellableConnection(cursor, safe=safe)
+    token = CancelToken()
+    outcome: list[Any] = []
+
+    def query() -> None:
+        with cancel_scope(token):
+            try:
+                outcome.append(postgres._run(lambda: connection, "SELECT pg_sleep(30)", limit=5))
+            except ToolError as exc:
+                outcome.append(exc)
+
+    thread = threading.Thread(target=query)
+    thread.start()
+    assert cursor.started.wait(5)
+    began = time.perf_counter()
+    token.cancel()
+    thread.join(5)
+    assert time.perf_counter() - began < 1.0
+    expected = f"cancel_safe(timeout={postgres.CONNECT_TIMEOUT})" if safe else "cancel()"
+    assert connection.cancel_requests == [expected]
+    (error,) = outcome
+    assert isinstance(error, ToolError) and "cancelled" in str(error)
+
+
+def test_postgres_a_finished_statement_is_not_cancelled_later() -> None:
+    _, cursor = postgres_server()
+    connection = CancellableConnection(cursor)
+    token = CancelToken()
+    with cancel_scope(token):
+        _, rows, _ = postgres._run(lambda: connection, "SELECT id FROM users", limit=5)
+    token.cancel()
+    assert rows == [[1], [2], [3]]
+    assert connection.cancel_requests == []
+
+
+def test_postgres_a_call_cancelled_before_it_starts_never_connects() -> None:
+    token = CancelToken()
+    token.cancel("timeout")
+    opened: list[object] = []
+    with cancel_scope(token), pytest.raises(ToolError, match="timed out"):
+        postgres._run(lambda: opened.append(1), "SELECT 1", limit=5)
+    assert opened == []
+
+
+def test_github_sends_nothing_for_a_cancelled_call() -> None:
+    client = GitHubClient(token="t", api_url="http://127.0.0.1:9")  # nothing listens there
+    token = CancelToken()
+    token.cancel()
+    with cancel_scope(token), pytest.raises(ToolError, match="not sent"):
+        client.request("POST", "/repos/o/r/issues", body={"title": "x"})
