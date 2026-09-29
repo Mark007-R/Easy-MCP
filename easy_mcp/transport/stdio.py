@@ -62,7 +62,9 @@ class StdioTransport(Transport):
         stdout: Binary stream to write responses to (defaults to the real
             stdout; injectable for tests).
         shutdown_timeout: Seconds to let in-flight tool calls finish after
-            stdin closes before they are cancelled.
+            stdin closes before they are cancelled; then as long again for
+            sync tool threads and cancel callbacks (a connector's ``KILL
+            QUERY``, say) to finish before serving ends.
     """
 
     def __init__(
@@ -146,6 +148,8 @@ class StdioTransport(Transport):
                 task.add_done_callback(in_flight.discard)
         finally:
             await self._drain(in_flight)
+            # Daemon threads die with the process, cancel callbacks included.
+            await self._server.wait_for_tool_threads(self._shutdown_timeout)
             if self._stdout_override is None:
                 sys.stdout = real_stdout
             self._loop = None

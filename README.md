@@ -367,6 +367,12 @@ that ignores its token keeps that thread until it returns, so at most
 `max_sync_workers` sync tools run at once; a call beyond that is refused with
 `-32008` at once rather than queued behind them.
 
+The threads are daemons, so the transports give them a bounded time to finish
+as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
+a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
+yourself, `await server.wait_for_tool_threads(5)` before exiting does the
+same.
+
 ### Error handling
 
 | Situation | What the client sees |
@@ -440,7 +446,9 @@ A database connector stops the statement on the database itself when its
 call is cancelled or runs past the server's tool timeout: `KILL QUERY` on
 MySQL, a cancel request on Postgres, `interrupt()` on SQLite, `killSessions`
 on MongoDB. An abandoned call does not keep a query running until
-`--statement-timeout`. The connectors set the server's `default_timeout`
+`--statement-timeout`. On MongoDB the kill goes to the primary, so it does
+not reach a read that a `readPreference` sent to a secondary; that read still
+ends at `maxTimeMS`. The connectors set the server's `default_timeout`
 longer than the statement timeout, so the database's own limit is what
 normally ends a slow statement; one built with a shorter `default_timeout`
 logs a warning at startup.

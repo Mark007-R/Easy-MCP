@@ -18,16 +18,30 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   can be polled. `cancel_scope(token)` sets a token for code that calls a tool
   function directly. Tools that ignore the token behave as before.
 - `max_sync_workers` (default 32) caps the sync tools running at once. A call
-  beyond it is refused with the new `ServerBusyError` (`-32008`) instead of
-  being queued, and does not count against `max_calls_per_session`.
+  beyond it is refused with the new `ServerBusyError` (`-32008`), and does not
+  count against `max_calls_per_session`. A worker is free again before its
+  call's answer is sent, so a client that never exceeds the cap is never
+  refused.
 - The audit event `tool_finished_after_cancel` records a sync tool that
   finished after its call was cancelled or timed out, with its outcome.
+- `MCPServer.wait_for_tool_threads(timeout)` gives sync tool threads and
+  cancel callbacks a bounded time to finish. Stdio calls it after its
+  `shutdown_timeout` drain, with the same timeout. The HTTP and SSE transports
+  call it for 5 s when their app shuts down. Call it yourself before exiting
+  when you drive `dispatch` directly: the threads are daemons, so a process
+  that exits first stops a callback before its `KILL QUERY` goes out.
 
 ### Changed
 
 - Each sync tool call runs on a daemon thread of its own instead of asyncio's
   shared default executor. A thread left behind by a cancelled call no longer
-  holds up unrelated calls queued behind it, or the interpreter at exit.
+  holds up unrelated calls queued behind it. At exit the transports wait for
+  such threads only for the bounded time above. 0.3.0 waited until they
+  finished, however long that took.
+- Sync calls beyond `max_sync_workers` are refused with `-32008` at once.
+  0.3.0 queued them on the default executor, which held at most
+  min(32, CPUs + 4) threads. A client that fires more than 32 sync calls at
+  once should retry the refused ones.
 - The database connectors warn at startup when the server's `default_timeout`
   is not longer than their statement timeout.
 
@@ -40,8 +54,12 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   statement, and its progress handler also catches a cancel that lands just
   before a statement starts. MongoDB runs each call in a session of its own
   and ends it with `killSessions`, which needs no privilege beyond `read` for
-  one's own sessions. The killed session is not reused from the driver's
-  pool. A call cancelled before its statement starts never sends it.
+  one's own sessions. A session that a kill may still target is never put
+  back in the driver's pool, so the kill cannot reach another call. The kill
+  goes to the primary: with a `readPreference` that sends reads to a
+  secondary, a cancelled read there runs on until `maxTimeMS`. A deployment
+  without session support gets no sessions and no kill, as in 0.3.0. A call
+  cancelled before its statement starts never sends it.
 - The GitHub connector sends no request for a call that has already been
   cancelled or timed out. A write that was already sent may still complete;
   this is documented, and audited as `tool_finished_after_cancel`.

@@ -118,6 +118,16 @@ the client is untrusted, the credential in the environment is trusted.
   connector's `create_issue`, cannot be recalled by a cancel and may still
   complete. Long-running work that cannot watch the token belongs in async
   tools or external workers.
+- **Tool threads get a bounded time at shutdown.** Sync tools and cancel
+  callbacks run on daemon threads. As they stop, the transports wait for them
+  for stdio's `shutdown_timeout`, or 5 s over HTTP/SSE
+  (`MCPServer.wait_for_tool_threads`). That leaves time for a connector's
+  `KILL QUERY` to reach the database. A thread still running after that dies
+  with the process, without running its `finally` blocks. So does one in a
+  process that drives `dispatch` itself and exits without that wait.
+- **A MongoDB cancel reaches only the primary.** `killSessions` is sent to the
+  primary. With a `readPreference` that routes reads to a secondary, a
+  cancelled read there keeps running until its `maxTimeMS`.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx, a cloud LB).
   API keys travel in headers and must not cross the network in plaintext.
 - **Single-process sessions.** Handshake-era SSE and Streamable HTTP sessions

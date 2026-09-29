@@ -109,6 +109,11 @@ class OriginGuard:
         await self.app(scope, receive, send)
 
 
+# How long the HTTP transports wait at shutdown for sync tool threads and
+# cancel callbacks to finish (stdio uses its own shutdown_timeout).
+THREAD_SHUTDOWN_GRACE = 5.0
+
+
 class BaseHTTPTransport(Transport):
     """Shared plumbing for transports that uvicorn serves over HTTP."""
 

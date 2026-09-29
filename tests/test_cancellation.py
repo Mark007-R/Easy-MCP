@@ -7,9 +7,12 @@ import io
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -330,19 +333,26 @@ async def test_sync_calls_beyond_the_worker_cap_are_refused_not_queued() -> None
     assert "retry" in busy["error"]["message"]
     assert context.tool_calls["add"] == 0  # a refused call does not count
 
-    # Once the worker is free again, so are calls.
+    # The worker is free again by the time the answer arrives.
     blocker.release.set()
     assert (await asyncio.wait_for(first, 5))["result"]["isError"] is False
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        again = await server.dispatch(
-            rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}}, 3), context
-        )
-        assert again is not None
-        if "result" in again:
-            break
-        await asyncio.sleep(0.02)
+    again = await server.dispatch(
+        rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}}, 3), context
+    )
+    assert again is not None
     assert again["result"]["content"][0]["text"] == "3"
+
+
+async def test_sequential_calls_at_the_cap_are_never_refused() -> None:
+    # One call at a time never exceeds one worker, so none may be refused:
+    # the worker is freed before the answer can reach the client.
+    server = make_server(Blocker(), max_sync_workers=1)
+    context = make_context()
+    for n in range(300):
+        response = await server.dispatch(
+            rpc("tools/call", {"name": "add", "arguments": {"a": n, "b": 1}}, n), context
+        )
+        assert response is not None and "result" in response, (n, response)
 
 
 async def test_an_abandoned_thread_keeps_its_worker_until_it_returns() -> None:
@@ -486,3 +496,205 @@ async def test_a_sync_tool_raising_stop_iteration_still_answers() -> None:
         server.dispatch(rpc("tools/call", {"name": "exhausted"}), make_context()), 3
     )
     assert response is not None and response["result"]["isError"] is True
+
+
+# ---------------------------------------------------------------- shutdown
+
+
+class SlowToStop:
+    """A tool that honours its token, with a cancel callback that takes a
+    while, like opening a second connection to send KILL QUERY."""
+
+    def __init__(self, delay: float = 0.4) -> None:
+        self.delay = delay
+        self.started = threading.Event()
+        self.callback_done = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self) -> str:
+        token = current_cancel_token()
+        assert token is not None
+        token.on_cancel(self.stop)
+        self.started.set()
+        self.release.wait(30)
+        return "done"
+
+    def stop(self) -> None:
+        time.sleep(self.delay)
+        self.callback_done.set()
+        self.release.set()
+
+
+async def test_stdio_shutdown_waits_for_cancel_callbacks() -> None:
+    tool = SlowToStop(delay=0.2)
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    server.register_tool(lambda: tool(), name="slow", description="Stops slowly.")
+    read_end, write_end = os.pipe()
+    stdin = os.fdopen(read_end, "rb")
+    writer = os.fdopen(write_end, "wb")
+    # 0.3s to finish in-flight calls, then as long again for the callbacks
+    # they trigger; the callback needs 0.2s.
+    transport = StdioTransport(server, stdin=stdin, stdout=io.BytesIO(), shutdown_timeout=0.3)
+    serving = asyncio.create_task(transport.serve())
+    try:
+        writer.write(json.dumps(rpc("tools/call", {"name": "slow"}, 1)).encode() + b"\n")
+        writer.flush()
+        assert await wait_for(tool.started)
+        writer.close()
+        await asyncio.wait_for(serving, 10)
+        # serve() returned only after the callback had done its work.
+        assert tool.callback_done.is_set()
+    finally:
+        if not writer.closed:
+            writer.close()
+        stdin.close()
+
+
+STDIO_CHILD = """
+import sys, threading, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from easy_mcp import MCPServer, StdioTransport, current_cancel_token
+
+marker = Path(sys.argv[1])
+server = MCPServer(port=0, rate_limit_per_minute=None)
+
+@server.tool
+def slow() -> str:
+    \"\"\"Stops slowly.\"\"\"
+    release = threading.Event()
+
+    def stop() -> None:
+        time.sleep(0.3)  # a connection round trip, say
+        marker.write_text("killed")
+        release.set()
+
+    current_cancel_token().on_cancel(stop)
+    marker.with_suffix(".started").write_text("")
+    release.wait(30)
+    return "done"
+
+StdioTransport(server, shutdown_timeout=1.0).run()
+"""
+
+
+def test_a_stdio_process_does_not_exit_before_its_cancel_callbacks(tmp_path: Path) -> None:
+    # The real exit: daemon threads die with the interpreter, so the
+    # transport must wait for them before it returns.
+    script = tmp_path / "child.py"
+    script.write_text(STDIO_CHILD)
+    marker = tmp_path / "marker.txt"
+    repo = str(Path(__file__).resolve().parent.parent)
+    child = subprocess.Popen(
+        [sys.executable, str(script), str(marker), repo],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert child.stdin is not None
+    child.stdin.write(json.dumps(rpc("tools/call", {"name": "slow"}, 1)).encode() + b"\n")
+    child.stdin.flush()
+    deadline = time.monotonic() + 10
+    while not marker.with_suffix(".started").exists():
+        assert time.monotonic() < deadline, "the tool never started"
+        time.sleep(0.05)
+    child.stdin.close()
+    assert child.wait(10) == 0
+    assert marker.read_text() == "killed"
+
+
+async def test_the_http_lifespan_waits_for_cancel_callbacks() -> None:
+    tool = SlowToStop()
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    server.register_tool(lambda: tool(), name="slow", description="Stops slowly.")
+    app = server.build_app()
+    async with app.router.lifespan_context(app):
+        call = asyncio.create_task(
+            server.dispatch(rpc("tools/call", {"name": "slow"}, 1), make_context())
+        )
+        assert await wait_for(tool.started)
+        call.cancel()  # what ending a session at shutdown does
+    assert tool.callback_done.is_set()
+    done, _ = await asyncio.wait({call}, timeout=5)
+    assert done  # the call itself ended (dropped, or cancelled outright)
+
+
+async def test_waiting_for_tool_threads_is_bounded(caplog: pytest.LogCaptureFixture) -> None:
+    blocker = Blocker(obey=False)
+    server = make_server(blocker)
+    context = make_context()
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "block"}, 1), context))
+    assert await wait_for(blocker.started)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 1}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
+        began = time.perf_counter()
+        assert await server.wait_for_tool_threads(0.2) == 1
+        assert time.perf_counter() - began < 1.0
+    assert "easy-mcp-tool:block" in caplog.text
+    blocker.release.set()
+    assert await server.wait_for_tool_threads(5) == 0
+
+
+async def test_a_cancel_thread_that_cannot_start_does_not_mask_the_cancel(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    real_start = threading.Thread.start
+
+    def start(thread: threading.Thread) -> None:
+        if thread.name.startswith("easy-mcp-cancel"):
+            raise RuntimeError("can't start new thread")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    blocker = Blocker()
+    server = make_server(blocker)
+    server.unregister_tool("block")
+    server.register_tool(lambda: blocker(), name="block", description="Block.", timeout=0.2)
+    context = make_context()
+    with caplog.at_level(logging.INFO):
+        timed_out = await server.dispatch(rpc("tools/call", {"name": "block"}, 1), context)
+    assert timed_out is not None and timed_out["error"]["code"] == TOOL_TIMEOUT
+    assert audit_events(caplog, "cancel_callback_failed")
+    blocker.release.set()
+    assert await wait_for(blocker.finished)
+
+    for event in (blocker.started, blocker.finished, blocker.release):
+        event.clear()
+    server.unregister_tool("block")
+    server.register_tool(lambda: blocker(), name="block", description="Block.")
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "block"}, 2), context))
+    assert await wait_for(blocker.started)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 2}), context)
+    assert await asyncio.wait_for(call, 5) is None  # still dropped, per MCP
+    blocker.release.set()
+
+
+async def test_a_tool_finishing_between_the_deadline_and_the_trigger_is_audited(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The deadline cancels the call's future a step before the token fires;
+    # a tool that returns in between still had its answer thrown away.
+    blocker = Blocker(obey=False)
+    server = make_server(blocker)
+    server.unregister_tool("block")
+    server.register_tool(lambda: blocker(), name="block", description="Block.", timeout=0.2)
+    stop_tool = server._stop_tool
+
+    def late(token: CancelToken, reason: str, name: str, context: Any) -> None:
+        blocker.release.set()
+        assert blocker.finished.wait(2)
+        time.sleep(0.1)  # the worker is done with the tool before the token fires
+        stop_tool(token, reason, name, context)
+
+    server._stop_tool = late  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO):
+        response = await server.dispatch(rpc("tools/call", {"name": "block"}), make_context())
+        assert response is not None and response["error"]["code"] == TOOL_TIMEOUT
+        deadline = time.monotonic() + 3
+        while (
+            not audit_events(caplog, "tool_finished_after_cancel") and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.02)
+    (event,) = audit_events(caplog, "tool_finished_after_cancel")
+    assert event["reason"] == "timeout" and event["status"] == "ok"

@@ -43,7 +43,7 @@ from starlette.routing import Route
 
 from ..exceptions import PARSE_ERROR, AuthenticationError, RateLimitError
 from ..logging import audit
-from ._http import BaseHTTPTransport
+from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -102,6 +102,7 @@ class SSETransport(BaseHTTPTransport):
             finally:
                 # Graceful shutdown: unblock every open SSE stream.
                 await self.close_all_sessions()
+                await self._server.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
 
         return Starlette(
             routes=[*self.routes(), Route("/healthz", self._handle_health, methods=["GET"])],

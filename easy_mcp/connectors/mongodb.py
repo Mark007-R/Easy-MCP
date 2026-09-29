@@ -19,7 +19,10 @@ clients to reading:
 * Each tool call runs its operations in a session of its own.  When the call
   is cancelled, or hits the server's tool timeout, ``killSessions`` ends that
   session's running operations and cursors on the server; users may always
-  kill their own sessions, so this needs no privilege beyond ``read``.
+  kill their own sessions, so this needs no privilege beyond ``read``.  The
+  command goes to the primary, so with a ``readPreference`` that sends reads
+  to a secondary, a cancelled read there still runs until ``maxTimeMS``.  A
+  deployment without session support gets no sessions (and no kill).
 * The tools see one database, and never its ``system.*`` collections.
 
 Still connect as a user holding only the ``read`` role on that database; the
@@ -248,16 +251,30 @@ def _is_driver_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".", 1)[0] in ("pymongo", "bson")
 
 
-def kill_session(client: Any, session: Any, session_id: Any) -> None:
-    """End every operation and cursor of *session* on the server.
+def kill_session(client: Any, session_id: Any) -> None:
+    """End every operation and cursor of the session *session_id* on the server.
 
     ``killSessions`` needs no privilege for the caller's own sessions.
     """
-    # A killed session must not go back to the driver's pool for reuse.
+    client.admin.command("killSessions", [session_id])
+
+
+def _discard(session: Any) -> None:
+    """Keep *session*'s server session out of the driver's pool.
+
+    The pool hands a returned session id to the next call, and a
+    ``killSessions`` for it that is still on its way would kill that call's
+    operation instead.  A dirty session is dropped, not pooled.
+    """
     mark_dirty = getattr(getattr(session, "_server_session", None), "mark_dirty", None)
     if mark_dirty is not None:
         mark_dirty()
-    client.admin.command("killSessions", [session_id])
+
+
+def _sessions_unsupported(exc: BaseException) -> bool:
+    # pymongo refuses an explicit session, before sending anything, when the
+    # deployment does not advertise logicalSessionTimeoutMinutes.
+    return type(exc).__name__ == "ConfigurationError" and "Sessions are not supported" in str(exc)
 
 
 def _require_driver() -> None:
@@ -345,29 +362,48 @@ def build_server(
                     )
             return client[0][database_name]
 
+    supports_sessions = True  # until the deployment says otherwise
+
+    def in_session(db: Any, operation: Callable[[Any, Any], Any], stopped: threading.Event) -> Any:
+        client = db.client
+        with client.start_session(causal_consistency=False) as session:
+            # Read here, not in the cancelling thread: the driver creates the
+            # id lazily.
+            session_id = session.session_id
+
+            def stop() -> None:
+                stopped.set()
+                kill_session(client, session_id)
+
+            remove_stop = _cancel.on_cancel(stop)
+            try:
+                if stopped.is_set():
+                    raise _cancel.cancelled_error()
+                return operation(db, session)
+            finally:
+                remove_stop()
+                # remove_stop() and a cancel take the same lock: if stop() can
+                # still run, the call counts as cancelled by now, and the
+                # session it will kill must not be pooled for another call.
+                if stopped.is_set() or _cancel.cancelled():
+                    _discard(session)
+
     def run(operation: Callable[[Any, Any], Any]) -> Any:
         """Run *operation(db, session)* in a session a cancel can kill."""
+        nonlocal supports_sessions
         _cancel.raise_if_cancelled()
         stopped = threading.Event()  # killed because the call was cancelled
         try:
             db = get_database()
-            client = db.client
-            with client.start_session(causal_consistency=False) as session:
-                # Read here, not in the cancelling thread: the driver creates
-                # the id lazily.
-                session_id = session.session_id
-
-                def stop() -> None:
-                    stopped.set()
-                    kill_session(client, session, session_id)
-
-                remove_stop = _cancel.on_cancel(stop)
+            if supports_sessions:
                 try:
-                    if stopped.is_set():
-                        raise _cancel.cancelled_error()
-                    return operation(db, session)
-                finally:
-                    remove_stop()
+                    return in_session(db, operation, stopped)
+                except Exception as exc:
+                    if not _sessions_unsupported(exc):
+                        raise
+                    # Nothing was sent; run it as 0.3.0 did, without a kill.
+                    supports_sessions = False
+            return operation(db, None)
         except ToolError:
             raise
         except OverflowError:

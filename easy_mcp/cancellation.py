@@ -139,7 +139,7 @@ def _noop() -> None:
 
 def _run_callbacks(
     callbacks: list[Callable[[], object]],
-    on_error: Callable[[Exception], None] | None = None,
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> None:
     for callback in callbacks:
         try:

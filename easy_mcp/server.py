@@ -234,6 +234,9 @@ class MCPServer:
         self._sync_slots = (
             threading.BoundedSemaphore(max_sync_workers) if max_sync_workers is not None else None
         )
+        # Sync tool and cancel-callback threads still running.
+        self._threads: set[threading.Thread] = set()
+        self._threads_lock = threading.Lock()
         self.max_sessions = max_sessions
         self.allowed_origins = (
             normalize_origins(allowed_origins) if allowed_origins is not None else None
@@ -697,7 +700,8 @@ class MCPServer:
         A daemon thread rather than a shared pool: a tool that ignores its
         token keeps its thread after the call is abandoned, and in a pool
         that thread would hold up unrelated calls queued behind it (and, at
-        exit, the interpreter).  ``max_sync_workers`` bounds them instead.
+        exit, the interpreter).  ``max_sync_workers`` bounds them instead,
+        and :meth:`wait_for_tool_threads` gives them time at shutdown.
 
         Raises:
             ServerBusyError: ``max_sync_workers`` tools are already running.
@@ -716,29 +720,35 @@ class MCPServer:
 
         def work() -> None:
             try:
-                try:
-                    outcome: tuple[bool, Any] = (True, run_in_context(definition.fn, **arguments))
-                except BaseException as exc:
-                    outcome = (False, exc)
-                if token.cancelled:
-                    # The client was told the call was cancelled or timed
-                    # out; a tool that acts (a write, say) may have done so
-                    # anyway, and this is the record of it.
-                    audit(
+                outcome: tuple[bool, Any] = (True, run_in_context(definition.fn, **arguments))
+            except BaseException as exc:
+                outcome = (False, exc)
+            finally:
+                # Free the worker before the answer can reach the client, or
+                # the client's next call could find it still taken.
+                if slots is not None:
+                    slots.release()
+            try:
+                # If the call was (or is about to be) cancelled or timed out,
+                # the client was told so; a tool that acts (a write, say) may
+                # have done so anyway, and this is the record of it.  Runs at
+                # once if the token has fired, or when it fires: the deadline
+                # can pass before the token is triggered.
+                token.on_cancel(
+                    lambda: audit(
                         "tool_finished_after_cancel",
                         tool=name,
                         client_id=context.client_id,
                         reason=token.reason,
                         status="ok" if outcome[0] else "error",
                     )
+                )
+            finally:
                 with contextlib.suppress(RuntimeError):  # the loop has closed
                     loop.call_soon_threadsafe(_settle, future, *outcome)
-            finally:
-                if slots is not None:
-                    slots.release()
 
         try:
-            threading.Thread(target=work, name=f"easy-mcp-tool:{name}", daemon=True).start()
+            self._spawn(f"easy-mcp-tool:{name}", work)
         except BaseException:
             if slots is not None:
                 slots.release()
@@ -752,13 +762,14 @@ class MCPServer:
 
         The flag is set at once, so a tool polling ``token.cancelled`` sees
         it immediately; callbacks may block (a MySQL ``KILL QUERY`` opens a
-        connection), so they get a thread of their own.
+        connection), so they get a thread of their own.  Never raises: it
+        runs while a cancellation or timeout is propagating.
         """
         callbacks = token._trigger(reason)
         if not callbacks:
             return
 
-        def failed(exc: Exception) -> None:
+        def failed(exc: BaseException) -> None:
             error_id = uuid.uuid4().hex[:12]
             self._logger.warning(
                 "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
@@ -770,12 +781,71 @@ class MCPServer:
                 error_id=error_id,
             )
 
-        threading.Thread(
-            target=_run_callbacks,
-            args=(callbacks, failed),
-            name=f"easy-mcp-cancel:{name}",
-            daemon=True,
-        ).start()
+        try:
+            self._spawn(f"easy-mcp-cancel:{name}", lambda: _run_callbacks(callbacks, failed))
+        except Exception as exc:
+            # No thread to run them on.  Running them here would block the
+            # event loop, so they are dropped, loudly.
+            failed(exc)
+
+    def _spawn(self, name: str, target: Callable[[], None]) -> None:
+        """Start *target* on a daemon thread that shutdown waits for."""
+
+        def run() -> None:
+            try:
+                target()
+            finally:
+                with self._threads_lock:
+                    self._threads.discard(thread)
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self._threads_lock:
+            self._threads.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._threads_lock:
+                self._threads.discard(thread)
+            raise
+
+    async def wait_for_tool_threads(self, timeout: float) -> int:
+        """Give sync tool threads and cancel callbacks up to *timeout* seconds to finish.
+
+        They are daemon threads, so a process that exits while they run
+        stops them where they are: a cancel callback that has not sent its
+        ``KILL QUERY`` yet never sends it.  The transports call this as they
+        shut down; call it yourself before exiting when you drive
+        :meth:`dispatch` directly.  Threads started while it waits (a
+        cancel's callbacks) are waited for too.
+
+        Returns:
+            How many are still running when it gives up (logged as well).
+        """
+        await asyncio.sleep(0)  # let calls cancelled just now start their callbacks
+        deadline = time.monotonic() + max(timeout, 0.0)
+
+        def join() -> list[str]:
+            while True:
+                with self._threads_lock:
+                    alive = [thread for thread in self._threads if thread.is_alive()]
+                remaining = deadline - time.monotonic()
+                if not alive or remaining <= 0:
+                    return [thread.name for thread in alive]
+                # Short slices, so threads started meanwhile are picked up.
+                alive[0].join(min(remaining, 0.05))
+
+        with self._threads_lock:
+            if not self._threads:
+                return 0
+        left = await asyncio.to_thread(join)
+        if left:
+            self._logger.warning(
+                "%d tool thread(s) still running after %gs; stopping without them: %s",
+                len(left),
+                timeout,
+                ", ".join(sorted(left)),
+            )
+        return len(left)
 
     # -------------------------------------------------------------- lifecycle
 

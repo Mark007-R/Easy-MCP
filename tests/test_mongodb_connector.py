@@ -43,6 +43,10 @@ class FakeCollection:
 
     def find(self, filter: Any, projection: Any = None, **options: Any) -> list[Any]:
         self.db.calls.append(("find", self.name, filter, projection, options))
+        if not self.db.client.supports_sessions and options.get("session") is not None:
+            raise FakeConfigurationError("Sessions are not supported by this MongoDB deployment")
+        if self.db.on_find is not None:
+            self.db.on_find()
         if self.db.block is not None:
             # A slow read: runs until its session is killed.
             self.db.block.set()
@@ -79,6 +83,14 @@ class FakeOperationFailure(Exception):
 FakeOperationFailure.__module__ = "pymongo.errors"
 
 
+class FakeConfigurationError(Exception):
+    pass
+
+
+FakeConfigurationError.__name__ = "ConfigurationError"
+FakeConfigurationError.__module__ = "pymongo.errors"
+
+
 class FakeServerSession:
     def __init__(self) -> None:
         self.dirty = False
@@ -88,18 +100,27 @@ class FakeServerSession:
 
 
 class FakeSession:
-    """What pymongo's ClientSession offers the connector."""
+    """What pymongo's ClientSession offers the connector.
 
-    def __init__(self, number: int) -> None:
+    Ending it does what pymongo does: the server session goes back to the
+    client's pool unless it is dirty, and the session lets go of it.
+    """
+
+    def __init__(self, client: FakeClient, number: int) -> None:
+        self.client = client
         self.session_id = {"id": f"session-{number}"}
         self.ended = False
-        self._server_session = FakeServerSession()
+        self.server_session = FakeServerSession()
+        self._server_session: FakeServerSession | None = self.server_session
 
     def __enter__(self) -> FakeSession:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.ended = True
+        if not self.server_session.dirty:
+            self.client.pool.append(self.session_id)
+        self._server_session = None
 
 
 class FakeAdmin:
@@ -118,9 +139,11 @@ class FakeClient:
     def __init__(self) -> None:
         self.admin = FakeAdmin()
         self.sessions: list[FakeSession] = []
+        self.pool: list[Any] = []  # session ids handed back for reuse
+        self.supports_sessions = True
 
     def start_session(self, **options: Any) -> FakeSession:
-        session = FakeSession(len(self.sessions) + 1)
+        session = FakeSession(self, len(self.sessions) + 1)
         self.sessions.append(session)
         return session
 
@@ -131,6 +154,7 @@ class FakeDatabase:
         self.fail: Exception | None = None
         self.docs: list[Any] | None = None
         self.block: threading.Event | None = None
+        self.on_find: Any = None
         self.client = FakeClient()
 
     def list_collections(
@@ -433,7 +457,7 @@ async def test_a_cancelled_call_kills_its_session() -> None:
     assert time.perf_counter() - began < 1.0
     (session,) = db.client.sessions
     assert db.client.admin.commands == [("killSessions", [session.session_id])]
-    assert session._server_session.dirty  # never reused from the driver's pool
+    assert session.server_session.dirty and client_pool_empty(db)  # never reused
     # The find ran in that very session.
     assert db.calls[0][4]["session"] is session
 
@@ -464,3 +488,46 @@ def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
     with caplog.at_level(logging.WARNING, logger="easy_mcp"):
         make(statement_timeout=30, default_timeout=30)
     assert "is not longer than the statement timeout" in caplog.text
+
+
+def client_pool_empty(db: FakeDatabase) -> bool:
+    return db.client.pool == []
+
+
+def test_a_cancel_that_races_completion_never_pools_the_doomed_session() -> None:
+    # The cancel takes the kill callback just as the find returns: the call
+    # ends first and the kill arrives after.  The session it names must not
+    # have gone back to the pool, where another call would pick it up.
+    server, db = make()
+    token = CancelToken()
+    taken: list[Any] = []
+    db.on_find = lambda: taken.extend(token._trigger("cancelled"))
+    tool = next(t for t in server.tools if t.name == "find")
+    with cancel_scope(token):
+        tool.fn(collection="orders")
+    (session,) = db.client.sessions
+    assert session.ended and taken  # the kill is still on its way
+    assert session.server_session.dirty
+    assert client_pool_empty(db)
+    for callback in taken:
+        callback()
+    assert db.client.admin.commands == [("killSessions", [session.session_id])]
+
+
+async def test_a_finished_call_returns_its_session_to_the_pool() -> None:
+    server, db = make()
+    ok(await call(server, "count", {"collection": "orders"}))
+    (session,) = db.client.sessions
+    assert not session.server_session.dirty
+    assert db.client.pool == [session.session_id]
+
+
+async def test_deployments_without_sessions_still_work_without_the_kill() -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    first = ok(await call(server, "find", {"collection": "orders"}))
+    second = ok(await call(server, "find", {"collection": "orders"}))
+    assert first["count"] == second["count"] == 3
+    # Tried once, refused before anything was sent, then never again.
+    assert len(db.client.sessions) == 1
+    assert [c[4].get("session") for c in db.calls] == [db.client.sessions[0], None, None]
