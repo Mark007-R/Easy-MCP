@@ -1071,3 +1071,27 @@ async def test_an_error_raced_by_a_cancel_does_not_keep_the_tools_frames_alive(
     finally:
         gc.enable()
         logging.disable(logging.NOTSET)
+
+
+def test_only_unreported_errors_lose_their_traceback() -> None:
+    from easy_mcp.server import _drop_unreported_error
+
+    def raised(error: BaseException) -> BaseException:
+        try:
+            raise error
+        except BaseException as caught:
+            return caught
+
+    loop = asyncio.new_event_loop()
+    try:
+        for error, kept in (
+            (ValueError("nobody reports this"), False),
+            (KeyboardInterrupt(), True),  # escapes the loop and is reported
+            (SystemExit(3), True),
+        ):
+            future = loop.create_future()
+            future.set_exception(raised(error))
+            _drop_unreported_error(future)
+            assert (error.__traceback__ is not None) is kept, error
+    finally:
+        loop.close()

@@ -110,8 +110,10 @@ def _drop_unreported_error(awaitable: Any) -> None:
     collection.
     """
     if isinstance(awaitable, asyncio.Future) and awaitable.done() and not awaitable.cancelled():
-        error = awaitable.exception()
-        if error is not None:
+        error = awaitable.exception()  # also marks it retrieved
+        # KeyboardInterrupt and SystemExit escape the event loop from the
+        # task's own step and are reported by whoever runs the loop.
+        if error is not None and not isinstance(error, KeyboardInterrupt | SystemExit):
             error.__traceback__ = None
 
 
