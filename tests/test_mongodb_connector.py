@@ -6,14 +6,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-import logging
 import threading
 import time
 from typing import Any
 
 import pytest
 from bson import ObjectId
-from conftest import make_context, notification, rpc
+from conftest import LogCapture, make_context, notification, rpc
 
 from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import mongodb
@@ -43,6 +42,10 @@ class FakeCollection:
 
     def find(self, filter: Any, projection: Any = None, **options: Any) -> list[Any]:
         self.db.calls.append(("find", self.name, filter, projection, options))
+        if not self.db.client.supports_sessions and options.get("session") is not None:
+            raise FakeConfigurationError("Sessions are not supported by this MongoDB deployment")
+        if self.db.on_find is not None:
+            self.db.on_find()
         if self.db.block is not None:
             # A slow read: runs until its session is killed.
             self.db.block.set()
@@ -79,6 +82,14 @@ class FakeOperationFailure(Exception):
 FakeOperationFailure.__module__ = "pymongo.errors"
 
 
+class FakeConfigurationError(Exception):
+    pass
+
+
+FakeConfigurationError.__name__ = "ConfigurationError"
+FakeConfigurationError.__module__ = "pymongo.errors"
+
+
 class FakeServerSession:
     def __init__(self) -> None:
         self.dirty = False
@@ -88,18 +99,27 @@ class FakeServerSession:
 
 
 class FakeSession:
-    """What pymongo's ClientSession offers the connector."""
+    """What pymongo's ClientSession offers the connector.
 
-    def __init__(self, number: int) -> None:
+    Ending it does what pymongo does: the server session goes back to the
+    client's pool unless it is dirty, and the session lets go of it.
+    """
+
+    def __init__(self, client: FakeClient, number: int) -> None:
+        self.client = client
         self.session_id = {"id": f"session-{number}"}
         self.ended = False
-        self._server_session = FakeServerSession()
+        self.server_session = FakeServerSession()
+        self._server_session: FakeServerSession | None = self.server_session
 
     def __enter__(self) -> FakeSession:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.ended = True
+        if not self.server_session.dirty:
+            self.client.pool.append(self.session_id)
+        self._server_session = None
 
 
 class FakeAdmin:
@@ -118,9 +138,11 @@ class FakeClient:
     def __init__(self) -> None:
         self.admin = FakeAdmin()
         self.sessions: list[FakeSession] = []
+        self.pool: list[Any] = []  # session ids handed back for reuse
+        self.supports_sessions = True
 
     def start_session(self, **options: Any) -> FakeSession:
-        session = FakeSession(len(self.sessions) + 1)
+        session = FakeSession(self, len(self.sessions) + 1)
         self.sessions.append(session)
         return session
 
@@ -131,6 +153,7 @@ class FakeDatabase:
         self.fail: Exception | None = None
         self.docs: list[Any] | None = None
         self.block: threading.Event | None = None
+        self.on_find: Any = None
         self.client = FakeClient()
 
     def list_collections(
@@ -433,7 +456,7 @@ async def test_a_cancelled_call_kills_its_session() -> None:
     assert time.perf_counter() - began < 1.0
     (session,) = db.client.sessions
     assert db.client.admin.commands == [("killSessions", [session.session_id])]
-    assert session._server_session.dirty  # never reused from the driver's pool
+    assert session.server_session.dirty and client_pool_empty(db)  # never reused
     # The find ran in that very session.
     assert db.calls[0][4]["session"] is session
 
@@ -459,8 +482,131 @@ async def test_a_call_cancelled_before_it_starts_opens_no_session() -> None:
 
 
 def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
-    caplog: pytest.LogCaptureFixture,
+    logs: LogCapture,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        make(statement_timeout=30, default_timeout=30)
-    assert "is not longer than the statement timeout" in caplog.text
+    make(statement_timeout=30, default_timeout=30)
+    assert "is not longer than the statement timeout" in logs.text
+
+
+def client_pool_empty(db: FakeDatabase) -> bool:
+    return db.client.pool == []
+
+
+def test_a_cancel_that_races_completion_never_pools_the_doomed_session() -> None:
+    # The cancel takes the kill callback just as the find returns: the call
+    # ends first and the kill arrives after.  The session it names must not
+    # have gone back to the pool, where another call would pick it up.
+    server, db = make()
+    token = CancelToken()
+    taken: list[Any] = []
+    db.on_find = lambda: taken.extend(token._trigger("cancelled"))
+    tool = next(t for t in server.tools if t.name == "find")
+    with cancel_scope(token):
+        tool.fn(collection="orders")
+    (session,) = db.client.sessions
+    assert session.ended and taken  # the kill is still on its way
+    assert session.server_session.dirty
+    assert client_pool_empty(db)
+    for callback in taken:
+        callback()
+    assert db.client.admin.commands == [("killSessions", [session.session_id])]
+
+
+async def test_a_finished_call_returns_its_session_to_the_pool() -> None:
+    server, db = make()
+    ok(await call(server, "count", {"collection": "orders"}))
+    (session,) = db.client.sessions
+    assert not session.server_session.dirty
+    assert db.client.pool == [session.session_id]
+
+
+async def test_deployments_without_sessions_still_work_without_the_kill(
+    logs: LogCapture,
+) -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    first = ok(await call(server, "find", {"collection": "orders"}))
+    second = ok(await call(server, "find", {"collection": "orders"}))
+    assert first["count"] == second["count"] == 3
+    # Each call asks for a session (a member may become readable), is
+    # refused before anything is sent, and runs without one.
+    one, two = db.client.sessions
+    assert [c[4].get("session") for c in db.calls] == [one, None, two, None]
+    assert logs.text.count("MongoDB refused a session") == 1  # said once
+
+
+async def test_sessions_are_used_again_once_the_deployment_allows_them() -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    ok(await call(server, "find", {"collection": "orders"}))
+    db.client.supports_sessions = True
+    ok(await call(server, "find", {"collection": "orders"}))
+    assert db.calls[-1][4]["session"] is db.client.sessions[-1]
+
+
+def test_a_call_cancelled_while_its_session_is_refused_is_not_retried() -> None:
+    server, db = make()
+    db.client.supports_sessions = False
+    token = CancelToken()
+    real_find = FakeCollection.find
+
+    def find(self: FakeCollection, *args: Any, **options: Any) -> Any:
+        if options.get("session") is not None:
+            token.cancel()  # arrives while the connection is being set up
+        return real_find(self, *args, **options)
+
+    tool = next(t for t in server.tools if t.name == "find")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeCollection, "find", find)
+        with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+            tool.fn(collection="orders")
+    assert [c[4].get("session") for c in db.calls] == [db.client.sessions[0]]  # no retry
+
+
+def test_describe_collection_stops_between_steps_once_cancelled() -> None:
+    # A kill ends only the operation running when it lands; the next step
+    # must not start.
+    server, db = make()
+    token = CancelToken()
+    real_list = FakeDatabase.list_collections
+
+    def list_collections(self: FakeDatabase, *args: Any, **kwargs: Any) -> Any:
+        token.cancel()  # lands while listCollections is answering
+        return real_list(self, *args, **kwargs)
+
+    tool = next(t for t in server.tools if t.name == "describe_collection")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FakeDatabase, "list_collections", list_collections)
+        with cancel_scope(token), pytest.raises(ToolError, match="cancelled"):
+            tool.fn(collection="orders")
+    assert not [c for c in db.calls if c[0] == "aggregate"]
+    (session,) = db.client.sessions
+    assert session.server_session.dirty and client_pool_empty(db)
+
+
+class SessionlessDatabase(FakeDatabase):
+    """A 0.3.0-era test double: no client, methods that take no session."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        del self.client
+
+
+async def test_a_database_without_sessions_still_works() -> None:
+    db = SessionlessDatabase()
+    server = mongodb.build_server(
+        database="shop", database_factory=lambda: db, rate_limit_per_minute=None
+    )
+    assert ok(await call(server, "count", {"collection": "orders"})) == 3
+    assert db.calls[0][3].get("session") is None
+
+
+async def test_a_client_whose_start_session_is_not_implemented_still_works() -> None:
+    server, db = make()
+
+    def not_implemented(**options: Any) -> Any:
+        raise NotImplementedError("mongomock has no sessions")
+
+    db.client.start_session = not_implemented  # type: ignore[method-assign]
+    assert ok(await call(server, "count", {"collection": "orders"})) == 3
+    assert db.calls[0][3].get("session") is None

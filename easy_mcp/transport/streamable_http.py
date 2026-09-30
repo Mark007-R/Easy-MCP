@@ -77,7 +77,7 @@ from ..protocol import (
     is_modern_request,
 )
 from ..security.auth import ClientIdentity
-from ._http import BaseHTTPTransport, rpc_error
+from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, rpc_error
 from .base import ClientContext
 from .sse import SSETransport
 
@@ -259,6 +259,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
     # ------------------------------------------------------------------ app
 
+    async def close_streams(self) -> None:
+        if self._legacy is not None:
+            await self._legacy.close_all_sessions()
+
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
         routes = [
@@ -278,6 +282,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     await legacy.close_all_sessions()
                 for session in list(self._sessions.values()):
                     self._end_session(session, reason="shutdown")
+                await self._server.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
 
         return Starlette(routes=routes, middleware=self._middleware(), lifespan=lifespan)
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sqlite3
 import sys
 import threading
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import make_context, notification, rpc
+from conftest import LogCapture, make_context, notification, rpc
 
 from easy_mcp import CancelToken, MCPServer, cancel_scope
 from easy_mcp.connectors import sqlite
@@ -298,8 +297,7 @@ def test_the_deadline_is_still_reported_as_such(db: Path) -> None:
 
 
 def test_a_server_timeout_below_the_statement_timeout_is_warned_about(
-    db: Path, caplog: pytest.LogCaptureFixture
+    db: Path, logs: LogCapture
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="easy_mcp"):
-        make(db, statement_timeout=10, default_timeout=5)
-    assert "is not longer than the statement timeout" in caplog.text
+    make(db, statement_timeout=10, default_timeout=5)
+    assert "is not longer than the statement timeout" in logs.text

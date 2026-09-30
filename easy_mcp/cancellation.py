@@ -49,13 +49,16 @@ _current: contextvars.ContextVar[CancelToken | None] = contextvars.ContextVar(
 class CancelToken:
     """The cancellation signal for one tool call; thread-safe."""
 
-    __slots__ = ("_callbacks", "_event", "_lock", "_reason")
+    __slots__ = ("__weakref__", "_callbacks", "_event", "_lock", "_on_error", "_reason")
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._callbacks: list[Callable[[], object]] = []
         self._reason: str | None = None
+        # What to do when a callback raises; the server sets one that logs
+        # and audits.  Without it, failures are logged.
+        self._on_error: Callable[[BaseException], None] | None = None
 
     @property
     def cancelled(self) -> bool:
@@ -88,12 +91,12 @@ class CancelToken:
                         self._callbacks.remove(callback)
 
                 return remove
-        _run_callbacks([callback])
+        _run_callbacks([callback], self._on_error)
         return _noop
 
     def cancel(self, reason: str = CANCELLED) -> None:
         """Mark the call cancelled and run the callbacks in this thread."""
-        _run_callbacks(self._trigger(reason))
+        _run_callbacks(self._trigger(reason), self._on_error)
 
     def _trigger(self, reason: str) -> list[Callable[[], object]]:
         """Set the flag at once; hand back the callbacks for the caller to run.
@@ -139,7 +142,7 @@ def _noop() -> None:
 
 def _run_callbacks(
     callbacks: list[Callable[[], object]],
-    on_error: Callable[[Exception], None] | None = None,
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> None:
     for callback in callbacks:
         try:

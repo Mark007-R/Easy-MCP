@@ -109,6 +109,11 @@ class OriginGuard:
         await self.app(scope, receive, send)
 
 
+# How long the HTTP transports wait at shutdown for sync tool threads and
+# cancel callbacks to finish (stdio uses its own shutdown_timeout).
+THREAD_SHUTDOWN_GRACE = 5.0
+
+
 class BaseHTTPTransport(Transport):
     """Shared plumbing for transports that uvicorn serves over HTTP."""
 
@@ -130,8 +135,22 @@ class BaseHTTPTransport(Transport):
             port=self._server.port,
             log_level="info" if self._server.debug else "warning",
         )
-        self._uvicorn = uvicorn.Server(config)
+        transport = self
+
+        class Server(uvicorn.Server):
+            async def shutdown(self, sockets: Any = None) -> None:
+                # uvicorn waits for every connection to close before the
+                # lifespan shutdown runs, and an open SSE stream only closes
+                # when told to: tell it first, or shutdown waits for the
+                # client to leave (and a forced exit skips the lifespan).
+                await transport.close_streams()
+                await super().shutdown(sockets)
+
+        self._uvicorn = Server(config)
         self._uvicorn.run()
+
+    async def close_streams(self) -> None:
+        """End the long-lived streams that would hold up a graceful shutdown."""
 
     def stop(self) -> None:
         """Ask the running uvicorn server to exit gracefully."""

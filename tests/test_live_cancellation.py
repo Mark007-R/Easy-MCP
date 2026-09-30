@@ -19,6 +19,7 @@ does, and then asks the server's own activity view whether it is still there.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections.abc import Callable
@@ -185,3 +186,72 @@ async def test_mongodb_cancel_removes_the_operation_from_current_op() -> None:
     finally:
         database[probe].drop()
         client.close()
+
+
+@pytest.mark.skipif(not MYSQL_URL, reason="EASY_MCP_LIVE_MYSQL_URL is not set")
+def test_mysql_stdio_client_quitting_mid_query_kills_it() -> None:
+    # A desktop client quits while a statement runs: stdin closes, in-flight
+    # calls are cancelled, and the process exits.  The KILL QUERY has to get
+    # out before it does.
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import pymysql
+
+    from easy_mcp.connectors import mysql
+
+    assert MYSQL_URL is not None
+    settings = mysql.ConnectionSettings.from_url(MYSQL_URL)
+    sql = "SELECT SLEEP(40)"
+    repo = str(Path(__file__).resolve().parent.parent)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "easy_mcp.connectors.mysql",
+            "--transport",
+            "stdio",
+            "--statement-timeout",
+            str(STATEMENT_TIMEOUT),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "MYSQL_URL": MYSQL_URL, "PYTHONPATH": repo},
+    )
+    watcher = pymysql.connect(
+        host=settings.host,
+        port=settings.port,
+        user=settings.user,
+        password=settings.password,
+        autocommit=True,
+    )
+
+    def running() -> bool:
+        with watcher.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO = %s", (sql,)
+            )
+            (count,) = cursor.fetchone()
+        return bool(count)
+
+    try:
+        assert child.stdin is not None
+        message = rpc("tools/call", {"name": "query", "arguments": {"sql": sql}}, 1)
+        child.stdin.write(json.dumps(message).encode() + b"\n")
+        child.stdin.flush()
+        deadline = time.monotonic() + 15
+        while not running():
+            assert time.monotonic() < deadline, "the query never showed up as running"
+            time.sleep(0.1)
+        child.stdin.close()  # the client quits
+        assert child.wait(20) == 0
+        deadline = time.monotonic() + 1.5
+        while running():
+            assert time.monotonic() < deadline, "still running after the process exited"
+            time.sleep(0.05)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        watcher.close()

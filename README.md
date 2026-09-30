@@ -367,6 +367,24 @@ that ignores its token keeps that thread until it returns, so at most
 `max_sync_workers` sync tools run at once; a call beyond that is refused with
 `-32008` at once rather than queued behind them.
 
+The threads are daemons, so the transports give them a bounded time to finish
+as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
+a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
+yourself, `await server.wait_for_tool_threads(5)` before exiting does the
+same. `server.run()` closes open legacy SSE streams as shutdown begins, since
+uvicorn waits for every connection to close before it shuts the app down. When
+you serve `server.build_app()` with your own uvicorn and SSE clients connect,
+pass `--timeout-graceful-shutdown`, or shutdown waits for those clients to leave.
+When you mount `server.build_app()` inside another Starlette or FastAPI app,
+its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
+the host app's shutdown.
+
+A thread takes its daemon flag from the thread that starts it, so a
+`threading.Thread` or `threading.Timer` that a sync tool starts is a daemon
+too. It stops, mid-way, when the process exits, and the shutdown wait does
+not cover it. Work that must outlive its call needs `daemon=False`, or a
+`ThreadPoolExecutor`, which the interpreter waits for at exit.
+
 ### Error handling
 
 | Situation | What the client sees |
@@ -440,7 +458,12 @@ A database connector stops the statement on the database itself when its
 call is cancelled or runs past the server's tool timeout: `KILL QUERY` on
 MySQL, a cancel request on Postgres, `interrupt()` on SQLite, `killSessions`
 on MongoDB. An abandoned call does not keep a query running until
-`--statement-timeout`. The connectors set the server's `default_timeout`
+`--statement-timeout`. On MongoDB the kill goes to the primary, so it does
+not reach a read that a `readPreference` sent to a secondary; that read still
+ends at `maxTimeMS`. A MongoDB call that the deployment will not give a
+session (no session support, or a member that is not readable yet) runs
+without one, as in 0.3.0, and a cancel cannot stop it either; the server logs
+this once. The connectors set the server's `default_timeout`
 longer than the statement timeout, so the database's own limit is what
 normally ends a slow statement; one built with a shorter `default_timeout`
 logs a warning at startup.

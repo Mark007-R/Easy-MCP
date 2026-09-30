@@ -33,6 +33,12 @@ def on_cancel(stop: Callable[[], object]) -> Callable[[], None]:
     return token.on_cancel(stop)
 
 
+def cancelled() -> bool:
+    """Whether the current tool call has been cancelled or has timed out."""
+    token = current_cancel_token()
+    return token is not None and token.cancelled
+
+
 def cancelled_error() -> ToolError:
     """The error a statement stopped by a cancel ends with.
 
@@ -51,8 +57,7 @@ def raise_if_cancelled() -> None:
     Raises:
         ToolError: The current call has been cancelled or has timed out.
     """
-    token = current_cancel_token()
-    if token is not None and token.cancelled:
+    if cancelled():
         raise cancelled_error()
 
 

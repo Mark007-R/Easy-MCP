@@ -19,7 +19,13 @@ clients to reading:
 * Each tool call runs its operations in a session of its own.  When the call
   is cancelled, or hits the server's tool timeout, ``killSessions`` ends that
   session's running operations and cursors on the server; users may always
-  kill their own sessions, so this needs no privilege beyond ``read``.
+  kill their own sessions, so this needs no privilege beyond ``read``.  A
+  kill ends the operation running at that moment; multi-step tools check for
+  a cancel between steps.  The command goes to the primary, so with a
+  ``readPreference`` that sends reads to a secondary, a cancelled read there
+  still runs until ``maxTimeMS``.  A call the deployment will not give a
+  session (a server without session support, or a member that is not
+  readable yet) runs without one, as in 0.3.0, and cannot be killed.
 * The tools see one database, and never its ``system.*`` collections.
 
 Still connect as a user holding only the ``read`` role on that database; the
@@ -43,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -50,6 +57,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..exceptions import ToolError
+from ..logging import LOGGER_NAME
 from ..server import MCPServer
 from . import _cancel, _cli
 
@@ -248,16 +256,36 @@ def _is_driver_error(exc: BaseException) -> bool:
     return type(exc).__module__.split(".", 1)[0] in ("pymongo", "bson")
 
 
-def kill_session(client: Any, session: Any, session_id: Any) -> None:
-    """End every operation and cursor of *session* on the server.
+def kill_session(client: Any, session_id: Any) -> None:
+    """End every operation and cursor of the session *session_id* on the server.
 
     ``killSessions`` needs no privilege for the caller's own sessions.
     """
-    # A killed session must not go back to the driver's pool for reuse.
+    client.admin.command("killSessions", [session_id])
+
+
+def _discard(session: Any) -> None:
+    """Keep *session*'s server session out of the driver's pool.
+
+    The pool hands a returned session id to the next call, and a
+    ``killSessions`` for it that is still on its way would kill that call's
+    operation instead.  A dirty session is dropped, not pooled.
+    """
     mark_dirty = getattr(getattr(session, "_server_session", None), "mark_dirty", None)
     if mark_dirty is not None:
         mark_dirty()
-    client.admin.command("killSessions", [session_id])
+
+
+class _NoSessions(Exception):
+    """The client offers no sessions at all (a test double, say)."""
+
+
+def _sessions_unsupported(exc: BaseException) -> bool:
+    # pymongo refuses an explicit session, before sending anything, when the
+    # deployment does not advertise logicalSessionTimeoutMinutes.
+    if isinstance(exc, _NoSessions):
+        return True
+    return type(exc).__name__ == "ConfigurationError" and "Sessions are not supported" in str(exc)
 
 
 def _require_driver() -> None:
@@ -289,6 +317,11 @@ def build_server(
         max_rows: Hard cap on documents returned by ``find``/``aggregate``.
         database_factory: Injectable zero-argument factory returning a
             pymongo-style ``Database`` (tests).  Skips the driver check.
+            For a cancel to reach the server, its ``client`` must offer
+            ``start_session()`` (a context manager with ``session_id``) and
+            ``admin.command()``, and its methods must accept ``session=``;
+            a ``Database`` without them runs calls without a session, as in
+            0.3.0.
         **server_options: Passed to :class:`~easy_mcp.server.MCPServer`.
 
     Raises:
@@ -345,29 +378,65 @@ def build_server(
                     )
             return client[0][database_name]
 
+    warned_no_sessions = False
+
+    def in_session(db: Any, operation: Callable[[Any, Any], Any], stopped: threading.Event) -> Any:
+        client = getattr(db, "client", None)
+        start_session = getattr(client, "start_session", None)
+        if not callable(start_session):
+            raise _NoSessions
+        try:
+            opened = start_session(causal_consistency=False)
+        except NotImplementedError:  # e.g. mongomock
+            raise _NoSessions from None
+        with opened as session:
+            # Read here, not in the cancelling thread: the driver creates the
+            # id lazily.
+            session_id = session.session_id
+
+            def stop() -> None:
+                stopped.set()
+                kill_session(client, session_id)
+
+            remove_stop = _cancel.on_cancel(stop)
+            try:
+                if stopped.is_set():
+                    raise _cancel.cancelled_error()
+                return operation(db, session)
+            finally:
+                remove_stop()
+                # remove_stop() and a cancel take the same lock: if stop() can
+                # still run, the call counts as cancelled by now, and the
+                # session it will kill must not be pooled for another call.
+                if stopped.is_set() or _cancel.cancelled():
+                    _discard(session)
+
     def run(operation: Callable[[Any, Any], Any]) -> Any:
         """Run *operation(db, session)* in a session a cancel can kill."""
+        nonlocal warned_no_sessions
         _cancel.raise_if_cancelled()
         stopped = threading.Event()  # killed because the call was cancelled
         try:
             db = get_database()
-            client = db.client
-            with client.start_session(causal_consistency=False) as session:
-                # Read here, not in the cancelling thread: the driver creates
-                # the id lazily.
-                session_id = session.session_id
-
-                def stop() -> None:
-                    stopped.set()
-                    kill_session(client, session, session_id)
-
-                remove_stop = _cancel.on_cancel(stop)
-                try:
-                    if stopped.is_set():
-                        raise _cancel.cancelled_error()
-                    return operation(db, session)
-                finally:
-                    remove_stop()
+            try:
+                return in_session(db, operation, stopped)
+            except Exception as exc:
+                if not _sessions_unsupported(exc):
+                    raise
+            # Refused on this connection before anything was sent.  Run the
+            # call as 0.3.0 did, without a kill; the next call tries again,
+            # since a member that was not readable yet may be by then.
+            if stopped.is_set():
+                raise _cancel.cancelled_error()
+            _cancel.raise_if_cancelled()
+            if not warned_no_sessions:
+                warned_no_sessions = True
+                logging.getLogger(LOGGER_NAME).warning(
+                    "MongoDB refused a session; calls without one cannot be stopped "
+                    "on the server when cancelled (they still end at maxTimeMS, or for "
+                    "discovery commands at the socket timeout)"
+                )
+            return operation(db, None)
         except ToolError:
             raise
         except OverflowError:
@@ -448,6 +517,9 @@ def build_server(
             kind = infos[0].get("type", "collection")
             target = db[collection]
             fields: dict[str, set[str]] = {}
+            # A kill ends only the operation running when it lands, so each
+            # step checks whether the call is still wanted.
+            _cancel.raise_if_cancelled()
             sample = target.aggregate(
                 [{"$sample": {"size": sample_size}}], session=session, maxTimeMS=max_time_ms
             )
@@ -458,6 +530,7 @@ def build_server(
                     fields.setdefault(key, set()).add(_bson_type(value))
             # A view has no indexes of its own (MongoDB refuses to list them);
             # the collection it reads from does.
+            _cancel.raise_if_cancelled()
             indexes = (
                 []
                 if kind == "view"
@@ -466,6 +539,7 @@ def build_server(
                     for name, info in sorted(target.index_information(session=session).items())
                 ]
             )
+            _cancel.raise_if_cancelled()
             return {
                 "collection": collection,
                 "type": kind,
