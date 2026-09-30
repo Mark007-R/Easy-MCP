@@ -5,4 +5,4 @@
 default, so a release bump happens in exactly one place.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
