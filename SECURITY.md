@@ -183,5 +183,6 @@ patch versions and credited unless you prefer otherwise.
 
 | Version | Supported |
 |---|---|
-| 0.2.x | ✅ |
-| 0.1.x | Security fixes only until 0.3.0 |
+| 0.3.x | ✅ |
+| 0.2.x | Security fixes only until 0.4.0 |
+| 0.1.x | ❌ |
