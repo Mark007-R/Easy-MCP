@@ -29,9 +29,13 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `RequestOutcome` or `ToolOutcome` describing what the client will get,
   timeouts and busy answers included. A middleware must return that object.
   One that returns anything else, or raises an unexpected exception, fails the
-  request with `-32603` and an `error_id`, and the tool does not run. An error
-  code from the range MCP reserves without defining (`-32023` to `-32099`) is
-  treated the same way.
+  request with `-32603` and an `error_id`. If it failed before `call_next()`,
+  the tool does not run; if after, the tool has run and the audit log records
+  `tool_result_withheld`. An error code from the range MCP reserves without
+  defining (`-32023` to `-32099`) is treated the same way. `call_next()` may be
+  awaited in a task of the middleware's own, but that work does not outlive
+  the middleware: whatever is left of it when the middleware returns or
+  raises is cancelled.
 
   A cancel (`notifications/cancelled`, a closed stateless connection, a
   deleted session, a closed SSE stream, shutdown) reaches middleware as
@@ -77,6 +81,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `-32001`), or a code from `-32023` to `-32099`, which MCP reserves without
   defining (it becomes `-32603` with an `error_id`, and the original is
   logged).
+- A request (a message with an `id`) that names a `notifications/*` method is
+  answered `-32601`, as an unknown method. Before, it was treated as that
+  notification and got no response at all: over HTTP a bare `202`, on stdio
+  nothing, so the client waited forever.
+- Shutting down the Streamable HTTP transport with `server.run()` (Ctrl-C,
+  `server.stop()`) ends the sessions and cancels the requests still running
+  before uvicorn waits for connections to close. A request cancelled this way
+  gets `202` with no body, and a handshake cut short opens no session. Before,
+  shutdown waited for every running request to finish, without a bound for a
+  tool with no timeout.
 
 ### Fixed
 

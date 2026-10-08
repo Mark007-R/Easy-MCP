@@ -114,6 +114,7 @@ class _Session:
     identity_fp: str | None
     last_seen: float
     active: int = 0  # requests currently being dispatched
+    opened: bool = False  # whether its handshake succeeded
 
 
 @dataclass(slots=True)
@@ -253,6 +254,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._legacy = SSETransport(server) if legacy_sse else None
         self._sessions: dict[str, _Session] = {}
         self._stateless: OrderedDict[str, _StatelessClient] = OrderedDict()
+        # Every message being dispatched, so shutdown can cancel it.
+        self._dispatches: set[asyncio.Task[Any]] = set()
+        self._closing = False
 
     def describe(self) -> str:
         legacy = " (+ legacy sse)" if self._legacy is not None else ""
@@ -261,8 +265,22 @@ class StreamableHTTPTransport(BaseHTTPTransport):
     # ------------------------------------------------------------------ app
 
     async def close_streams(self) -> None:
+        """End the SSE streams, the sessions and the messages still being served.
+
+        uvicorn waits for every open connection before the lifespan shutdown
+        runs, and a request held in middleware (which no tool timeout
+        bounds) or in a slow tool keeps its connection open: cancel them
+        first.  A cancelled request gets no response (``202``), as on any
+        cancel, and a handshake cut short opens no session.
+        """
+        self._closing = True
         if self._legacy is not None:
             await self._legacy.close_all_sessions()
+        for session in list(self._sessions.values()):
+            if session.opened:  # a handshake still running ends with its dispatch
+                self._end_session(session, reason="shutdown")
+        for task in list(self._dispatches):
+            task.cancel()
 
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
@@ -276,13 +294,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
+            self._closing = False  # an app built again from this transport serves anew
             try:
                 yield
             finally:
-                if legacy is not None:
-                    await legacy.close_all_sessions()
-                for session in list(self._sessions.values()):
-                    self._end_session(session, reason="shutdown")
+                await self.close_streams()
                 await self._server.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
 
         return Starlette(routes=routes, middleware=self._middleware(), lifespan=lifespan)
@@ -354,7 +370,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         session.active += 1
         try:
-            response = await self._server.dispatch(message, session.context, transport=info)
+            # A disconnect cancels nothing in this era; shutdown does.
+            response = await self._dispatch_until_disconnect(
+                message, session.context, request, info, disconnect=False
+            )
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()
@@ -427,18 +446,28 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         context: ClientContext,
         request: Request,
         info: TransportInfo | None = None,
+        *,
+        disconnect: bool = True,
     ) -> dict[str, Any] | None:
         """Dispatch, cancelling the work if the client closes the connection.
 
         In the stateless era a closed connection is the cancellation signal:
-        nobody is left to read the answer.
+        nobody is left to read the answer.  The session era passes
+        *disconnect* false: there a closed connection cancels nothing.
+        Shutdown cancels the work in both.  Returns ``None`` for work
+        cancelled here (no answer is sent, as for any cancel).
         """
         task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
+        self._dispatches.add(task)
+        if self._closing:
+            task.cancel()  # shutdown has begun: nothing new is served
         try:
             while True:
-                done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
+                timeout = _DISCONNECT_POLL_SECONDS if disconnect else None
+                done, _ = await asyncio.wait({task}, timeout=timeout)
                 if done:
-                    return task.result()
+                    # Cancelled by shutdown: no answer, as for any cancel.
+                    return None if task.cancelled() else task.result()
                 if await request.is_disconnected():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -451,6 +480,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     )
                     return None
         finally:
+            self._dispatches.discard(task)
             # Our own caller may be cancelled too (shutdown, a timeout in a
             # wrapping app): the call must not outlive its request.
             if not task.done():
@@ -519,7 +549,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._sessions[session_id] = session
         response: dict[str, Any] | None = None
         try:
-            response = await self._server.dispatch(message, session.context, transport=info)
+            # A disconnect cancels nothing in this era, and nor can the
+            # client cancel a handshake; shutdown does.
+            response = await self._dispatch_until_disconnect(
+                message, session.context, request, info, disconnect=False
+            )
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()
@@ -530,6 +564,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return Response(status_code=202)
         if "error" in response:
             return _json_response(response)
+        session.opened = True
         audit("session_open", session_id=session_id, client_id=client_id, transport=_TRANSPORT)
         return _json_response(response, headers={SESSION_HEADER: session_id})
 

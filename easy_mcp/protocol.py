@@ -20,7 +20,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from .exceptions import INVALID_PARAMS, UNSUPPORTED_PROTOCOL_VERSION, ProtocolError
+from .exceptions import (
+    AUTHENTICATION_REQUIRED,
+    FORBIDDEN,
+    INVALID_PARAMS,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    ProtocolError,
+)
 
 MODERN_PROTOCOL_VERSIONS: tuple[str, ...] = ("2026-07-28",)
 
@@ -54,6 +60,16 @@ _RESERVED_ERROR_CODES = range(-32099, -32022)
 def is_reserved_error_code(code: int) -> bool:
     """Whether *code* is one MCP reserves without defining (``-32023``..``-32099``)."""
     return code in _RESERVED_ERROR_CODES
+
+
+def era_error_code(code: int, *, stateless: bool) -> int:
+    """The error code a request of this era is answered with for *code*.
+
+    The stateless revision forbids ``-32002`` (this package's ``FORBIDDEN``;
+    older revisions use it for "resource not found") in any response, so a
+    stateless request gets ``-32001`` instead.
+    """
+    return AUTHENTICATION_REQUIRED if stateless and code == FORBIDDEN else code
 
 
 def negotiate_protocol_version(requested: object) -> str:

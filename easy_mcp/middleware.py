@@ -38,7 +38,9 @@ The contract:
 * ``call_next()`` may be called once.  It never raises for an outcome (a
   timeout, a busy server, an inner middleware's refusal all arrive as
   outcomes); only a cancellation reaches middleware as ``CancelledError``,
-  and it must be re-raised.
+  and it must be re-raised.  It may be awaited in another task (``gather``,
+  ``create_task``), but that work is cancelled if the middleware returns or
+  raises before it is done.
 * The first middleware registered is the outermost, and request middleware
   always encloses tool middleware.
 * Notifications and ``server/discover`` pass through request middleware for
@@ -54,6 +56,7 @@ import functools
 import inspect
 import logging
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -61,7 +64,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar
 
 from .exceptions import INTERNAL_ERROR, ProtocolError, ToolError
 from .logging import audit
-from .protocol import is_reserved_error_code
+from .protocol import era_error_code, is_reserved_error_code
 
 if TYPE_CHECKING:
     from .cancellation import CancelToken
@@ -110,6 +113,15 @@ def _freeze(value: Any) -> Any:
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _copy(value: Any) -> Any:
+    """A deep copy of decoded JSON: new dicts and lists, the other values shared."""
+    if isinstance(value, dict):
+        return {key: _copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy(item) for item in value]
     return value
 
 
@@ -207,6 +219,8 @@ class RequestInfo:
         "_tool",
         "_tool_layers",
         "_transport",
+        "_watch",
+        "_watch_baseline",
     )
 
     _client_id: str
@@ -225,6 +239,8 @@ class RequestInfo:
     _tool: ToolDefinition | None
     _tool_layers: tuple[ToolMiddleware, ...]
     _transport: TransportInfo
+    _watch: weakref.ref[asyncio.Task[Any]] | None
+    _watch_baseline: int
 
     def __init__(self) -> None:
         raise TypeError("RequestInfo is created by the server, not by user code")
@@ -268,7 +284,26 @@ class RequestInfo:
         # more while it is served affects only later requests.
         self._request_layers = request_layers
         self._tool_layers = tool_layers
+        self._watch = None
+        self._watch_baseline = 0
         return self
+
+    def _watch_current_task(self) -> None:
+        """Count every cancel of the current task as a cancel of this request.
+
+        The server calls it from the task that awaits the one middleware runs
+        in.  A weak reference: the frames that hold this object must not hold
+        the task too, or a cancelled task would keep them in a cycle.
+        """
+        task = asyncio.current_task()
+        if task is not None:
+            self._watch = weakref.ref(task)
+            self._watch_baseline = task.cancelling()
+
+    def _cancels(self) -> int:
+        """How many times the request has been cancelled while middleware served it."""
+        task = self._watch() if self._watch is not None else None
+        return task.cancelling() - self._watch_baseline if task is not None else 0
 
     @property
     def method(self) -> str:
@@ -379,6 +414,7 @@ class ToolCall:
     __slots__ = (
         "_arguments",
         "_cancel_token",
+        "_closed",
         "_plain",
         "_request",
         "_started",
@@ -388,6 +424,7 @@ class ToolCall:
 
     _arguments: Mapping[str, Any] | None
     _cancel_token: CancelToken
+    _closed: bool
     _plain: dict[str, Any]
     _request: RequestInfo
     _started: bool
@@ -414,6 +451,7 @@ class ToolCall:
         self._cancel_token = cancel_token
         self._timeout = timeout
         self._started = False  # whether the tool function was started
+        self._closed = False  # whether the call is over: the tool may no longer start
         return self
 
     @property
@@ -430,8 +468,9 @@ class ToolCall:
     def arguments(self) -> Mapping[str, Any]:
         """The validated and normalized arguments, in JSON form, deep read-only.
 
-        A snapshot taken on first access.  The tool gets its own copy (and
-        its own Pydantic models), so nothing read here can reach it.
+        Built on first access.  The tool gets a copy of its own (and its own
+        Pydantic models), so nothing read here can reach it, and nothing the
+        tool does to its arguments shows here, before or after it ran.
         """
         if self._arguments is None:
             self._arguments = _freeze(self._plain)
@@ -736,12 +775,11 @@ def describe(fn: object) -> str:
 
 def _is_async(fn: object) -> bool:
     """Whether calling *fn* gives a coroutine: an async function, a partial of
-    one, or an object whose class defines ``async def __call__``."""
+    one, or an object whose ``__call__`` (the one that runs, wherever in its
+    class hierarchy it is defined) is ``async def``."""
     if inspect.iscoroutinefunction(fn):
         return True
-    return inspect.iscoroutinefunction(type(fn).__dict__.get("__call__")) or any(
-        inspect.iscoroutinefunction(vars(base).get("__call__")) for base in type(fn).__mro__[1:]
-    )
+    return inspect.iscoroutinefunction(type(fn).__call__)
 
 
 def check_middleware(fn: object, kind: str) -> None:
@@ -799,31 +837,78 @@ async def run_chain(
     info: Any,
     terminal: Callable[[], Awaitable[_OutcomeT]],
     policy: _Policy[_OutcomeT],
+    request: RequestInfo,
 ) -> _OutcomeT:
     """Run *terminal* inside *layers*, the first one outermost.
 
     The terminal never raises but ``CancelledError``.  Neither does this,
     apart from a middleware's ``KeyboardInterrupt`` or ``SystemExit``.
+    *request* is the request being served: a middleware is taken to have
+    swallowed a cancellation only if the request itself was cancelled (see
+    :meth:`RequestInfo._cancels`).
     """
-    reached: list[_OutcomeT] = []
+    if not layers:
+        return await terminal()
+    return await _Chain(layers, info, terminal, policy, request).layer(0)
 
-    async def once() -> _OutcomeT:
+
+class _Chain(Generic[_OutcomeT]):
+    """One run of a middleware chain.
+
+    An object rather than nested functions: a closure that calls itself is a
+    reference cycle, which would keep every request served through
+    middleware, params and arguments included, alive until the cyclic
+    collector runs.
+    """
+
+    __slots__ = ("_info", "_layers", "_policy", "_reached", "_request", "_terminal")
+
+    _info: Any
+    _layers: Sequence[Callable[[Any, Callable[[], Awaitable[_OutcomeT]]], Awaitable[Any]]]
+    _policy: _Policy[_OutcomeT]
+    _reached: list[_OutcomeT]
+    _request: RequestInfo
+    _terminal: Callable[[], Awaitable[_OutcomeT]]
+
+    def __init__(
+        self,
+        layers: Sequence[Callable[[Any, Callable[[], Awaitable[_OutcomeT]]], Awaitable[Any]]],
+        info: Any,
+        terminal: Callable[[], Awaitable[_OutcomeT]],
+        policy: _Policy[_OutcomeT],
+        request: RequestInfo,
+    ) -> None:
+        self._layers = layers
+        self._info = info
+        self._terminal = terminal
+        self._policy = policy
+        self._request = request
+        self._reached = []
+
+    async def _once(self) -> _OutcomeT:
         # Observe-only messages run their terminal even when a middleware
         # never reached it; it runs at most once either way.
-        if not reached:
-            reached.append(await terminal())
-        return reached[0]
+        if not self._reached:
+            self._reached.append(await self._terminal())
+        return self._reached[0]
 
-    async def layer(index: int) -> _OutcomeT:
-        if index == len(layers):
-            return await once()
-        middleware = layers[index]
+    async def layer(self, index: int) -> _OutcomeT:
+        if index == len(self._layers):
+            return await self._once()
+        middleware = self._layers[index]
+        info, policy, request = self._info, self._policy, self._request
         produced: list[_OutcomeT] = []
         pending: list[Coroutine[Any, Any, _OutcomeT]] = []
-        unawaited = False
+        runner: list[weakref.ref[asyncio.Task[Any]]] = []
+        absorbed = [0]
 
         async def collect() -> _OutcomeT:
-            outcome = await layer(index + 1)
+            runner.extend(_current_task_ref())
+            before = request._cancels()
+            outcome = await self.layer(index + 1)
+            # A cancel the inner chain took in and answered anyway (a tool
+            # that swallows its own, say) is not this layer's doing.
+            absorbed[0] = request._cancels() - before
             produced.append(outcome)
             return outcome
 
@@ -834,28 +919,27 @@ async def run_chain(
             pending.append(coroutine)
             return coroutine
 
-        task = asyncio.current_task()
-        baseline = task.cancelling() if task is not None else 0
+        baseline = request._cancels()
         try:
             returned = await middleware(info, call_next)
         except asyncio.CancelledError:
+            await _abandon(pending, runner)
             raise
         except Exception as exc:
-            if task is not None and task.cancelling() > baseline:
+            await _abandon(pending, runner)
+            if request._cancels() - absorbed[0] > baseline:
                 # A cancellation arrived and was turned into another error.
                 _drop_traceback(exc)
                 policy.swallowed_cancel(info, middleware)
                 raise asyncio.CancelledError from None
             inner = produced[0] if produced else None
             outcome = policy.refused(info, middleware, exc, inner)
-            return outcome if outcome is not None else await once()
-        finally:
-            if pending and inspect.getcoroutinestate(pending[0]) == inspect.CORO_CREATED:
-                # call_next() was called and never awaited: close it, or it
-                # would warn when collected.  The inner chain never ran.
-                pending[0].close()
-                unawaited = True
-        if task is not None and task.cancelling() > baseline:
+            return outcome if outcome is not None else await self._once()
+        except BaseException:  # KeyboardInterrupt, SystemExit
+            _detach(pending, runner)
+            raise
+        unawaited = await _abandon(pending, runner)
+        if request._cancels() - absorbed[0] > baseline:
             policy.swallowed_cancel(info, middleware)  # caught and not re-raised
             raise asyncio.CancelledError
         if produced and returned is produced[0]:
@@ -863,11 +947,65 @@ async def run_chain(
         inner = produced[0] if produced else None
         problem = _breach(returned, called=bool(pending), unawaited=unawaited, done=bool(produced))
         outcome = policy.breached(info, middleware, problem, inner)
-        return outcome if outcome is not None else await once()
+        return outcome if outcome is not None else await self._once()
 
-    if not layers:
-        return await terminal()
-    return await layer(0)
+
+def _current_task_ref() -> list[weakref.ref[asyncio.Task[Any]]]:
+    """A weak reference to the running task, if any.
+
+    Weak, because the frames that keep it may end up in that task's own
+    CancelledError, and a strong one would close a cycle.
+    """
+    task = asyncio.current_task()
+    return [weakref.ref(task)] if task is not None else []
+
+
+def _detach(
+    pending: list[Coroutine[Any, Any, Any]], runner: list[weakref.ref[asyncio.Task[Any]]]
+) -> tuple[asyncio.Task[Any] | None, bool]:
+    """Cancel the inner chain a middleware started and left unfinished.
+
+    Returns the task still running it, if there is one, and whether
+    ``call_next()`` was called and never awaited at all.
+    """
+    if not pending:
+        return None, False
+    coroutine = pending[0]
+    state = inspect.getcoroutinestate(coroutine)
+    if state == inspect.CORO_CLOSED:
+        return None, False  # it ran to its end
+    if state == inspect.CORO_CREATED:
+        # Never awaited, or handed to a task that has yet to start it.
+        task = next((t for t in asyncio.all_tasks() if t.get_coro() is coroutine), None)
+        if task is None:
+            # Close it, or it would warn when collected.  The inner chain
+            # never ran.
+            coroutine.close()
+            return None, True
+    else:
+        task = runner[0]() if runner else None
+    if task is None or task.done() or task is asyncio.current_task():
+        return None, False
+    task.cancel()
+    return task, False
+
+
+async def _abandon(
+    pending: list[Coroutine[Any, Any, Any]], runner: list[weakref.ref[asyncio.Task[Any]]]
+) -> bool:
+    """Stop the inner chain a middleware left running in a task of its own.
+
+    A middleware may await ``call_next()`` in another task (``create_task``,
+    ``gather``, ``shield``).  If it returns or raises before that work is
+    done, the work is cancelled and waited for: it must not go on to run the
+    tool once the call has been answered and its count refunded.  Returns
+    whether ``call_next()`` was called and never awaited.
+    """
+    task, unawaited = _detach(pending, runner)
+    if task is not None:
+        # Its CancelledError stays in it; one of our own, meanwhile, does not.
+        await asyncio.wait({task})
+    return unawaited
 
 
 def _breach(returned: object, *, called: bool, unawaited: bool, done: bool) -> str:
@@ -1003,7 +1141,9 @@ class RequestPolicy(_Level[RequestOutcome]):
             ran = inner.tool if inner is not None and inner.tool is not None else None
             if isinstance(exc, ProtocolError):
                 outcome = RequestOutcome._create(
-                    error_code=exc.code, message=str(exc), data=exc.data
+                    error_code=era_error_code(exc.code, stateless=info.stateless),
+                    message=str(exc),
+                    data=exc.data,
                 )
             elif info.method == "tools/call":
                 # A ToolError is an isError result the model can read.
@@ -1103,7 +1243,7 @@ class ObservePolicy(_Level[RequestOutcome]):
         inner: RequestOutcome | None,
     ) -> RequestOutcome | None:
         try:
-            if isinstance(exc, ProtocolError):
+            if isinstance(exc, ProtocolError | ToolError):
                 # A policy that refuses everything also meets these messages;
                 # they are served regardless, and this is not a failure.
                 self._logger.debug(
@@ -1165,7 +1305,7 @@ class ToolPolicy(_Level[ToolOutcome]):
                     "refused",
                     message=str(exc),
                     started=started,
-                    error_code=exc.code,
+                    error_code=era_error_code(exc.code, stateless=info.request.stateless),
                     data=exc.data,
                     duration_ms=duration,
                 )

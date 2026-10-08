@@ -374,10 +374,12 @@ The threads are daemons, so the transports give them a bounded time to finish
 as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
 a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
 yourself, `await server.wait_for_tool_threads(5)` before exiting does the
-same. `server.run()` closes open legacy SSE streams as shutdown begins, since
-uvicorn waits for every connection to close before it shuts the app down. When
-you serve `server.build_app()` with your own uvicorn and SSE clients connect,
-pass `--timeout-graceful-shutdown`, or shutdown waits for those clients to leave.
+same. `server.run()` closes open legacy SSE streams and cancels the requests
+still running as shutdown begins, since uvicorn waits for every connection to
+close before it shuts the app down. When you serve `server.build_app()` with
+your own uvicorn, pass `--timeout-graceful-shutdown`, or shutdown waits for SSE
+clients to leave and for running requests (one held in middleware included) to
+finish.
 When you mount `server.build_app()` inside another Starlette or FastAPI app,
 its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
 the host app's shutdown.
@@ -444,8 +446,12 @@ will get (`outcome.error_type`, `outcome.status`, `outcome.message`) without
 letting you change it. Timeouts and a busy server arrive as outcomes too, so
 `call_next()` raises nothing but a cancellation. Return exactly that object. A
 middleware that returns anything else, or raises an unexpected exception,
-fails the request with `-32603` and an `error_id`; the tool does not run.
-`call_next()` may be called once.
+fails the request with `-32603` and an `error_id`. If it failed before
+`call_next()`, the tool did not run; if after, the tool has already run, and
+the audit log records `tool_result_withheld`. `call_next()` may be called
+once. You may await it in a task of your own (`asyncio.gather`, say), but that
+work does not outlive your middleware: if you return or raise before it is
+done, it is cancelled.
 
 The first middleware registered is the outermost. Request middleware always
 encloses tool middleware. (Some web frameworks do the opposite and make the
@@ -454,7 +460,9 @@ last one added the outermost.)
 A cancel reaches middleware as `CancelledError` wherever the call is. Re-raise
 it: a middleware that swallows one is overruled, and no response is sent. A
 tool's `timeout` covers the tool only, so bound your own awaits:
-`async with asyncio.timeout(2): ...`.
+`async with asyncio.timeout(2): ...`. A middleware that waits forever holds
+its request until it is cancelled, and in a Streamable HTTP session a closed
+connection cancels nothing (SECURITY.md lists what does).
 
 Middleware runs on the event loop, never in a sync tool's thread, so it must
 not block: run blocking work with `await asyncio.to_thread(...)`. Context
@@ -504,7 +512,7 @@ caller.
 | HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
 | Middleware refuses with a `ProtocolError` | its code (e.g. `-32001`, `-32003`) |
 | Middleware raises `ToolError` | `isError: true` with your message verbatim (`-32603` with the message outside `tools/call`) |
-| Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run |
+| Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run if it failed before `call_next()` |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The
 `error_id` in production responses matches the server-side log entry that

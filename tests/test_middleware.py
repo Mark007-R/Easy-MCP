@@ -15,7 +15,7 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from typing import Any
 
@@ -170,19 +170,54 @@ async def test_methods_outside_the_table_are_answered_as_before() -> None:
     discover = await server.dispatch(rpc("server/discover"), context)
     assert discover is not None and discover["error"]["code"] == INVALID_PARAMS
     assert await server.dispatch(notification("notifications/unknown"), context) is None
-    assert await server.dispatch(rpc("notifications/unknown", msg_id=3), context) is None
+    # A message with an id is a request, whatever its method is called.
+    named = await server.dispatch(rpc("notifications/unknown", msg_id=3), context)
+    assert named is not None and named["error"]["code"] == METHOD_NOT_FOUND
 
 
-async def test_a_legacy_request_naming_a_notification_acts_as_one() -> None:
+async def test_a_request_naming_a_notification_is_an_unknown_method() -> None:
     server = make_server()
     started, cancelled = with_slow_tool(server)
     context = make_context()
     call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "slow"}, 7), context))
     await asyncio.wait_for(started.wait(), 5)
-    cancel = rpc("notifications/cancelled", {"requestId": 7}, msg_id=8)
-    assert await server.dispatch(cancel, context) is None
+    for method in ("notifications/cancelled", "notifications/initialized"):
+        named = rpc(method, {"requestId": 7}, msg_id=8)
+        response = await server.dispatch(named, context)
+        assert response is not None and response["error"]["code"] == METHOD_NOT_FOUND, method
+    await asyncio.sleep(0.05)
+    assert not call.done() and not cancelled.is_set()  # it cancelled nothing
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 7}), context)
     assert await asyncio.wait_for(call, 5) is None
     assert cancelled.is_set()
+
+
+async def test_a_refused_handshake_negotiates_no_version() -> None:
+    for refusal in (AuthenticationError("handshake refused"), RuntimeError("broken")):
+        server = make_server()
+        seen: list[str | None] = []
+
+        @server.middleware
+        async def gate(
+            request: RequestInfo,
+            call_next: RequestNext,
+            refusal: Exception = refusal,
+            seen: list[str | None] = seen,
+        ) -> RequestOutcome:
+            outcome = await call_next()
+            if request.method == "initialize":
+                raise refusal  # after the handshake was served
+            seen.append(request.protocol_version)
+            return outcome
+
+        context = make_context()
+        handshake = rpc("initialize", {"protocolVersion": "2025-03-26"})
+        refused = await server.dispatch(handshake, context)
+        assert refused is not None and "error" in refused, refusal
+        assert context.protocol_version is None
+        listed = await server.dispatch(rpc("tools/list", msg_id=2), context)
+        assert listed is not None and "result" in listed
+        assert seen == [None]
 
 
 async def test_request_ids_that_cannot_be_keys_are_still_served() -> None:
@@ -244,6 +279,48 @@ async def test_forbidden_is_never_sent_statelessly(monkeypatch: pytest.MonkeyPat
     assert legacy is not None and legacy["error"]["code"] == FORBIDDEN
 
 
+async def test_outcomes_carry_the_code_a_stateless_client_gets() -> None:
+    server = make_server()
+    seen: list[tuple[Any, ...]] = []
+
+    @server.middleware
+    async def watch(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        outcome = await call_next()
+        seen.append((request.method, outcome.error_code, outcome.error_type))
+        return outcome
+
+    @server.middleware
+    async def deny_list(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "tools/list":
+            raise AuthorizationError("not for you")
+        return await call_next()
+
+    @server.tool_middleware
+    async def watch_tool(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        outcome = await call_next()
+        seen.append(("tool", outcome.error_code, outcome.status))
+        return outcome
+
+    @server.tool_middleware
+    async def deny(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        raise AuthorizationError("not for you")
+
+    arguments = {"name": "add", "arguments": {"a": 1, "b": 1}}
+    for message in (modern("tools/call", arguments), modern("tools/list", msg_id=2)):
+        response = await server.dispatch(message, make_context())
+        assert response is not None and response["error"]["code"] == AUTHENTICATION_REQUIRED
+    assert seen == [
+        ("tool", AUTHENTICATION_REQUIRED, "refused"),
+        ("tools/call", AUTHENTICATION_REQUIRED, str(AUTHENTICATION_REQUIRED)),
+        ("tools/list", AUTHENTICATION_REQUIRED, str(AUTHENTICATION_REQUIRED)),
+    ]
+    seen.clear()
+    # Older revisions still get -32002, and so does what middleware sees.
+    legacy = await server.dispatch(rpc("tools/call", arguments, 3), make_context())
+    assert legacy is not None and legacy["error"]["code"] == FORBIDDEN
+    assert seen == [("tool", FORBIDDEN, "refused"), ("tools/call", FORBIDDEN, str(FORBIDDEN))]
+
+
 def test_the_origin_refusal_speaks_the_requests_era(live_server: LiveServer) -> None:
     base = live_server(make_server())
     evil = {"Origin": "http://evil.example:8000"}
@@ -284,20 +361,34 @@ def test_middleware_must_be_async() -> None:
         def __call__(self, request: Any, call_next: Any) -> Any:
             return call_next()
 
-    for bad in (sync_function, lambda request, call_next: call_next(), SyncCallable()):
+    class AsyncCallable:
+        async def __call__(self, request: Any, call_next: Any) -> Any:
+            return await call_next()
+
+    class SyncOverride(AsyncCallable):
+        def __call__(self, request: Any, call_next: Any) -> Any:
+            return None  # the __call__ that runs is not async
+
+    bad_ones = (
+        sync_function,
+        lambda request, call_next: call_next(),
+        SyncCallable(),
+        SyncOverride(),
+    )
+    for bad in bad_ones:
         with pytest.raises(TypeError, match="must be an async function"):
             server.middleware(bad)
         with pytest.raises(TypeError, match="must be an async function"):
             server.tool_middleware(bad)
 
-    class AsyncCallable:
-        async def __call__(self, request: Any, call_next: Any) -> Any:
-            return await call_next()
+    class InheritsAsync(AsyncCallable):
+        """Its async __call__ comes from the base class."""
 
     async def labelled(label: str, request: Any, call_next: Any) -> Any:
         return await call_next()
 
     server.middleware(AsyncCallable())
+    server.middleware(InheritsAsync())
     server.tool_middleware(functools.partial(labelled, "audit"))
 
 
@@ -1260,6 +1351,171 @@ async def test_call_next_twice_raises() -> None:
     assert ran == [True, True]  # once per request, never twice
 
 
+def capped_server() -> tuple[MCPServer, list[str]]:
+    """A server whose tools ``once`` (async) and ``once_sync`` may run once per session."""
+    server = make_server()
+    runs: list[str] = []
+
+    async def once() -> str:
+        runs.append("once")
+        return "done"
+
+    def once_sync() -> str:
+        runs.append("once_sync")
+        return "done"
+
+    for fn in (once, once_sync):
+        server.register_tool(
+            fn, name=fn.__name__, description="Once per session.", max_calls_per_session=1
+        )
+    return server, runs
+
+
+async def quota(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+    """Asks a remote quota service first, as a real one would."""
+    await asyncio.sleep(0.05)
+    return await call_next()
+
+
+async def test_work_call_next_left_in_a_gather_is_stopped(logs: LogCapture) -> None:
+    server, runs = capped_server()
+
+    @server.tool_middleware
+    async def fan_out(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        async def log_remote() -> None:
+            await asyncio.sleep(0.01)
+            raise ConnectionError("log service down")
+
+        outcome, _ = await asyncio.gather(call_next(), log_remote())
+        return outcome
+
+    server.tool_middleware(quota)
+    context = make_context()
+    for n, name in enumerate(("once", "once", "once_sync", "once_sync")):
+        response = await server.dispatch(rpc("tools/call", {"name": name}, n), context)
+        assert response is not None and response["error"]["code"] == INTERNAL_ERROR
+    await asyncio.sleep(0.2)  # time enough for left-behind work to reach the tool
+    assert runs == [] and context.tool_calls == {"once": 0, "once_sync": 0}
+    assert [event["stage"] for event in logs.events("middleware_failed")] == ["before"] * 4
+
+    request_level, runs = capped_server()
+
+    @request_level.middleware
+    async def fan_out_request(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        async def log_remote() -> None:
+            await asyncio.sleep(0.01)
+            raise ConnectionError("log service down")
+
+        outcome, _ = await asyncio.gather(call_next(), log_remote())
+        return outcome
+
+    @request_level.middleware
+    async def policy(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        await asyncio.sleep(0.05)  # a remote policy service
+        return await call_next()
+
+    context = make_context()
+    for n in range(2):
+        response = await request_level.dispatch(rpc("tools/call", {"name": "once"}, n), context)
+        assert response is not None and response["error"]["code"] == INTERNAL_ERROR
+    await asyncio.sleep(0.2)
+    assert runs == [] and context.tool_calls.get("once", 0) == 0
+
+
+async def test_work_call_next_left_in_a_task_is_stopped(logs: LogCapture) -> None:
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+    try:
+        for started in (False, True):
+            server, runs = capped_server()
+            kept: list[asyncio.Future[ToolOutcome]] = []
+
+            @server.tool_middleware
+            async def detach(
+                call: ToolCall,
+                call_next: ToolNext,
+                started: bool = started,
+                kept: list[asyncio.Future[ToolOutcome]] = kept,
+            ) -> ToolOutcome:
+                kept.append(asyncio.ensure_future(call_next()))
+                if started:
+                    await asyncio.sleep(0.01)  # the inner chain is under way
+                return None  # type: ignore[return-value]
+
+            server.tool_middleware(quota)
+            context = make_context()
+            for n in range(3):
+                response = await server.dispatch(rpc("tools/call", {"name": "once"}, n), context)
+                assert response is not None and response["error"]["code"] == INTERNAL_ERROR
+            await asyncio.sleep(0.2)
+            assert runs == [] and context.tool_calls == {"once": 0}, started
+            assert all(task.done() for task in kept)
+            kept.clear()
+            gc.collect()
+    finally:
+        loop.set_exception_handler(None)
+    assert unhandled == []
+    assert "called call_next() without awaiting it" not in logs.text
+    assert logs.text.count("returned before the call_next() it started had finished") == 6
+
+
+async def test_work_call_next_left_in_a_shield_is_stopped() -> None:
+    server, runs = capped_server()
+    entered = asyncio.Event()
+
+    @server.tool_middleware
+    async def shielded(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        return await asyncio.shield(call_next())
+
+    @server.tool_middleware
+    async def slow_quota(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        entered.set()
+        await asyncio.sleep(0.05)
+        return await call_next()
+
+    context = make_context()
+    for n in range(3):
+        entered.clear()
+        call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "once"}, n), context))
+        await asyncio.wait_for(entered.wait(), 5)
+        await server.dispatch(notification("notifications/cancelled", {"requestId": n}), context)
+        assert await asyncio.wait_for(call, 5) is None
+    await asyncio.sleep(0.2)
+    assert runs == [] and context.tool_calls == {"once": 0}
+
+
+async def test_work_left_behind_never_starts_the_tool_once_the_call_is_over() -> None:
+    server, runs = capped_server()
+    detached = asyncio.Event()
+    kept: list[asyncio.Future[ToolOutcome]] = []
+
+    @server.tool_middleware
+    async def detach(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        kept.append(asyncio.ensure_future(call_next()))
+        await asyncio.sleep(0.01)
+        detached.set()
+        raise RuntimeError("gave up on it")
+
+    @server.tool_middleware
+    async def stubborn(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.1)  # takes its time over being stopped
+        return await call_next()
+
+    context = make_context()
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "once"}, 1), context))
+    await asyncio.wait_for(detached.wait(), 5)
+    # The call is cancelled while its middleware waits for the work it left.
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 1}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    await asyncio.sleep(0.3)
+    assert runs == [] and context.tool_calls == {"once": 0}
+    assert all(task.done() for task in kept)
+
+
 class Payload:
     """A middleware local that can be watched with a weak reference."""
 
@@ -1274,8 +1530,12 @@ async def test_middleware_exception_frames_are_freed(monkeypatch: pytest.MonkeyP
     own = [handler for handler in logger.handlers if getattr(handler, "_easy_mcp", False)]
     monkeypatch.setattr(logger, "handlers", own)
     tool_level = make_server()
+    observe_level = make_server()
     held: list[weakref.ref[Payload]] = []
 
+    # Each keeps its exception in a local, so the exception's traceback holds
+    # the frame that holds the exception: a cycle only clearing the
+    # traceback breaks.
     @request_level.middleware
     async def failing(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
         payload = Payload()
@@ -1283,13 +1543,22 @@ async def test_middleware_exception_frames_are_freed(monkeypatch: pytest.MonkeyP
         try:
             raise KeyError("first")
         except KeyError as exc:
-            raise RuntimeError("then this") from exc
+            error = RuntimeError("then this")
+            raise error from exc
 
     @tool_level.tool_middleware
     async def refusing(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
         payload = Payload()
         held.append(weakref.ref(payload))
-        raise ToolError("refused")
+        refusal = ToolError("refused")
+        raise refusal
+
+    @observe_level.middleware
+    async def watching(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        payload = Payload()
+        held.append(weakref.ref(payload))
+        error = RuntimeError("cannot watch")
+        raise error
 
     call = rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 1}})
     gc.disable()
@@ -1299,8 +1568,10 @@ async def test_middleware_exception_frames_are_freed(monkeypatch: pytest.MonkeyP
             assert response is not None and response["error"]["code"] == INTERNAL_ERROR
             response = await tool_level.dispatch({**call, "id": n}, make_context())
             assert response is not None and response["result"]["isError"] is True
+            initialized = notification("notifications/initialized")
+            assert await observe_level.dispatch(initialized, make_context()) is None
         await asyncio.sleep(0)
-        assert len(held) == 6
+        assert len(held) == 9
         assert [ref for ref in held if ref() is not None] == []
     finally:
         gc.enable()
@@ -1465,8 +1736,8 @@ async def test_the_tool_receives_its_own_arguments() -> None:
 
     @server.tool_middleware
     async def look(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
-        views.append(call.arguments)  # snapshot before the tool runs
         outcome = await call_next()
+        views.append(call.arguments)  # first read only after the tool ran
         views.append(call.arguments)
         return outcome
 
@@ -1476,9 +1747,63 @@ async def test_the_tool_receives_its_own_arguments() -> None:
     )
     assert response is not None and response["result"]["isError"] is False, response
     assert received == [("Point", 1, ["a"])]
-    before, after = views
-    assert before is after
-    assert dict(before["point"]) == {"x": 1, "y": 2} and before["tags"] == ("a",)
+    first, again = views
+    assert first is again
+    assert dict(first["point"]) == {"x": 1, "y": 2} and first["tags"] == ("a",)
+
+
+def thawed(value: Any) -> Any:
+    """A read-only view as plain JSON, for comparing."""
+    if isinstance(value, Mapping):
+        return {key: thawed(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [thawed(item) for item in value]
+    return value
+
+
+async def test_what_a_tool_does_to_its_arguments_never_shows_in_middleware() -> None:
+    server = make_server()
+    seen: list[tuple[str, str, Any]] = []
+
+    def grow(items: list[int], config: dict[str, Any]) -> str:
+        """Changes its arguments in place."""
+        items.append(99)
+        config["inner"]["k"] = "changed by the tool"
+        config["added"] = True
+        return "grown"
+
+    async def grow_async(items: list[int], config: dict[str, Any]) -> str:
+        """Changes its arguments in place, from a task."""
+        return grow(items, config)
+
+    server.register_tool(grow, name="grow")
+    server.register_tool(grow_async, name="grow_async")
+
+    @server.middleware
+    async def after_request(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        outcome = await call_next()
+        assert request.tool is not None
+        seen.append((request.tool.name, "params", thawed(request.params["arguments"])))
+        return outcome
+
+    @server.tool_middleware
+    async def after_tool(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        outcome = await call_next()
+        seen.append((call.tool.name, "arguments", thawed(call.arguments)))
+        return outcome
+
+    sent = {"items": [1, 2], "config": {"inner": {"k": "v"}}}
+    for name in ("grow", "grow_async"):
+        message = rpc("tools/call", {"name": name, "arguments": json.loads(json.dumps(sent))})
+        response = await server.dispatch(message, make_context())
+        assert response is not None and response["result"]["content"][0]["text"] == "grown"
+        assert message["params"]["arguments"] == sent  # the client's message is untouched
+    assert seen == [
+        ("grow", "arguments", sent),
+        ("grow", "params", sent),
+        ("grow_async", "arguments", sent),
+        ("grow_async", "params", sent),
+    ]
 
 
 async def test_the_session_cap_holds_under_slow_middleware() -> None:
@@ -1769,6 +2094,86 @@ async def test_other_requests_are_cancellable_now(logs: LogCapture) -> None:
     assert context.in_flight == {}
 
 
+async def test_a_tool_that_swallows_its_cancel_answers_alike_with_middleware(
+    logs: LogCapture,
+) -> None:
+    responses: list[Any] = []
+    started = asyncio.Event()
+    for layer in ("none", "tool", "request"):
+        server = make_server()
+        started.clear()
+
+        @server.tool
+        async def stubborn() -> str:
+            """Ignores its cancel."""
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return "swallowed"
+            return "finished"
+
+        if layer == "tool":
+            server.tool_middleware(tool_passthrough)
+        elif layer == "request":
+            server.middleware(passthrough)
+        context = make_context()
+        call = asyncio.create_task(
+            server.dispatch(rpc("tools/call", {"name": "stubborn"}, 1), context)
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        await server.dispatch(notification("notifications/cancelled", {"requestId": 1}), context)
+        responses.append(await asyncio.wait_for(call, 5))
+    assert responses[0] is not None
+    assert responses[0]["result"]["content"][0]["text"] == "swallowed"
+    assert responses == [responses[0]] * 3
+    assert "swallowed a cancellation" not in logs.text
+
+
+async def check_ok() -> None:
+    await asyncio.sleep(0)
+
+
+async def check_down() -> None:
+    await asyncio.sleep(0.01)  # fails once the TaskGroup's body has finished
+    raise ConnectionError("policy service down")
+
+
+async def test_a_failed_task_group_in_middleware_is_no_cancellation(logs: LogCapture) -> None:
+    # On Python 3.11 a TaskGroup whose child fails after the body finished
+    # cancels the task it runs in and never takes that back.
+    call = rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}})
+    for level in ("request", "tool"):
+        for mode in ("fail closed", "fail open", "after the call"):
+            server = make_server()
+
+            async def checks(info: Any, call_next: Any, mode: str = mode) -> Any:
+                if isinstance(info, RequestInfo) and info.method != "tools/call":
+                    return await call_next()
+                outcome = await call_next() if mode == "after the call" else None
+                try:
+                    async with asyncio.TaskGroup() as group:
+                        group.create_task(check_ok())
+                        group.create_task(check_down())
+                except ExceptionGroup:
+                    if mode == "fail closed":
+                        raise AuthenticationError("policy unavailable") from None
+                return outcome if outcome is not None else await call_next()
+
+            if level == "request":
+                server.middleware(checks)
+            else:
+                server.tool_middleware(checks)
+            response = await asyncio.wait_for(server.dispatch(call, make_context()), 5)
+            assert response is not None, (level, mode)
+            if mode == "fail closed":
+                assert response["error"] == {"code": -32001, "message": "policy unavailable"}
+            else:
+                assert response["result"]["content"][0]["text"] == "3", (level, mode)
+    assert "swallowed a cancellation" not in logs.text
+    assert logs.events("tool_cancelled") == []
+
+
 async def test_initialize_is_never_cancelled() -> None:
     server = make_server()
     entered = asyncio.Event()
@@ -1793,7 +2198,7 @@ async def test_initialize_is_never_cancelled() -> None:
 
 
 async def test_notifications_cannot_be_refused(logs: LogCapture) -> None:
-    for refusal in (AuthenticationError("no"), RuntimeError("broken"), None):
+    for refusal in (AuthenticationError("no"), ToolError("no"), RuntimeError("broken"), None):
         server = make_server()
         logging.getLogger("easy_mcp").setLevel(logging.DEBUG)
         started, cancelled = with_slow_tool(server)
@@ -1817,8 +2222,8 @@ async def test_notifications_cannot_be_refused(logs: LogCapture) -> None:
         assert cancelled.is_set()
         records = logs.records[first:]
         failed = [r.event for r in records if r.getMessage() == "middleware_failed"]  # type: ignore[attr-defined]
-        if isinstance(refusal, AuthenticationError):
-            assert failed == []
+        if isinstance(refusal, AuthenticationError | ToolError):
+            assert failed == [], refusal
             (debug,) = [r for r in records if "cannot be refused" in r.getMessage()]
             assert debug.levelname == "DEBUG"
         else:
@@ -1827,8 +2232,10 @@ async def test_notifications_cannot_be_refused(logs: LogCapture) -> None:
 
 
 async def test_discover_cannot_be_refused(logs: LogCapture) -> None:
-    for refusal in (AuthenticationError("no"), RuntimeError("broken"), None):
+    for refusal in (AuthenticationError("no"), ToolError("no"), RuntimeError("broken"), None):
         server = make_server()
+        logging.getLogger("easy_mcp").setLevel(logging.DEBUG)
+        first = len(logs.records)
 
         @server.middleware
         async def hostile(
@@ -1843,6 +2250,15 @@ async def test_discover_cannot_be_refused(logs: LogCapture) -> None:
         result = discovered["result"]
         assert result["supportedVersions"][0] == "2026-07-28"
         assert result["cacheScope"] == "public" and result["resultType"] == "complete"
+        records = logs.records[first:]
+        failed = [r.event for r in records if r.getMessage() == "middleware_failed"]  # type: ignore[attr-defined]
+        if isinstance(refusal, AuthenticationError | ToolError):
+            assert failed == [], refusal
+            (debug,) = [r for r in records if "cannot be refused" in r.getMessage()]
+            assert debug.levelname == "DEBUG"
+        else:
+            (event,) = failed
+            assert event["stage"] == "observe" and event["method"] == "server/discover"
         listed = await server.dispatch(modern("tools/list"), make_context())
         assert listed is not None and "error" in listed  # everything else is refusable
 
@@ -2140,6 +2556,125 @@ async def test_a_finished_call_with_middleware_does_not_keep_its_result_alive() 
         gc.enable()
 
 
+class Watched(dict[str, Any]):
+    """A JSON object that can be watched with a weak reference."""
+
+
+def watched(
+    method: str, params: dict[str, Any], msg_id: int
+) -> tuple[Watched, list[weakref.ref[Watched]]]:
+    """A request whose message, params and (when given) arguments can be watched."""
+    outer = Watched(params)
+    refs = [weakref.ref(outer)]
+    if "arguments" in params:
+        arguments = outer["arguments"] = Watched(params["arguments"])
+        refs.append(weakref.ref(arguments))
+    message = Watched(jsonrpc="2.0", id=msg_id, method=method, params=outer)
+    return message, [weakref.ref(message), *refs]
+
+
+def only_the_servers_log_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # pytest attaches handlers that keep every record, traceback included, to
+    # loggers that exist when a test starts; only the server's own may stay.
+    logger = logging.getLogger("easy_mcp")
+    own = [handler for handler in logger.handlers if getattr(handler, "_easy_mcp", False)]
+    monkeypatch.setattr(logger, "handlers", own)
+
+
+async def test_a_cancelled_request_nobody_awaits_is_freed_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A transport that cancels a dispatch and drops it (an SSE stream that
+    # closes) leaves the task holding its CancelledError, traceback and all.
+    # With the cyclic collector off, nothing in those frames may lead back to
+    # the task, or the request stays alive until a full collection.
+    only_the_servers_log_handlers(monkeypatch)
+    for layer in ("none", "request", "tool"):
+        server = make_server()
+        started, _ = with_slow_tool(server)
+        if layer == "request":
+            server.middleware(passthrough)
+        elif layer == "tool":
+            server.tool_middleware(tool_passthrough)
+        refs: list[weakref.ref[Watched]] = []
+        gc.disable()
+        try:
+            for n in range(3):
+                started.clear()
+                message, watching = watched("tools/call", {"name": "slow", "arguments": {}}, n)
+                refs.extend(watching)
+                task = asyncio.create_task(server.dispatch(message, make_context()))
+                del message
+                await asyncio.wait_for(started.wait(), 5)
+                task.cancel()
+                await asyncio.wait({task})  # never awaited itself
+                del task
+            await asyncio.sleep(0.01)
+            assert len(refs) == 9
+            assert [ref for ref in refs if ref() is not None] == [], layer
+        finally:
+            gc.enable()
+
+
+async def test_a_cancelled_handshake_nobody_awaits_is_freed_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    only_the_servers_log_handlers(monkeypatch)
+    server = make_server()
+    entered = asyncio.Event()
+
+    @server.middleware
+    async def hold(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "initialize":
+            entered.set()
+            await asyncio.sleep(30)
+        return await call_next()
+
+    refs: list[weakref.ref[Watched]] = []
+    gc.disable()
+    try:
+        for n in range(3):
+            entered.clear()
+            message, watching = watched("initialize", {"protocolVersion": "2025-11-25"}, n)
+            refs.extend(watching)
+            task = asyncio.create_task(server.dispatch(message, make_context()))
+            del message
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            await asyncio.wait({task})
+            del task
+        await asyncio.sleep(0.01)
+        assert len(refs) == 6
+        assert [ref for ref in refs if ref() is not None] == []
+    finally:
+        gc.enable()
+
+
+async def test_a_request_served_through_middleware_is_freed_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    only_the_servers_log_handlers(monkeypatch)
+    server = make_server()
+    server.middleware(passthrough)
+    server.tool_middleware(tool_passthrough)
+    refs: list[weakref.ref[Watched]] = []
+    gc.disable()
+    try:
+        for n in range(3):
+            message, watching = watched(
+                "tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}}, n
+            )
+            refs.extend(watching)
+            response = await server.dispatch(message, make_context())
+            assert response is not None and response["result"]["content"][0]["text"] == "3"
+            del message, response
+        await asyncio.sleep(0.05)  # let the last worker thread let go
+        assert len(refs) == 9
+        assert [ref for ref in refs if ref() is not None] == []
+    finally:
+        gc.enable()
+
+
 # --------------------------------------------------------------- transports
 
 ACCEPT = {"Accept": "application/json, text/event-stream"}
@@ -2403,6 +2938,84 @@ async def test_stdio_shutdown_cancels_middleware() -> None:
         stdin.close()
 
 
+@pytest.mark.parametrize("era", ["session", "stateless", "handshake", "notification"])
+def test_http_shutdown_cancels_middleware(era: str) -> None:
+    import socket
+
+    server, entered, cancelled, ran = holding_server()
+    held = {"handshake": "initialize", "notification": "notifications/initialized"}.get(era)
+
+    @server.middleware
+    async def hold_more(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == held:
+            entered.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return await call_next()
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server.port = port
+    serving = threading.Thread(target=server.run, args=("http",), daemon=True)
+    serving.start()
+    base = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            httpx.get(f"{base}/healthz", timeout=1)
+            break
+        except httpx.TransportError:
+            assert time.monotonic() < deadline, "the server never came up"
+            time.sleep(0.05)
+    statuses: list[int] = []
+
+    def fire() -> None:
+        # The client stays connected, waiting for its answer.
+        try:
+            with httpx.Client(base_url=base, timeout=20) as client:
+                if era == "stateless":
+                    call = modern("tools/call", {"name": "touch"})
+                    statuses.append(
+                        client.post("/mcp", json=call, headers=headers_for(call)).status_code
+                    )
+                    return
+                init = client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+                statuses.append(init.status_code)
+                if era in ("session", "notification"):
+                    headers = {**ACCEPT, "MCP-Session-Id": init.headers["mcp-session-id"]}
+                    if era == "session":
+                        message = rpc("tools/call", {"name": "touch"}, 2)
+                    else:
+                        message = notification("notifications/initialized")
+                    posted = client.post("/mcp", json=message, headers=headers)
+                    statuses.append(posted.status_code)
+        except httpx.TransportError:
+            statuses.append(0)
+
+    client = threading.Thread(target=fire, daemon=True)
+    client.start()
+    try:
+        assert entered.wait(5)
+        server.stop()
+        serving.join(5)
+        assert not serving.is_alive(), "shutdown waited for the held request"
+    finally:
+        if serving.is_alive():
+            server._transport._uvicorn.force_exit = True  # type: ignore[union-attr]
+            serving.join(5)
+    assert cancelled.is_set()
+    client.join(5)
+    # A cancelled request gets no response; a handshake that never finished
+    # opens no session.
+    expected = {"stateless": [202], "handshake": [202]}.get(era, [200, 202])
+    assert statuses == expected
+    assert ran == []
+
+
 async def test_stdio_serves_both_eras_to_middleware() -> None:
     server = make_server()
     kept: list[tuple[Any, ...]] = []
@@ -2427,9 +3040,26 @@ async def test_stdio_serves_both_eras_to_middleware() -> None:
         rpc("initialize", {"protocolVersion": "2025-11-25"}, msg_id=3),
         rpc("tools/list", msg_id=4),
     ]
-    stdin = io.BytesIO(b"".join(json.dumps(m).encode() + b"\n" for m in lines))
+    read_end, write_end = os.pipe()
+    stdin = os.fdopen(read_end, "rb")
+    writer = os.fdopen(write_end, "wb")
     stdout = io.BytesIO()
-    await StdioTransport(server, stdin=stdin, stdout=stdout).serve()
+    serving = asyncio.create_task(StdioTransport(server, stdin=stdin, stdout=stdout).serve())
+    try:
+        writer.write(b"".join(json.dumps(m).encode() + b"\n" for m in lines[:3]))
+        writer.flush()
+        deadline = time.monotonic() + 5
+        while stdout.getvalue().count(b"\n") < 3:
+            assert time.monotonic() < deadline, "no answer to initialize"
+            await asyncio.sleep(0.01)
+        # A session-era request, once initialize has been answered.
+        writer.write(json.dumps(lines[3]).encode() + b"\n")
+        writer.close()
+        await asyncio.wait_for(serving, 5)
+    finally:
+        if not writer.closed:
+            writer.close()
+        stdin.close()
     responses = {r["id"]: r for r in map(json.loads, stdout.getvalue().splitlines())}
     assert responses[2]["result"]["content"][0]["text"] == "2"
     assert sorted(kept, key=str) == sorted(

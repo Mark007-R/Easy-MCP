@@ -20,7 +20,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +55,7 @@ from .middleware import (
     ToolOutcome,
     ToolPolicy,
     TransportInfo,
+    _copy,
     _tool_call_scope,
     _type_name,
     check_middleware,
@@ -68,6 +69,7 @@ from .protocol import (
     META_SERVER_INFO,
     SUPPORTED_PROTOCOL_VERSIONS,
     check_request_meta,
+    era_error_code,
     is_modern_request,
     is_reserved_error_code,
     negotiate_protocol_version,
@@ -566,7 +568,7 @@ class MCPServer:
             if modern:
                 check_request_meta(params)
             notification_method = method.startswith("notifications/")
-            if notification_method and modern:
+            if notification_method and not is_notification:
                 # A notification has no id; a request naming one of these
                 # methods is asking for a method that does not exist.
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
@@ -582,7 +584,7 @@ class MCPServer:
             )
             if spec.notification:
                 notify = functools.partial(self._handle_notification_outcome, request, context)
-                await self._observe(request, notify)
+                await self._isolated(request, functools.partial(self._observe, request, notify))
                 return None
             if spec.cancellable:
                 response = await self._serve_cancellable(request, context)
@@ -691,7 +693,13 @@ class MCPServer:
                         client_id=context.client_id,
                         request_id=msg_id,
                     )
-            if caller is not None and caller.cancelling() > baseline:
+            ours = caller is not None and caller.cancelling() > baseline
+            # A cancelled caller that nobody awaits keeps its CancelledError,
+            # whose traceback holds this frame: were the frame to hold the
+            # caller too, the request would stay alive until the cyclic
+            # collector ran.
+            caller = None
+            if ours:
                 task.cancel()  # the request must not outlive its caller
                 raise
             return None  # cancelled by the client: per MCP, no response
@@ -707,15 +715,12 @@ class MCPServer:
 
     async def _serve(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
         """Run the request middleware around the request; returns the response."""
-        route = functools.partial(self._route, request, context)
-        layers = request._request_layers
-        if _METHODS[request.method].observe_only:
-            outcome = await self._observe(request, route)
-        elif layers:
-            policy = RequestPolicy(self._logger, self.debug)
-            outcome = await run_chain(layers, request, route, policy)
-        else:
-            outcome = await route()
+        outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
+        if request.method == "initialize" and outcome.error_code is None:
+            # Only a handshake the client is answered with negotiates a
+            # version; later requests on this connection or session are
+            # spoken in it.
+            context.protocol_version = request.protocol_version
         if outcome.error_code is not None:
             return _error_response(
                 request.request_id, outcome.error_code, outcome.message or "", outcome._data
@@ -724,6 +729,38 @@ class MCPServer:
         if request.stateless:
             result = self._modern_result(result)
         return _result_response(request.request_id, result)
+
+    async def _outcome(self, request: RequestInfo, context: ClientContext) -> RequestOutcome:
+        """The request's outcome, with its request middleware around it."""
+        route = functools.partial(self._route, request, context)
+        layers = request._request_layers
+        if _METHODS[request.method].observe_only:
+            return await self._observe(request, route)
+        if layers:
+            policy = RequestPolicy(self._logger, self.debug)
+            return await run_chain(layers, request, route, policy, request)
+        return await route()
+
+    @staticmethod
+    async def _isolated(
+        request: RequestInfo, serve: Callable[[], Coroutine[Any, Any, RequestOutcome]]
+    ) -> RequestOutcome:
+        """Run *serve* in a task of its own whenever middleware will run in it.
+
+        A middleware swallowed a cancellation if the request was cancelled
+        and the middleware did not re-raise it.  asyncio counts every cancel
+        of a task, those a library makes and takes back itself included (and
+        on Python 3.11, a TaskGroup whose child fails never takes back its
+        own), so the task middleware runs in cannot tell.  The task awaiting
+        it can: only cancels of the request reach it (the task registered
+        for ``notifications/cancelled``, or the caller of ``dispatch``).
+        """
+        if not request._request_layers and not (
+            request._tool_layers and request.method == "tools/call"
+        ):
+            return await serve()
+        request._watch_current_task()
+        return await asyncio.create_task(serve())
 
     async def _observe(
         self, request: RequestInfo, handle: Callable[[], Awaitable[RequestOutcome]]
@@ -737,7 +774,8 @@ class MCPServer:
         layers = request._request_layers
         if not layers:
             return await handle()
-        return await run_chain(layers, request, handle, ObservePolicy(self._logger, self.debug))
+        policy = ObservePolicy(self._logger, self.debug)
+        return await run_chain(layers, request, handle, policy, request)
 
     async def _route(self, request: RequestInfo, context: ClientContext) -> RequestOutcome:
         """Serve the request itself, inside the request middleware.
@@ -759,7 +797,9 @@ class MCPServer:
             else:  # the method table and this routing disagree
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
         except ProtocolError as exc:
-            return RequestOutcome._create(error_code=exc.code, message=str(exc), data=exc.data)
+            # The code the client will get, so outer middleware sees it too.
+            code = era_error_code(exc.code, stateless=request.stateless)
+            return RequestOutcome._create(error_code=code, message=str(exc), data=exc.data)
         except Exception:
             # Sanitize: clients get an opaque error_id; the log gets the trace.
             error_id = uuid.uuid4().hex[:12]
@@ -806,9 +846,9 @@ class MCPServer:
         return {"name": self.name, "version": self.version}
 
     def _handle_initialize(self, params: dict[str, Any], context: ClientContext) -> dict[str, Any]:
+        # The version is recorded on *context* by _serve, once the answer
+        # stands: middleware may still refuse the handshake.
         version = negotiate_protocol_version(params.get("protocolVersion"))
-        # Later requests on this connection or session are spoken in it.
-        context.protocol_version = version
         result: dict[str, Any] = {
             "protocolVersion": version,
             "capabilities": self._capabilities(),
@@ -928,9 +968,12 @@ class MCPServer:
             if not isinstance(arguments, dict):
                 raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
             # Middleware reads the plain JSON form; the tool gets its own
-            # models, built from it.
+            # models, built from it, and whenever middleware can read the
+            # arguments, a copy of its own too: what the tool does to them
+            # (from a thread that may outlive the call) never shows there.
             plain = validate_arguments(arguments, definition.arguments_schema)
-            built = build_param_models(definition.param_models, plain)
+            own = _copy(plain) if request._request_layers or request._tool_layers else plain
+            built = build_param_models(definition.param_models, own)
         except ProtocolError as exc:
             audit(
                 "tool_denied",
@@ -959,13 +1002,17 @@ class MCPServer:
                 layers = request._tool_layers
                 if not layers:
                     return await run()
-                return await run_chain(layers, call, run, ToolPolicy(self._logger, self.debug))
+                policy = ToolPolicy(self._logger, self.debug)
+                return await run_chain(layers, call, run, policy, request)
         except asyncio.CancelledError:
             # Wherever the call was, in a middleware or in the tool.  Only the
             # first trigger counts, so a tool stopped already keeps its reason.
             self._stop_tool(token, CANCELLED, name, context)
             raise
         finally:
+            # Work a middleware left behind must not start the tool from now
+            # on, when its count may be refunded.
+            call._closed = True
             if not call._started:
                 # Refused, busy, a middleware failure or an early cancel: it
                 # never ran, so it does not count against the session cap.
@@ -979,6 +1026,11 @@ class MCPServer:
         Every answer is an outcome, timeouts and a busy server included; only
         a cancellation is raised.
         """
+        if call._closed:
+            # The call is over and its count may be refunded: this is work a
+            # middleware left running past its end, and the tool must not
+            # start for it.
+            raise asyncio.CancelledError
         definition = call.tool
         name = definition.name
         token = call.cancel_token

@@ -45,7 +45,7 @@ Consequences:
 | Crash amplification | Exceptions in one tool call are contained; the server keeps serving |
 | Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
 | Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
-| Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`, tool not run) |
+| Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
 
 ## Transport trust boundaries
 
@@ -78,7 +78,9 @@ request and tool call. The same trust model applies to them as to tools:
 - **What it cannot do:** skip or reorder a built-in check, grant access, change
   the caller's identity or the arguments a tool receives, or rewrite a result.
   It can only refuse. A middleware that fails or breaks its contract fails the
-  request closed with `-32603`, and the tool does not run.
+  request closed with `-32603`. If it failed before `call_next()`, the tool
+  does not run; if after, the tool has already run (a write it made stands),
+  and `tool_result_withheld` is audited.
 - **Treat headers, `_meta` and request ids as client-controlled.** Trust a
   header only if your proxy strips and re-sets it. Never authorize on
   `clientInfo`, which the client reports about itself.
@@ -87,9 +89,21 @@ request and tool call. The same trust model applies to them as to tools:
   The audit events middleware adds carry none of them.
 - **Session ids are capabilities for anonymous sessions.** Avoid exporting
   `request.session_id` in plain form.
-- **Bound remote calls inside middleware with a timeout.** The tool timeout
-  does not cover middleware, and a middleware that waits forever holds its
-  request until the client cancels it or disconnects.
+- **Bound remote calls inside middleware with a timeout, on `initialize`
+  too.** The tool timeout does not cover middleware, and a middleware that
+  waits forever holds its request until it is cancelled:
+  - on stateless HTTP, by the client closing the connection;
+  - on stdio, legacy SSE and Streamable HTTP sessions, by
+    `notifications/cancelled`; on legacy SSE also by the stream closing, and
+    on a Streamable HTTP session also by `DELETE`;
+  - everywhere, by shutdown.
+
+  On a Streamable HTTP session a closed connection cancels nothing, and a
+  session with a request running never idle-expires, so it keeps its
+  `max_sessions` slot until one of the above. No client can cancel
+  `initialize`: a middleware hung on it over Streamable HTTP holds a session
+  slot (the client has no session id to cancel or delete with) until it
+  returns or the server shuts down.
 - **Never block the event loop.** A blocking middleware stalls every client;
   use `await asyncio.to_thread(...)` for blocking work.
 
@@ -158,12 +172,14 @@ the client is untrusted, the credential in the environment is trusted.
   with the process, without running its `finally` blocks. So does one in a
   process that drives `dispatch` itself and exits without that wait. Under
   your own uvicorn (`build_app()`), set `--timeout-graceful-shutdown`: uvicorn
-  waits for open SSE streams to close before it shuts the app down, and a
-  forced exit skips that wait entirely. `server.run()` closes those streams
-  itself. A mounted `build_app()` gets no lifespan at all, so the host app
-  must call `wait_for_tool_threads` on shutdown. Threads a sync tool starts
-  itself are daemons as well, because they inherit the flag, and nothing
-  waits for them. Pass `daemon=False` for work that must finish.
+  waits for open SSE streams to close and running requests to finish (one
+  held in middleware never does) before it shuts the app down, and a forced
+  exit skips that wait entirely. `server.run()` closes those streams and
+  cancels those requests itself. A mounted `build_app()` gets no lifespan at
+  all, so the host app must call `wait_for_tool_threads` on shutdown. Threads
+  a sync tool starts itself are daemons as well, because they inherit the
+  flag, and nothing waits for them. Pass `daemon=False` for work that must
+  finish.
 - **A MongoDB cancel reaches only the primary, and only calls with a
   session.** `killSessions` is sent to the primary. With a `readPreference`
   that routes reads to a secondary, a cancelled read there keeps running until
