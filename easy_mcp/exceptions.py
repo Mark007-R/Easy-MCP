@@ -223,3 +223,25 @@ class AuthServerUnavailableError(ProtocolError):
         self.stage = stage
         self.sent_request = sent_request
         super().__init__(message, data={"reason": "auth_server_unavailable"})
+
+
+# --- Shared state store (MCPServer(store=...)) --------------------------------
+
+
+class StoreUnavailableError(ProtocolError):
+    """The shared state store cannot be reached; retry shortly.
+
+    ``-32008`` with ``data.reason = "store_unavailable"``.  Over HTTP it is
+    answered ``503`` with ``Retry-After: 1``.  A request that needs the store
+    (a session, a rate limit, a ``max_calls_per_session`` count) is refused
+    with it rather than served without its limits.  Not a
+    :class:`ServerBusyError`, so code that refunds busy calls never catches
+    it.
+    """
+
+    code = SERVER_BUSY
+
+    def __init__(
+        self, message: str = "Service unavailable: shared store unreachable; retry shortly"
+    ) -> None:
+        super().__init__(message, data={"reason": "store_unavailable"})

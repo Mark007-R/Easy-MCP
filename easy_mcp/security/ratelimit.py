@@ -58,6 +58,14 @@ class SlidingWindowRateLimiter:
         """
         self._record(client_id)
 
+    async def acheck(self, client_id: str) -> None:
+        """:meth:`check`, for code that also takes a shared store's async limiter.
+
+        Raises:
+            RateLimitError: If the client is over its budget.
+        """
+        self._record(client_id)
+
     def _record(self, client_id: str) -> float:
         """:meth:`check`, returning the time recorded so :meth:`_refund` can take it back."""
         now = self._clock()

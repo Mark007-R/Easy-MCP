@@ -31,6 +31,7 @@ from .exceptions import (
     SchemaError,
     ServerBusyError,
     SessionLimitError,
+    StoreUnavailableError,
     TokenRequiredError,
     ToolError,
     ToolRegistrationError,
@@ -49,6 +50,7 @@ from .security.auth import APIKeyAuth, ClientIdentity, current_identity
 from .security.oauth import Introspection, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
 from .server import PROTOCOL_VERSION, MCPServer
+from .store import MemoryStore, Store
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -67,6 +69,7 @@ __all__ = [
     "Introspection",
     "InvalidTokenError",
     "MCPServer",
+    "MemoryStore",
     "OAuthResourceServer",
     "PROTOCOL_VERSION",
     "PayloadTooLargeError",
@@ -81,6 +84,8 @@ __all__ = [
     "SessionLimitError",
     "SlidingWindowRateLimiter",
     "StdioTransport",
+    "Store",
+    "StoreUnavailableError",
     "StreamableHTTPTransport",
     "TokenRequiredError",
     "ToolDefinition",
