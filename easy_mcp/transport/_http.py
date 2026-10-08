@@ -330,7 +330,9 @@ class BaseHTTPTransport(Transport):
                 )
         failed = False
         try:
-            return await server.authenticate_request(bearer=bearer, api_key=api_key, tool=tool)
+            return await server.authenticate_request(
+                bearer=bearer, api_key=api_key, tool=tool, client=client_id
+            )
         except TokenRequiredError:
             # No credential: RFC 6750 sends no error code, only where to sign in.
             challenge = bearer_challenge(metadata_url, scope=server._initial_scopes())
@@ -380,9 +382,10 @@ class BaseHTTPTransport(Transport):
             )
         except AuthServerUnavailableError as exc:
             # Charged when this token was sent for introspection and that
-            # request failed: a token can be made to fail it (a filter in
+            # request failed in a way the token may have caused (a filter in
             # front of the endpoint), so it must not be repeated for free.  A
-            # refusal while an outage window is open sent nothing.
+            # failure found to be the authorization server's own outage is
+            # not, and a refusal while its window is open sent nothing.
             failed = exc.sent_request
             return rpc_error(
                 503,

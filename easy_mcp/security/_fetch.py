@@ -13,6 +13,12 @@ module adds the transport rules every fetch follows:
 
 urllib blocks, so each fetch runs on the executor the caller passes.  Only the
 standard library is used: introspection needs no extra dependency.
+
+A socket timeout bounds one call on the socket, not the exchange: a server
+(or a filter in front of it) that sends a byte every few seconds would make
+every read succeed, and hold the thread for as long as it kept on, status
+line and headers included.  So the sockets of a fetch give each call only
+the time left before the exchange's deadline (:class:`_Deadline`).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import contextlib
 import functools
 import http.client
 import json
+import socket
 import ssl
 import time
 import urllib.error
@@ -93,18 +100,171 @@ def allowed_url(url: str) -> bool:
     return parts.scheme == "http" and host in LOOPBACK_HOSTS
 
 
+class _Deadline:
+    """When one exchange must be over; its sockets give each call only the time left."""
+
+    def __init__(self, seconds: float) -> None:
+        self._at = time.monotonic() + seconds
+
+    def left(self) -> float:
+        """Seconds left.
+
+        Raises:
+            TimeoutError: None are.
+        """
+        left = self._at - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("timed out")
+        return left
+
+    def connect(
+        self,
+        address: tuple[str, int],
+        timeout: float | None = None,
+        source_address: tuple[str, int] | None = None,
+    ) -> socket.socket:
+        """``socket.create_connection`` with a :class:`_TimedSocket` of this deadline.
+
+        *timeout* is ignored: each attempt gets the time left.  The TLS
+        handshake that may follow runs in one call, bounded by the timeout
+        the socket has when it starts: the time left once connected.
+        """
+        host, port = address
+        error: OSError | None = None
+        for family, kind, proto, _, peer in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+            sock = _TimedSocket(family, kind, proto)
+            sock.deadline = self
+            try:
+                sock.settimeout(self.left())
+                if source_address is not None:
+                    sock.bind(source_address)
+                sock.connect(peer)
+                sock.settimeout(self.left())
+            except OSError as exc:
+                sock.close()
+                if isinstance(exc, TimeoutError):
+                    raise
+                error = exc
+                continue
+            return sock
+        raise error if error is not None else OSError(f"no address found for {host}")
+
+
+class _TimedSocket(socket.socket):
+    """A TCP socket whose every send and receive ends by its deadline."""
+
+    deadline: _Deadline | None = None
+
+    def _arm(self) -> None:
+        if self.deadline is not None:
+            self.settimeout(self.deadline.left())
+
+    def recv(self, bufsize: int, flags: int = 0, /) -> bytes:
+        self._arm()
+        return super().recv(bufsize, flags)
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        self._arm()
+        return super().recv_into(buffer, nbytes, flags)
+
+    def send(self, data: Any, flags: int = 0, /) -> int:
+        self._arm()
+        return super().send(data, flags)
+
+    def sendall(self, data: Any, flags: int = 0, /) -> None:
+        self._arm()
+        super().sendall(data, flags)
+
+
+class _TimedSSLSocket(ssl.SSLSocket):
+    """A TLS socket whose every read and write ends by its deadline.
+
+    ``recv`` and ``recv_into`` go through :meth:`read`, and ``sendall``
+    through :meth:`send`.  The deadline is set once the handshake is over.
+    """
+
+    deadline: _Deadline | None = None
+
+    def _arm(self) -> None:
+        if self.deadline is not None:
+            self.settimeout(self.deadline.left())
+
+    def read(self, len: int = 1024, buffer: Any = None) -> bytes:
+        self._arm()
+        return super().read(len, buffer)
+
+    def send(self, data: Any, flags: int = 0) -> int:
+        self._arm()
+        return super().send(data, flags)
+
+
 @functools.lru_cache(maxsize=1)
 def _tls_context() -> ssl.SSLContext:
     # Built once: loading the system's trusted certificates is slow on some
     # platforms, and the context is safe to share between threads.
-    return ssl.create_default_context()
+    context = ssl.create_default_context()
+    context.sslsocket_class = _TimedSSLSocket
+    return context
 
 
-def _opener(url: str) -> urllib.request.OpenerDirector:
+class _HTTPConnection(http.client.HTTPConnection):
+    """Plain HTTP (to a loopback host only) under one exchange's deadline."""
+
+    def __init__(self, host: str, /, *, deadline: _Deadline, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._create_connection = deadline.connect
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS under one exchange's deadline."""
+
+    def __init__(self, host: str, /, *, deadline: _Deadline, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._create_connection = deadline.connect
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        super().connect()  # the TCP connection, a proxy's tunnel, the TLS handshake
+        if isinstance(self.sock, _TimedSSLSocket):
+            self.sock.deadline = self._deadline
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    """Open ``http`` URLs under one deadline (:class:`_HTTPConnection`)."""
+
+    def __init__(self, deadline: _Deadline) -> None:
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        deadline = self._deadline
+
+        def connection(host: str, /, **kwargs: Any) -> http.client.HTTPConnection:
+            return _HTTPConnection(host, deadline=deadline, **kwargs)
+
+        return self.do_open(connection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    """Open ``https`` URLs under one deadline (:class:`_HTTPSConnection`)."""
+
+    def __init__(self, deadline: _Deadline) -> None:
+        # The shared context: without one, Python 3.12+ builds a new one here.
+        super().__init__(context=_tls_context())
+        self._deadline = deadline
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        deadline = self._deadline
+
+        def connection(host: str, /, **kwargs: Any) -> http.client.HTTPConnection:
+            return _HTTPSConnection(host, deadline=deadline, context=_tls_context(), **kwargs)
+
+        return self.do_open(connection, req)
+
+
+def _opener(url: str, deadline: _Deadline) -> urllib.request.OpenerDirector:
     parts = urllib.parse.urlsplit(url)
-    handlers: list[Any] = [_NoRedirect()]
-    if parts.scheme == "https":
-        handlers.append(urllib.request.HTTPSHandler(context=_tls_context()))
+    handlers: list[Any] = [_NoRedirect(), _HTTPHandler(deadline), _HTTPSHandler(deadline)]
     if parts.hostname in LOOPBACK_HOSTS:
         # A loopback address is never reached through a proxy; anything else
         # honours the environment's proxy settings, as the rest of urllib does.
@@ -121,7 +281,7 @@ def _exchange(
     timeout: float,
 ) -> dict[str, Any]:
     """One blocking request; returns the JSON object the server answered with."""
-    deadline = time.monotonic() + timeout
+    deadline = _Deadline(timeout)
     request = urllib.request.Request(
         url,
         data=data,
@@ -129,11 +289,9 @@ def _exchange(
         method="POST" if data is not None else "GET",
     )
     try:
-        with _opener(url).open(request, timeout=timeout) as response:
+        with _opener(url, deadline).open(request, timeout=timeout) as response:
             status: int = response.status
             body = bytearray()
-            # read1 returns what one read of the socket brings, so a server
-            # that trickles its answer meets the deadline between reads.
             while True:
                 chunk = response.read1(_CHUNK)
                 if not chunk:
@@ -143,8 +301,6 @@ def _exchange(
                     raise FetchError(
                         f"response from {url} exceeds {max_bytes} bytes", too_large=True
                     )
-                if time.monotonic() > deadline:
-                    raise FetchError(f"{url} timed out")
     except urllib.error.HTTPError as exc:
         status = exc.code
         exc.close()
@@ -156,6 +312,8 @@ def _exchange(
         raise FetchError(f"{url} timed out") from None
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         reason = getattr(exc, "reason", None) or type(exc).__name__
+        if isinstance(reason, TimeoutError):  # while connecting or sending
+            raise FetchError(f"{url} timed out") from None
         raise FetchError(f"{url} unreachable: {reason}") from None
     # The server answered: these keep its status, so a caller can tell an
     # answer it cannot use from a server it cannot reach.

@@ -729,6 +729,54 @@ async def test_failed_auth_throttle_holds_for_concurrent_requests(
     assert Counter(response.status_code for response in responses) == {401: 3, 429: 17}
 
 
+async def test_one_address_cannot_hold_every_introspection_slot(
+    fake_as: FakeAuthorizationServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A filter in front of the endpoint drops the tokens one address sends,
+    # within its budget: each holds an introspection slot until its request
+    # times out, and fails alone.  The address holds at most half the slots,
+    # so a token from another address is introspected at once, not after
+    # all of them, and no outage window opens.
+    monkeypatch.setattr(oauth_module, "REQUEST_TIMEOUT_SECONDS", 0.5)
+    fake_as.stall_seconds = 3.0
+    dropped = [f"dropped-token-{index}" for index in range(16)]
+    for token in dropped:
+        fake_as.fail_token(token, "timeout")
+    fake_as.set_introspection(
+        "good-token", {"active": True, "aud": OAUTH_RESOURCE, "sub": "bob", "scope": "mcp:access"}
+    )
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    server = make_server(fake_as, introspection=introspection, rate_limit_per_minute=120)
+    assert server.oauth is not None
+    app = StreamableHTTPTransport(server).build_app()
+    message = modern("tools/list")
+
+    def client(address: str) -> httpx.AsyncClient:
+        transport = httpx.ASGITransport(app=app, client=(address, 40000))
+        return httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1", timeout=10)
+
+    async def send(http: httpx.AsyncClient, token: str) -> httpx.Response:
+        return await http.post(
+            "/mcp", json=message, headers={**headers_for(message), **bearer(token)}
+        )
+
+    try:
+        async with client("203.0.113.9") as attacker, client("198.51.100.7") as victim:
+            attack = [asyncio.ensure_future(send(attacker, token)) for token in dropped]
+            await asyncio.sleep(0.1)  # the dropped tokens hold their slots
+            started = time.monotonic()
+            answered = await send(victim, "good-token")
+            elapsed = time.monotonic() - started
+            responses = await asyncio.gather(*attack)
+    finally:
+        server.oauth.close()
+    assert answered.status_code == 200
+    assert elapsed < 0.5  # within one request timeout
+    assert [response.status_code for response in responses] == [503] * len(dropped)
+    assert server.oauth._ready()
+    assert server.oauth._states[fake_as.issuer].unavailable_until == 0.0
+
+
 def test_a_refused_token_opens_no_outage_and_is_throttled(
     live_server: LiveServer, fake_as: FakeAuthorizationServer, logs: LogCapture
 ) -> None:
@@ -756,7 +804,8 @@ def test_a_refused_token_opens_no_outage_and_is_throttled(
         throttled = stateless(client, modern("tools/list"), bearer(hostile))
         assert throttled.status_code == 429
         assert client.get("/healthz").json()["oauth"] == "ok"
-    assert fake_as.counters["introspect"] == 5
+    # Three refusals, each with its check of the endpoint, and the good tokens.
+    assert fake_as.counters["introspect"] == 8
     assert len(logs.events("auth_rate_limited")) == 1
     assert "introspection_credentials_rejected" not in logs.text
 
@@ -783,6 +832,37 @@ def test_a_token_a_filter_answers_with_a_page_opens_no_outage(
             response = stateless(client, modern("tools/list"), bearer(f"{name}-token"))
             assert response.status_code == 200, name
         assert client.get("/healthz").json()["oauth"] == "ok"
+
+
+def test_an_outage_of_the_authorization_server_is_not_charged(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    # The endpoint fails every token, a check with a random token included:
+    # the server is down, and no caller caused that.  So the users behind
+    # one address, retrying after each window, spend none of its budget, and
+    # once the server is back a token and an API key from there are let in.
+    now = [time.time()]
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    server = make_server(
+        fake_as,
+        auth=APIKeyAuth({KEY: "*"}),
+        introspection=introspection,
+        rate_limit_per_minute=3,
+        clock=lambda: now[0],
+    )
+    base = live_server(server)
+    fake_as.set_introspection(
+        "good-token", {"active": True, "aud": OAUTH_RESOURCE, "sub": "bob", "scope": "mcp:access"}
+    )
+    with httpx.Client(base_url=base, timeout=10) as client:
+        for index, mode in enumerate((500, 401, "not_json", 500)):
+            fake_as.fail("introspect", mode)
+            response = stateless(client, modern("tools/list"), bearer(f"user-token-{index}"))
+            assert response.status_code == 503, mode
+            now[0] += 6  # past the outage window: the next user's token is sent again
+        fake_as.heal()
+        assert stateless(client, modern("tools/list"), bearer("good-token")).status_code == 200
+        assert stateless(client, modern("tools/list"), {"X-API-Key": KEY}).status_code == 200
 
 
 def test_healthz_reports_a_failing_introspection_endpoint(

@@ -553,6 +553,7 @@ class MCPServer:
         bearer: str | None = None,
         api_key: str | None = None,
         tool: str | None = None,
+        client: str | None = None,
     ) -> ClientIdentity | None:
         """Resolve one HTTP request's credential to an identity.
 
@@ -567,6 +568,10 @@ class MCPServer:
         *tool* is the tool a ``tools/call`` names.  A token that lacks a
         required scope is then also asked for the scope that tool needs (with
         step-up), so one challenge covers the whole call.
+
+        *client* names who presented the credential, as
+        :meth:`~easy_mcp.OAuthResourceServer.verify` takes it (the HTTP
+        transports pass ``"ip:<address>"``).
 
         Returns:
             The identity, or ``None`` for anonymous access, which only a
@@ -592,7 +597,7 @@ class MCPServer:
         elif self.oauth is None:
             return None  # nothing to check credentials against: anonymous
         if self.oauth is not None and bearer is not None:
-            identity = await self.oauth.verify(bearer)
+            identity = await self.oauth.verify(bearer, client=client)
             required = self.oauth.required_scopes
             missing = [scope for scope in required if scope not in identity.scopes]
             if missing:

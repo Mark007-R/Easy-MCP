@@ -407,15 +407,17 @@ Good to know:
   With introspection, once the authorization server fails a discovery or
   introspection request it is not asked again for 5 s: tokens without a
   cached answer get `503` at once meanwhile, and `/healthz` reports
-  `"unavailable"` until a request to it succeeds. A failure one token can
-  cause (a `4xx` other than `401` or `429`; or no answer, a timeout, a `5xx`
-  or a `2xx` that is no JSON object while the endpoint still answers a check
-  with a random token) fails only that token.
+  `"unavailable"` until a request to it succeeds. Any other failure than a
+  `401` or `429` (a `3xx` or `4xx`, no answer, a timeout, a `5xx`, or a `2xx`
+  that is no JSON object or is over 64 KiB) fails only that token while the
+  endpoint still answers a check with a random token. One client address's
+  tokens take at most 4 of the 8 introspection requests in flight.
 - Token checks are limited per client address with the server's
   `rate_limit_per_minute`: each failed check spends one unit and each check
   still running holds one, so past it presented credentials get `429`
   without being checked, however many arrive at once. A request without any
-  token is never throttled.
+  token is never throttled, and an outage of the authorization server is
+  charged to no one.
 - The MCP Python SDK client answers one `401` or `403` per request. A client
   pinned to `2026-07-28` whose very first request calls a tool needing more
   than `required_scopes` signs in on that request's `401` and then gets the

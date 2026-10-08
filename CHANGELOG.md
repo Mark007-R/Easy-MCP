@@ -94,22 +94,27 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   before a refresh has been tried (a request waits for it), so a key the
   authorization server withdraws stops working within the hour. When the
   authorization server cannot be reached, the keys already fetched stay in
-  use, and after one failed refresh they answer without waiting; a key set
-  that arrives with no usable key withdraws them. With no keys the answer is
-  `503` with `-32008` (`data.reason: "auth_server_unavailable"`) and
-  `Retry-After: 5`. With introspection, when the authorization server fails
-  a discovery or introspection request, it is not asked again for 5 s:
-  meanwhile tokens without a cached answer get that `503` at once, and the
-  failure is logged once. An introspection request shows the server failing
-  when it gets `401` (this server's credentials) or `429`, or when it gets
-  no answer, times out, or gets `5xx` or a `2xx` that is not a JSON object
-  and a check with a random token fails too. Otherwise, as with any other
-  `4xx` or an answer over 64 KiB, that token alone fails (`503`, charged to
-  the sender's failed-token budget), so a token that a filter in front of
+  use, and once a refresh of keys that old has failed they answer without
+  waiting; a key set that arrives with no usable key withdraws them. With no
+  keys the answer is `503` with `-32008` (`data.reason:
+  "auth_server_unavailable"`) and `Retry-After: 5`, given at once for 5 s
+  after a fetch fails. With introspection, when the authorization server
+  fails a discovery or introspection request, it is not asked again for
+  5 s: meanwhile tokens without a cached answer get that `503` at once, and
+  the failure is logged once. An introspection request shows the server
+  failing when it gets `401` (this server's credentials) or `429`. After
+  any other failure (no answer, a timeout, a `3xx`, `4xx` or `5xx`, or a
+  `2xx` that is not a JSON object or is over 64 KiB) the endpoint is checked
+  with a random token: if that fails too, the server is failing, and no
+  caller is charged for it. Otherwise that token alone fails (`503`, charged
+  to the sender's failed-token budget), so a token that a filter in front of
   the endpoint blocks or drops cannot shut the others out. An answer nested
-  too deeply to parse is refused as malformed (`401`, cached). Each of the 8
-  introspection requests in flight gets a fetch thread at once, so a slow
-  but working authorization server is not taken for a failing one.
+  too deeply to parse is refused as malformed (`401`, cached). At most 8
+  introspection requests are in flight, at most 4 of them for one client
+  address, and each gets a fetch thread at once, so a slow but working
+  authorization server is not taken for a failing one. No fetch (metadata,
+  key set or introspection) lasts more than 5 s, however slowly its answer
+  trickles in.
 
   Token scopes map onto the existing per-tool `scopes`, which are
   alternatives: list the narrowest first. A signed-in caller sees every tool,
@@ -135,8 +140,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   events: `auth_failed`, `auth_rate_limited`, `auth_unavailable` and
   `principal_seen`; `tool_denied` carries the `scope` a step-up asked for.
 - `MCPServer.authenticate_request()` resolves an HTTP request's credential
-  (API key or access token), and `MCPServer.auth_configured` says whether
-  `auth` or `oauth` is set.
+  (API key or access token; `client=` names who sent it, as for
+  `OAuthResourceServer.verify()`), and `MCPServer.auth_configured` says
+  whether `auth` or `oauth` is set.
 - `MCPServer.lifespan()`: the startup and shutdown of `build_app()` (OAuth
   key warm-up; closing streams, cancelling what is left, waiting for tool
   threads), for apps that mount it and so run no lifespan of its own.

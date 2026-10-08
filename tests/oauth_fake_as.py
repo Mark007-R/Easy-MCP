@@ -144,7 +144,10 @@ class FakeAuthorizationServer:
         self.keys = list(keys)
 
     def fail(self, route: str, mode: Any) -> None:
-        """Make *route* fail: an HTTP status, "timeout", "redirect", "huge" or "not_json"."""
+        """Make *route* fail: an HTTP status, "timeout", "redirect", "huge" or "not_json".
+
+        Or answer it with bytes: a ``200`` with that body, as is.
+        """
         self.failures[route] = mode
 
     def heal(self) -> None:
@@ -199,6 +202,8 @@ class FakeAuthorizationServer:
             return Response(b'{"keys": [' + b" " * (2 * 1024 * 1024) + b"]}")
         if mode == "not_json":
             return Response(b"<html>not json</html>", media_type="text/html")
+        if isinstance(mode, bytes):
+            return Response(mode, media_type="application/json")
         return JSONResponse({"error": "failure"}, status_code=int(mode))
 
     async def _rfc8414(self, request: Request) -> Response:

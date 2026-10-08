@@ -237,9 +237,11 @@ class FakeVerifier:
     def __init__(self, identity: ClientIdentity) -> None:
         self.identity = identity
         self.tokens: list[str] = []
+        self.clients: list[str | None] = []
 
-    async def __call__(self, token: str) -> ClientIdentity:
+    async def __call__(self, token: str, *, client: str | None = None) -> ClientIdentity:
         self.tokens.append(token)
+        self.clients.append(client)
         return self.identity
 
 
@@ -261,10 +263,11 @@ async def test_authenticate_request_rules(
     with pytest.raises(AuthenticationError, match="Invalid API key"):
         await server.authenticate_request(api_key="not-a-key-but-maybe-a-token")
     assert verifier.tokens == []
-    # A bearer value that is no key is a token.
-    token = await server.authenticate_request(bearer="a-token", api_key=KEY)
+    # A bearer value that is no key is a token, verified for whoever sent it.
+    token = await server.authenticate_request(bearer="a-token", api_key=KEY, client="ip:10.0.0.1")
     assert token is verifier.identity
     assert verifier.tokens == ["a-token"]
+    assert verifier.clients == ["ip:10.0.0.1"]
     # required_scopes: all of them.
     verifier.identity = token_identity("files:read")
     with pytest.raises(InsufficientScopeError) as caught:

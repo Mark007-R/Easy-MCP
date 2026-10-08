@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gc
+import json
 import math
 import pickle
 import sys
@@ -59,8 +60,12 @@ class FakeIntrospection:
         self.running = 0
         self.peak = 0
         self.error: _fetch.FetchError | None = None
-        # Failures for one token only (a WAF rule in front of the endpoint).
+        # Failures for one token only (a WAF rule in front of the endpoint),
+        # and how long it takes to fail (a filter that drops it).
         self.token_errors: dict[str, _fetch.FetchError] = {}
+        self.token_delays: dict[str, float] = {}
+        self.delayed_running = 0
+        self.delayed_peak = 0
 
     async def __call__(
         self,
@@ -72,12 +77,19 @@ class FakeIntrospection:
         timeout: float,
         executor: Any,
     ) -> dict[str, Any]:
-        self.calls.append({"url": url, "form": dict(form), "auth": auth})
+        self.calls.append({"url": url, "form": dict(form), "auth": auth, "max_bytes": max_bytes})
         self.running += 1
         self.peak = max(self.peak, self.running)
         try:
             if self.delay:
                 await asyncio.sleep(self.delay)
+            if form["token"] in self.token_delays:
+                self.delayed_running += 1
+                self.delayed_peak = max(self.delayed_peak, self.delayed_running)
+                try:
+                    await asyncio.sleep(self.token_delays[form["token"]])
+                finally:
+                    self.delayed_running -= 1
             if self.error is not None:
                 raise self.error
             if form["token"] in self.token_errors:
@@ -390,8 +402,9 @@ async def test_a_token_the_endpoint_refuses_opens_no_outage(
     endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
 ) -> None:
     # A 4xx for one token (a WAF rule that matches it, a form-size limit), or
-    # an answer too large to read, is that token's failure: it gets 503, and
-    # every other token is still introspected.
+    # an answer too large to read, while the endpoint still answers a check
+    # with a random token, is that token's failure: it gets 503, and every
+    # other token is still introspected.
     oauth = make(clock)
     hostile = "../../../../etc/passwd"
     refusals = {
@@ -409,23 +422,51 @@ async def test_a_token_the_endpoint_refuses_opens_no_outage(
         assert oauth._ready()
         assert caught.value.stage == "introspection"
         assert caught.value.sent_request  # charged to the caller's failed-auth budget
-    assert len(endpoint.calls) == 8
+    assert len(endpoint.calls) == 12  # each refusal, its check and the good token
     assert len(logs.events("auth_unavailable")) == 4
     assert logs.text.count("token introspection failed") == 4
     assert "introspection_credentials_rejected" not in logs.text
     # Nothing is cached for it: sent again, it is asked again (the throttle bounds that).
     with pytest.raises(AuthServerUnavailableError):
         await oauth.verify(hostile)
-    assert len(endpoint.calls) == 9
-    # A request refused while a real outage window is open sent nothing.
+    assert len(endpoint.calls) == 14
+    # A real outage is no caller's doing: the request that finds it is not
+    # charged, and one refused while its window is open sent nothing.
     endpoint.error = _fetch.FetchError("the endpoint answered HTTP 502", status=502)
     with pytest.raises(AuthServerUnavailableError) as opened:
         await oauth.verify("another-token")
-    assert opened.value.sent_request
+    assert not opened.value.sent_request
     with pytest.raises(AuthServerUnavailableError) as refused:
         await oauth.verify("yet-another-token")
     assert not refused.value.sent_request
-    assert len(endpoint.calls) == 11  # and one check of the endpoint, which failed too
+    assert len(endpoint.calls) == 16  # and one check of the endpoint, which failed too
+
+
+@pytest.mark.parametrize("mode", [404, 403, "redirect", "page over 64 KiB"])
+async def test_an_endpoint_that_fails_every_token_is_an_outage(
+    fake_as: Any, clock: Clock, logs: LogCapture, mode: Any
+) -> None:
+    # A wrong endpoint path (404), a firewall that blocks this server (403),
+    # a redirect to a sign-in page (302) or a page too large to read (200):
+    # each fails every token the way a filter could fail one, and a check
+    # with a random token fails too.  So the server is down: the outage
+    # window opens, /healthz says so, and no caller is charged for it.
+    if mode == "page over 64 KiB":
+        mode = b"<html>" + b"x" * (64 * 1024) + b"</html>"
+    fake_as.fail("introspect", mode)
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        for index in range(3):
+            with pytest.raises(AuthServerUnavailableError) as caught:
+                await oauth.verify(f"token-{index}")
+            assert caught.value.stage == "introspection"
+            assert not caught.value.sent_request
+            assert not oauth._ready()
+    finally:
+        oauth.close()
+    # The first token's request and the check with a random token; no more.
+    assert len(fake_as.introspection_requests) == 2
+    assert len(logs.events("auth_unavailable")) == 1
 
 
 @pytest.mark.parametrize("mode", ["not_json", "timeout", 500])
@@ -724,6 +765,38 @@ async def test_concurrency_cap(endpoint: FakeIntrospection, clock: Clock) -> Non
     assert len(endpoint.calls) == 1
 
 
+async def test_one_client_holds_at_most_half_the_slots(
+    endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    # Tokens a filter drops each hold a slot until their request times out.
+    # One client holds at most half the slots, and its other tokens wait for
+    # its own to finish: another client's token is introspected at once.
+    oauth = make(clock)
+    dropped = [f"dropped-{index}" for index in range(12)]
+    for token in dropped:
+        endpoint.token_delays[token] = 0.2
+        endpoint.token_errors[token] = _fetch.FetchError("the endpoint timed out")
+    endpoint.answers["good"] = active()
+    attack = asyncio.gather(
+        *(oauth.verify(token, client="ip:203.0.113.9") for token in dropped),
+        return_exceptions=True,
+    )
+    await asyncio.sleep(0.05)  # the dropped tokens hold their slots
+    started = time.monotonic()
+    assert (await oauth.verify("good", client="ip:198.51.100.7")).subject == "user-1"
+    assert time.monotonic() - started < 0.1
+    failures = await attack
+    # Each failed alone (the endpoint answered every check), charged to its sender.
+    assert all(isinstance(failure, AuthServerUnavailableError) for failure in failures)
+    assert all(failure.sent_request for failure in failures)
+    assert endpoint.delayed_peak == oauth_module.MAX_INTROSPECTIONS_PER_CLIENT == 4
+    assert oauth._ready()
+    # A client's share exists only while it holds or waits for a slot.
+    loop_state = oauth._loop_state()
+    assert loop_state.shares == {} and not loop_state.share_users
+    assert loop_state.slots is None
+
+
 async def test_a_cancelled_waiter_does_not_cancel_the_lookup(
     endpoint: FakeIntrospection, clock: Clock
 ) -> None:
@@ -751,3 +824,43 @@ async def test_works_without_pyjwt(
     assert await reason(oauth, "x" * (16 * 1024 + 1)) == "too_large"
     assert await reason(oauth, "not a token") == "malformed"
     assert len(endpoint.calls) == 2
+    assert await reason(oauth, "x" * (16 * 1024)) == "inactive"  # 16 KiB itself is sent
+    assert len(endpoint.calls) == 3
+
+
+async def test_answers_are_read_with_a_64_kib_cap(
+    endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    assert oauth_module.MAX_INTROSPECTION_BYTES == 64 * 1024  # what SECURITY.md promises
+    endpoint.answers[TOKEN] = active()
+    endpoint.token_errors["refused"] = _fetch.FetchError("the endpoint: HTTP 403", status=403)
+    oauth = make(clock)
+    assert (await oauth.verify(TOKEN)).subject == "user-1"
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify("refused")  # and the endpoint is checked with a random token
+    assert [call["max_bytes"] for call in endpoint.calls] == [64 * 1024] * 3
+
+
+def padded(document: dict[str, Any], size: int) -> bytes:
+    """*document* as JSON of exactly *size* bytes (spaces before the last brace)."""
+    raw = json.dumps(document).encode()
+    assert len(raw) < size
+    return raw[:-1] + b" " * (size - len(raw)) + b"}"
+
+
+async def test_an_answer_of_64_kib_is_read_and_one_byte_more_fails_that_token(
+    fake_as: Any, clock: Clock
+) -> None:
+    answer = active(iss=fake_as.issuer)
+    fake_as.fail_token("at-the-cap", padded(answer, 64 * 1024))
+    fake_as.fail_token("over-the-cap", padded(answer, 64 * 1024 + 1))
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        assert (await oauth.verify("at-the-cap")).subject == "user-1"
+        with pytest.raises(AuthServerUnavailableError) as caught:
+            await oauth.verify("over-the-cap")
+        # The endpoint answered a check with a random token: that token's failure.
+        assert caught.value.sent_request
+        assert oauth._ready()
+    finally:
+        oauth.close()

@@ -202,9 +202,11 @@ class AuthServerUnavailableError(ProtocolError):
     a :class:`ServerBusyError`, so code that refunds busy calls never catches it.
 
     ``sent_request`` is set when this token was sent for introspection and
-    that request failed (a refusal during an outage window sends nothing).
-    Such a failure is charged to the caller's failed-authentication budget,
-    since a token can be made to fail it.
+    that request failed in a way the token itself may have caused.  Such a
+    failure is charged to the caller's failed-authentication budget, since a
+    token can be made to fail it.  It is not set when the failure turned out
+    to be an outage of the authorization server, nor for a refusal during an
+    outage window, which sends nothing.
     """
 
     code = SERVER_BUSY

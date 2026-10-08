@@ -12,17 +12,22 @@ import asyncio
 import base64
 import copy
 import dataclasses
+import datetime
 import gc
 import hashlib
 import hmac
+import ipaddress
+import itertools
 import json
 import math
 import pickle
+import socket
+import ssl
 import threading
 import time
 import weakref
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -42,6 +47,8 @@ from easy_mcp.security.oauth import (
     KEY_REFRESH_AHEAD_SECONDS,
     KEYS_TTL_SECONDS,
     MAX_CLAIM_DEPTH,
+    MAX_DOCUMENT_BYTES,
+    MAX_TOKEN_BYTES,
     principal_fingerprint,
 )
 
@@ -68,6 +75,7 @@ class FakeFetch:
         self.keys = keys
         self.issuer = issuer
         self.calls: Counter[str] = Counter()
+        self.max_bytes: dict[str, int] = {}  # the cap each URL was last fetched with
         self.down = False
         self.documents: dict[str, dict[str, Any]] = {
             f"{issuer}/.well-known/oauth-authorization-server": {
@@ -82,6 +90,7 @@ class FakeFetch:
         self, url: str, *, max_bytes: int, timeout: float, executor: Any
     ) -> dict[str, Any]:
         self.calls[url] += 1
+        self.max_bytes[url] = max_bytes
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.down:
@@ -453,7 +462,9 @@ async def test_encrypted_token_rejected(fetch: FakeFetch, clock: Clock) -> None:
 
 async def test_oversized_and_non_base64url_rejected(fetch: FakeFetch, clock: Clock) -> None:
     oauth = make(clock)
+    assert MAX_TOKEN_BYTES == 16 * 1024  # what the CHANGELOG promises
     assert await reason(oauth, "a" * (16 * 1024 + 1)) == "too_large"
+    assert await reason(oauth, "a" * (16 * 1024)) == "malformed"  # 16 KiB itself is no size
     for bad in ("not a token", "a.b", "a.b.c.d", "ab$.cd.ef", "a.b.c==x", "a..c", "é.b.c"):
         assert await reason(oauth, bad) == "malformed", bad
     header = b64url({"alg": "RS256"})
@@ -687,6 +698,64 @@ async def test_stale_keys_used_when_refresh_fails(
     assert logs.text.count("jwks_refresh_failed") == 1
 
 
+async def test_a_failed_fetch_early_in_the_hour_does_not_keep_old_keys_answering(
+    fetch: FakeFetch, clock: Clock, rsa: SigningKey, rsa_key_2: Any
+) -> None:
+    # A fetch for an unknown kid fails a few minutes in.  Then the
+    # authorization server answers again, without k1.  That failure was no
+    # refresh of the keys: once they are an hour old, the next request still
+    # waits for their refresh, so the withdrawn k1 stops working.
+    other = SigningKey("k2", "RS256", rsa_key_2)
+    oauth = make(clock)
+    assert (await oauth.verify(mint(rsa, clock))).subject == "user-1"
+    clock.now += 100
+    fetch.down = True
+    assert await reason(oauth, mint(other, clock)) == "unknown_key"
+    assert fetch.key_fetches == 2  # the fetch for k2, which failed
+    fetch.down = False
+    fetch.keys = [other]  # k1 withdrawn
+    fetch.delay = 0.2
+    clock.now += KEYS_TTL_SECONDS + 1300  # idle until the keys are well past the hour
+    withdrawn, kept = await asyncio.gather(
+        reason(oauth, mint(rsa, clock)), oauth.verify(mint(other, clock))
+    )
+    assert withdrawn == "unknown_key"
+    assert kept.subject == "user-1"
+    assert fetch.key_fetches == 3
+
+
+async def test_with_no_keys_the_wait_starts_when_a_slow_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch, clock: Clock, rsa: SigningKey
+) -> None:
+    # An authorization server that takes connections and never answers: each
+    # discovery candidate times out, so a fetch fails 10 s after it began.
+    # The 5 s before the next fetch count from that failure, so requests in
+    # them get 503 at once rather than waiting for a fetch that is always
+    # running.
+    fetched: Counter[str] = Counter()
+
+    async def silent(url: str, *, max_bytes: int, timeout: float, executor: Any) -> dict[str, Any]:
+        fetched[url] += 1
+        clock.now += timeout
+        raise _fetch.FetchError(f"{url} timed out")
+
+    monkeypatch.setattr(_fetch, "fetch_json", silent)
+    oauth = make(clock)
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify(mint(rsa, clock))
+    assert sum(fetched.values()) == 2  # RFC 8414, then OpenID Connect discovery
+    for _ in range(2):
+        with pytest.raises(AuthServerUnavailableError):
+            await oauth.verify(mint(rsa, clock))
+        assert sum(fetched.values()) == 2  # refused at once: no fetch started
+        assert not oauth._loop_state().refreshes
+        clock.now += 2.4
+    clock.now += 0.2  # 5 s after the failure, the next request tries again
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify(mint(rsa, clock))
+    assert sum(fetched.values()) == 4
+
+
 async def test_a_key_set_without_usable_keys_withdraws_the_cached_ones(
     fetch: FakeFetch, clock: Clock, rsa: SigningKey, logs: LogCapture
 ) -> None:
@@ -831,6 +900,47 @@ async def test_fetch_refuses_redirects_oversize_and_plain_http(fake_as: Any) -> 
         executor.shutdown(wait=False)
 
 
+async def test_metadata_and_key_sets_are_fetched_with_a_1_mib_cap(
+    fetch: FakeFetch, clock: Clock, rsa: SigningKey
+) -> None:
+    assert MAX_DOCUMENT_BYTES == 1024 * 1024  # what SECURITY.md promises
+    assert (await make(clock).verify(mint(rsa, clock))).subject == "user-1"
+    assert fetch.max_bytes == {METADATA_URL: 1024 * 1024, JWKS_URL: 1024 * 1024}
+
+
+def padded(document: dict[str, Any], size: int) -> bytes:
+    """*document* as JSON of exactly *size* bytes (spaces before the last brace)."""
+    raw = json.dumps(document).encode()
+    assert len(raw) < size
+    return raw[:-1] + b" " * (size - len(raw)) + b"}"
+
+
+@pytest.mark.parametrize("route", ["rfc8414", "jwks"])
+async def test_a_document_of_1_mib_is_read_and_one_byte_more_refused(
+    fake_as: Any, route: str
+) -> None:
+    clock = Clock(time.time())
+    document = (
+        fake_as.metadata()
+        if route == "rfc8414"
+        else {"keys": [key.public_jwk() for key in fake_as.keys]}
+    )
+    token = fake_as.mint(now=clock.now)
+    for size, accepted in ((1024 * 1024, True), (1024 * 1024 + 1, False)):
+        fake_as.fail(route, padded(document, size))
+        oauth = OAuthResourceServer(RESOURCE, [fake_as.issuer], clock=clock)
+        try:
+            if accepted:
+                assert (await oauth.verify(token)).subject == "user-1"
+            else:
+                with pytest.raises(AuthServerUnavailableError) as caught:
+                    await oauth.verify(token)
+                assert caught.value.stage in ("metadata", "keys")
+                assert not oauth._ready()
+        finally:
+            oauth.close()
+
+
 async def test_fetch_times_out(fake_as: Any) -> None:
     executor = ThreadPoolExecutor(max_workers=1)
     try:
@@ -840,6 +950,232 @@ async def test_fetch_times_out(fake_as: Any) -> None:
                 f"{fake_as.issuer}/jwks", max_bytes=1024, timeout=0.3, executor=executor
             )
     finally:
+        executor.shutdown(wait=False)
+
+
+# What a trickling server sends at once, then one byte at a time, then one
+# byte of filler at a time for ever: every read brings a byte well within the
+# socket timeout, so only a deadline for the whole exchange can end it.
+DRIPS = {
+    "status": (b"", b"HTTP/1.1 200 OK\r\nX-Drip: ", b"a"),
+    "headers": (b"HTTP/1.1 200 OK\r\nX-Drip: ", b"", b"a"),
+    "body": (b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n", b"", b" "),
+    # A TLS handshake record announcing 16 KiB, which never arrives.
+    "handshake": (b"\x16\x03\x03\x40\x00", b"", b"\x00"),
+}
+
+
+@pytest.fixture
+def dripping() -> Iterator[Callable[[str], str]]:
+    """Serve one of ``DRIPS`` on 127.0.0.1, a byte every 0.1 s; returns its URL."""
+    stop = threading.Event()
+    listeners: list[socket.socket] = []
+
+    def start(phase: str) -> str:
+        head, prefix, filler = DRIPS[phase]
+        listener = socket.create_server(("127.0.0.1", 0))
+        listener.settimeout(0.1)
+        listeners.append(listener)
+
+        def answer(conn: socket.socket) -> None:
+            with conn:
+                try:
+                    conn.recv(65536)  # the request, or a TLS client hello
+                    conn.sendall(head)
+                    for byte in itertools.chain(prefix, itertools.repeat(filler[0])):
+                        if stop.wait(0.1):
+                            return
+                        conn.sendall(bytes([byte]))
+                except OSError:
+                    pass  # the client hung up
+
+        def serve() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                threading.Thread(target=answer, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+        scheme = "https" if phase == "handshake" else "http"
+        return f"{scheme}://127.0.0.1:{listener.getsockname()[1]}/"
+
+    yield start
+    stop.set()
+    for listener in listeners:
+        listener.close()
+
+
+@pytest.mark.parametrize("phase", list(DRIPS))
+async def test_a_trickled_answer_is_cut_off_at_the_deadline(
+    dripping: Callable[[str], str], phase: str
+) -> None:
+    # Wherever the trickle starts (status line, headers, body or the TLS
+    # handshake), the exchange ends at its deadline, and so does its thread:
+    # the next fetch gets it at once.
+    url = dripping(phase)
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        started = time.monotonic()
+        with pytest.raises(_fetch.FetchError, match="timed out") as caught:
+            await _fetch.fetch_json(url, max_bytes=1024 * 1024, timeout=1.0, executor=executor)
+        assert time.monotonic() - started < 1.5
+        assert caught.value.status is None and not caught.value.queued
+        assert executor.submit(lambda: "free").result(timeout=0.25) == "free"
+    finally:
+        executor.shutdown(wait=False)
+
+
+def tls_certificates(host: str) -> tuple[bytes, bytes, bytes]:
+    """A test CA, and a certificate it signed for *host*: (CA, certificate, key) as PEM."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    now = datetime.datetime.now(datetime.UTC)
+
+    def name(common: str) -> x509.Name:
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common)])
+
+    def usage(**granted: bool) -> x509.KeyUsage:
+        fields = (
+            "digital_signature content_commitment key_encipherment data_encipherment "
+            "key_agreement key_cert_sign crl_sign encipher_only decipher_only"
+        ).split()
+        return x509.KeyUsage(**{field: granted.get(field, False) for field in fields})
+
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(name("easy-mcp test CA"))
+        .issuer_name(name("easy-mcp test CA"))
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(usage(key_cert_sign=True, crl_sign=True), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = ec.generate_private_key(ec.SECP256R1())
+    try:
+        alt: x509.GeneralName = x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        alt = x509.DNSName(host)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name(host))
+        .issuer_name(ca.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(usage(digital_signature=True), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .add_extension(x509.SubjectAlternativeName([alt]), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    return (
+        ca.public_bytes(serialization.Encoding.PEM),
+        certificate.public_bytes(serialization.Encoding.PEM),
+        key_pem,
+    )
+
+
+async def test_https_fetch_checks_the_certificate_and_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # Over TLS the certificate chain and the name it certifies are checked,
+    # and an answer trickled a record at a time ends at the deadline too.
+    executor = ThreadPoolExecutor(max_workers=1)
+    stop = threading.Event()
+    servers: list[socket.socket] = []
+    trusted = ssl.create_default_context()
+    trusted.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    trusted.sslsocket_class = _fetch._tls_context().sslsocket_class
+
+    def serve(certified_for: str, *, trickle: bool = False) -> str:
+        ca, certificate, key = tls_certificates(certified_for)
+        trusted.load_verify_locations(cadata=ca.decode())
+        (tmp_path / f"{certified_for}.pem").write_bytes(certificate + key)
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(tmp_path / f"{certified_for}.pem")
+        listener = socket.create_server(("127.0.0.1", 0))
+        listener.settimeout(0.1)
+        servers.append(listener)
+        body = b'{"keys": []}'
+        answer_bytes = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body)
+        )
+
+        def answer(conn: socket.socket) -> None:
+            try:
+                with server_context.wrap_socket(conn, server_side=True) as tls:
+                    tls.settimeout(5)
+                    tls.recv(65536)
+                    if not trickle:
+                        tls.sendall(answer_bytes)
+                        return
+                    for byte in itertools.chain(answer_bytes[:20], itertools.repeat(97)):
+                        if stop.wait(0.1):
+                            return
+                        tls.sendall(bytes([byte]))  # a TLS record each
+            except OSError:
+                pass  # the client refused the certificate, or hung up
+
+        def accept() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    return
+                threading.Thread(target=answer, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        return f"https://127.0.0.1:{listener.getsockname()[1]}/jwks"
+
+    async def fetch(url: str, timeout: float = 5.0) -> dict[str, Any]:
+        return await _fetch.fetch_json(url, max_bytes=1024, timeout=timeout, executor=executor)
+
+    try:
+        right = serve("127.0.0.1")
+        wrong = serve("localhost")
+        trickling = serve("127.0.0.1", trickle=True)
+        monkeypatch.setattr(_fetch, "_tls_context", lambda: trusted)
+        assert await fetch(right) == {"keys": []}
+        with pytest.raises(_fetch.FetchError, match="unreachable") as refused:
+            await fetch(wrong)
+        assert refused.value.status is None
+        started = time.monotonic()
+        with pytest.raises(_fetch.FetchError, match="timed out"):
+            await fetch(trickling, timeout=1.0)
+        assert time.monotonic() - started < 1.5
+        assert executor.submit(lambda: "free").result(timeout=0.25) == "free"
+        monkeypatch.undo()  # the system's trusted certificates know no test CA
+        with pytest.raises(_fetch.FetchError, match="unreachable"):
+            await fetch(right)
+    finally:
+        stop.set()
+        for listener in servers:
+            listener.close()
         executor.shutdown(wait=False)
 
 
