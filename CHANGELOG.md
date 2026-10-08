@@ -35,13 +35,15 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   defining (`-32023` to `-32099`) is treated the same way. `call_next()` may be
   awaited in a task of the middleware's own, but that work does not outlive
   the middleware: whatever is left of it when the middleware returns or
-  raises is cancelled.
+  raises is cancelled, and `call_next()` raises `RuntimeError` once the
+  middleware has returned.
 
   A cancel (`notifications/cancelled`, a closed stateless connection, a
   deleted session, a closed SSE stream, shutdown) reaches middleware as
   `CancelledError`. A middleware that swallows it is overruled and no response
-  is sent. Notifications and `server/discover` pass through middleware but
-  cannot be refused.
+  is sent. A `CancelledError` a middleware raises when nothing cancelled the
+  request is a failure like any other. Notifications and `server/discover`
+  pass through middleware but cannot be refused.
 
   Middleware runs on the event loop. Context variables it sets before
   `call_next()` reach the tool, sync tools included. A tool's `timeout` still
@@ -86,9 +88,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   notification and got no response at all: over HTTP a bare `202`, on stdio
   nothing, so the client waited forever.
 - Shutting down the Streamable HTTP transport with `server.run()` (Ctrl-C,
-  `server.stop()`) ends the sessions and cancels the requests still running
-  before uvicorn waits for connections to close. A request cancelled this way
-  gets `202` with no body, and a handshake cut short opens no session. Before,
+  `server.stop()`) gives the requests still running 5 s to finish, as stdio
+  does, then cancels them and ends the sessions, before uvicorn waits for
+  connections to close. A request cancelled this way, or sent once shutdown
+  has begun, is answered `503` with `-32008` (`data.reason: "shutdown"`) and
+  `Retry-After: 1`, and a handshake cut short opens no session. Before,
   shutdown waited for every running request to finish, without a bound for a
   tool with no timeout.
 

@@ -40,7 +40,8 @@ The contract:
   outcomes); only a cancellation reaches middleware as ``CancelledError``,
   and it must be re-raised.  It may be awaited in another task (``gather``,
   ``create_task``), but that work is cancelled if the middleware returns or
-  raises before it is done.
+  raises before it is done, and ``call_next()`` raises ``RuntimeError`` once
+  the middleware has returned.
 * The first middleware registered is the outermost, and request middleware
   always encloses tool middleware.
 * Notifications and ``server/discover`` pass through request middleware for
@@ -218,6 +219,7 @@ class RequestInfo:
         "_stateless",
         "_tool",
         "_tool_layers",
+        "_tool_started",
         "_transport",
         "_watch",
         "_watch_baseline",
@@ -238,6 +240,7 @@ class RequestInfo:
     _stateless: bool
     _tool: ToolDefinition | None
     _tool_layers: tuple[ToolMiddleware, ...]
+    _tool_started: bool
     _transport: TransportInfo
     _watch: weakref.ref[asyncio.Task[Any]] | None
     _watch_baseline: int
@@ -284,6 +287,9 @@ class RequestInfo:
         # more while it is served affects only later requests.
         self._request_layers = request_layers
         self._tool_layers = tool_layers
+        # Whether the tool a tools/call names was started, so request
+        # middleware's audit knows even when no outcome reached it.
+        self._tool_started = False
         self._watch = None
         self._watch_baseline = 0
         return self
@@ -901,18 +907,32 @@ class _Chain(Generic[_OutcomeT]):
         pending: list[Coroutine[Any, Any, _OutcomeT]] = []
         runner: list[weakref.ref[asyncio.Task[Any]]] = []
         absorbed = [0]
+        # Set once the middleware has returned or raised: the call is being
+        # answered, and the inner chain (the tool included) must not start.
+        over = [False]
+        home = _current_task_ref()  # the task the middleware runs in
 
         async def collect() -> _OutcomeT:
+            if over[0]:
+                # Created in time, but first run by a task after the
+                # middleware was done.
+                raise asyncio.CancelledError
             runner.extend(_current_task_ref())
-            before = request._cancels()
+            # Awaited in a task of the middleware's own (ensure_future,
+            # shield, wait), the inner chain receives only the cancels of
+            # that task, not every cancel of the request.
+            aside = not home or home[0]() is not asyncio.current_task()
+            before = _task_cancels() if aside else request._cancels()
             outcome = await self.layer(index + 1)
             # A cancel the inner chain took in and answered anyway (a tool
             # that swallows its own, say) is not this layer's doing.
-            absorbed[0] = request._cancels() - before
+            absorbed[0] = (_task_cancels() if aside else request._cancels()) - before
             produced.append(outcome)
             return outcome
 
         def call_next() -> Awaitable[_OutcomeT]:
+            if over[0]:
+                raise RuntimeError("call_next() called after the middleware returned")
             if pending:
                 raise RuntimeError("call_next() may be called only once")
             coroutine = collect()
@@ -920,11 +940,28 @@ class _Chain(Generic[_OutcomeT]):
             return coroutine
 
         baseline = request._cancels()
+        own_baseline = _task_cancels()
         try:
-            returned = await middleware(info, call_next)
-        except asyncio.CancelledError:
+            try:
+                returned = await middleware(info, call_next)
+            finally:
+                over[0] = True
+        except asyncio.CancelledError as cancel:
             await _abandon(pending, runner)
-            raise
+            if request._cancels() > baseline or _task_cancels() > own_baseline:
+                # The request was cancelled, or the work this layer runs in
+                # was (left behind by an outer middleware, or bounded by its
+                # timeout).
+                raise
+            # Nobody cancelled anything here: the middleware awaited something
+            # cancelled elsewhere (a shared lookup, say).  A failure, not a
+            # cancel, or the message would go unanswered and unprocessed.
+            _drop_traceback(cancel)
+            error = RuntimeError(
+                "middleware raised CancelledError although the request was not cancelled"
+            )
+            outcome = policy.refused(info, middleware, error, produced[0] if produced else None)
+            return outcome if outcome is not None else await self._once()
         except Exception as exc:
             await _abandon(pending, runner)
             if request._cancels() - absorbed[0] > baseline:
@@ -958,6 +995,12 @@ def _current_task_ref() -> list[weakref.ref[asyncio.Task[Any]]]:
     """
     task = asyncio.current_task()
     return [weakref.ref(task)] if task is not None else []
+
+
+def _task_cancels() -> int:
+    """How many cancel requests the running task has received and not taken back."""
+    task = asyncio.current_task()
+    return task.cancelling() if task is not None else 0
 
 
 def _detach(
@@ -1122,6 +1165,15 @@ def _refusal(exc: Exception) -> bool:
     return isinstance(exc, ToolError)
 
 
+def _stage(inner: object, started: bool) -> Stage:
+    """``after`` once ``call_next()`` answered, or once the tool started anyway.
+
+    A middleware that stops the work it awaits (a timeout of its own, say)
+    gets no outcome, but the tool may have run by then.
+    """
+    return "after" if inner is not None or started else "before"
+
+
 class RequestPolicy(_Level[RequestOutcome]):
     """Request middleware on a message that can be refused."""
 
@@ -1134,23 +1186,26 @@ class RequestPolicy(_Level[RequestOutcome]):
         exc: Exception,
         inner: RequestOutcome | None,
     ) -> RequestOutcome:
-        stage: Stage = "after" if inner is not None else "before"
+        stage = _stage(inner, info._tool_started)
         if not _refusal(exc):
             return self._failed(info, middleware, inner, stage, exc=exc)
         try:
-            ran = inner.tool if inner is not None and inner.tool is not None else None
+            # What tool-level processing answered stays visible to the
+            # middleware further out, whatever replaces the answer.
+            ran = inner.tool if inner is not None else None
             if isinstance(exc, ProtocolError):
                 outcome = RequestOutcome._create(
                     error_code=era_error_code(exc.code, stateless=info.stateless),
                     message=str(exc),
                     data=exc.data,
+                    tool=ran,
                 )
             elif info.method == "tools/call":
                 # A ToolError is an isError result the model can read.
                 tool = ToolOutcome._create(
                     "tool_error",
                     message=str(exc),
-                    started=ran is not None and ran.started,
+                    started=info._tool_started,
                     is_error=True,
                     exception_type=_type_name(exc),
                     duration_ms=ran.duration_ms if ran is not None else None,
@@ -1159,7 +1214,9 @@ class RequestPolicy(_Level[RequestOutcome]):
             else:
                 # Elsewhere there is no result to carry it: -32603 with the
                 # message as written, as for any ToolError outside tools/call.
-                outcome = RequestOutcome._create(error_code=INTERNAL_ERROR, message=str(exc))
+                outcome = RequestOutcome._create(
+                    error_code=INTERNAL_ERROR, message=str(exc), tool=ran
+                )
             self._audit_refusal(info, middleware, type(exc).__name__, inner)
             return outcome
         finally:
@@ -1172,7 +1229,7 @@ class RequestPolicy(_Level[RequestOutcome]):
         problem: str,
         inner: RequestOutcome | None,
     ) -> RequestOutcome:
-        stage: Stage = "after" if inner is not None else "before"
+        stage = _stage(inner, info._tool_started)
         return self._failed(info, middleware, inner, stage, problem=problem)
 
     def _failed(
@@ -1195,7 +1252,8 @@ class RequestPolicy(_Level[RequestOutcome]):
             problem=problem,
         )
         self._audit_withheld(info, middleware, "middleware_failed", inner)
-        return RequestOutcome._create(error_code=INTERNAL_ERROR, message=message)
+        ran = inner.tool if inner is not None else None
+        return RequestOutcome._create(error_code=INTERNAL_ERROR, message=message, tool=ran)
 
     def _audit_refusal(
         self, info: RequestInfo, middleware: object, reason: str, inner: RequestOutcome | None
@@ -1217,14 +1275,16 @@ class RequestPolicy(_Level[RequestOutcome]):
         info: RequestInfo, middleware: object, reason: str, inner: RequestOutcome | None
     ) -> bool:
         """Audit a tool result that ran but is withheld; whether there was one."""
-        if inner is None or inner.tool is None or not inner.tool.started:
+        if not info._tool_started:
             return False
+        ran = inner.tool if inner is not None else None
         audit(
             "tool_result_withheld",
             tool=info.tool.name if info.tool is not None else None,
             client_id=info.client_id,
             middleware=describe(middleware),
-            status=inner.tool.status,
+            # No outcome: the work the middleware awaited was stopped.
+            status=ran.status if ran is not None else "cancelled",
             reason=reason,
         )
         return True
@@ -1294,7 +1354,7 @@ class ToolPolicy(_Level[ToolOutcome]):
         exc: Exception,
         inner: ToolOutcome | None,
     ) -> ToolOutcome:
-        stage: Stage = "after" if inner is not None else "before"
+        stage = _stage(inner, info._started)
         if not _refusal(exc):
             return self._failed(info, middleware, inner, stage, exc=exc)
         try:
@@ -1337,7 +1397,7 @@ class ToolPolicy(_Level[ToolOutcome]):
         problem: str,
         inner: ToolOutcome | None,
     ) -> ToolOutcome:
-        stage: Stage = "after" if inner is not None else "before"
+        stage = _stage(inner, info._started)
         return self._failed(info, middleware, inner, stage, problem=problem)
 
     def _failed(
@@ -1375,14 +1435,15 @@ class ToolPolicy(_Level[ToolOutcome]):
         info: ToolCall, middleware: object, reason: str, inner: ToolOutcome | None
     ) -> bool:
         """Audit a tool result that ran but is withheld; whether there was one."""
-        if not info._started or inner is None:
+        if not info._started:
             return False
         audit(
             "tool_result_withheld",
             tool=info.tool.name,
             client_id=info.client_id,
             middleware=describe(middleware),
-            status=inner.status,
+            # No outcome: the work the middleware awaited was stopped.
+            status=inner.status if inner is not None else "cancelled",
             reason=reason,
         )
         return True

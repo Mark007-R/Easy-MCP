@@ -374,12 +374,14 @@ The threads are daemons, so the transports give them a bounded time to finish
 as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
 a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
 yourself, `await server.wait_for_tool_threads(5)` before exiting does the
-same. `server.run()` closes open legacy SSE streams and cancels the requests
-still running as shutdown begins, since uvicorn waits for every connection to
-close before it shuts the app down. When you serve `server.build_app()` with
-your own uvicorn, pass `--timeout-graceful-shutdown`, or shutdown waits for SSE
-clients to leave and for running requests (one held in middleware included) to
-finish.
+same. `server.run()` closes open legacy SSE streams as shutdown begins, gives
+the requests still running 5 s to finish and then cancels them, since uvicorn
+waits for every connection to close before it shuts the app down. A request
+cancelled this way, or sent once shutdown has begun, is answered `503` with
+`-32008` and `Retry-After: 1`, so the client can retry. When you serve
+`server.build_app()` with your own uvicorn, pass `--timeout-graceful-shutdown`,
+or shutdown waits for SSE clients to leave and for running requests (one held
+in middleware included) to finish.
 When you mount `server.build_app()` inside another Starlette or FastAPI app,
 its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
 the host app's shutdown.
@@ -451,7 +453,8 @@ fails the request with `-32603` and an `error_id`. If it failed before
 the audit log records `tool_result_withheld`. `call_next()` may be called
 once. You may await it in a task of your own (`asyncio.gather`, say), but that
 work does not outlive your middleware: if you return or raise before it is
-done, it is cancelled.
+done, it is cancelled, and `call_next()` raises `RuntimeError` once your
+middleware has returned.
 
 The first middleware registered is the outermost. Request middleware always
 encloses tool middleware. (Some web frameworks do the opposite and make the
@@ -459,7 +462,9 @@ last one added the outermost.)
 
 A cancel reaches middleware as `CancelledError` wherever the call is. Re-raise
 it: a middleware that swallows one is overruled, and no response is sent. A
-tool's `timeout` covers the tool only, so bound your own awaits:
+`CancelledError` raised when nothing cancelled the request (from a shared task
+someone else cancelled, say) is a failure like any other. A tool's `timeout`
+covers the tool only, so bound your own awaits:
 `async with asyncio.timeout(2): ...`. A middleware that waits forever holds
 its request until it is cancelled, and in a Streamable HTTP session a closed
 connection cancels nothing (SECURITY.md lists what does).
@@ -538,10 +543,12 @@ worth watching for tools that write.
 
 Middleware adds its own: `request_denied` and `tool_denied` (which names the
 `middleware` that refused) when a middleware refuses before the tool runs,
-`tool_result_withheld` when it replaces the answer of a tool that did run,
-`middleware_failed` (with its `error_id` and `stage`) when one fails or breaks
-its contract, and `request_cancelled` when a request other than `tools/call`
-is cancelled. None of them carries arguments, results, `_meta` or headers.
+`tool_result_withheld` when it replaces the answer of a tool that did run
+(`status: "cancelled"` when the middleware stopped the tool before it
+answered, with a timeout of its own, say), `middleware_failed` (with its
+`error_id` and `stage`) when one fails or breaks its contract, and
+`request_cancelled` when a request other than `tools/call` is cancelled. None
+of them carries arguments, results, `_meta` or headers.
 
 ## Connecting a client
 

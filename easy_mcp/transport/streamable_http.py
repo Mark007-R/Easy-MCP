@@ -48,7 +48,7 @@ import json
 import secrets
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
@@ -64,6 +64,7 @@ from ..exceptions import (
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     PAYLOAD_TOO_LARGE,
+    SERVER_BUSY,
     TOO_MANY_SESSIONS,
     AuthenticationError,
     ProtocolError,
@@ -102,7 +103,15 @@ _STATELESS_CLIENTS_MAX = 4096
 # How often a running stateless request checks whether its client hung up.
 _DISCONNECT_POLL_SECONDS = 0.25
 
+# How long shutdown lets the requests still running finish before it cancels
+# them, as stdio does with its default shutdown_timeout.
+_SHUTDOWN_GRACE_SECONDS = 5.0
+
 _TRANSPORT = "streamable-http"
+
+
+class _ShuttingDown(Exception):
+    """Shutdown stopped a message being dispatched, or refused to start one."""
 
 
 @dataclass(slots=True)
@@ -115,6 +124,8 @@ class _Session:
     last_seen: float
     active: int = 0  # requests currently being dispatched
     opened: bool = False  # whether its handshake succeeded
+    # Its messages being dispatched, registered before their dispatch starts.
+    dispatches: set[asyncio.Task[Any]] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -163,6 +174,18 @@ def _rpc_error_body(msg_id: Any, code: int, message: str, data: Any = None) -> d
     if data is not None:
         error["data"] = data
     return {"jsonrpc": "2.0", "id": msg_id, "error": error}
+
+
+def _shutting_down(msg_id: Any) -> Response:
+    """The answer to a request shutdown stopped or refused: retry shortly.
+
+    Not the bare ``202`` of a cancel: the client cancelled nothing, and a
+    request must be answered with a JSON-RPC message.
+    """
+    body = _rpc_error_body(
+        msg_id, SERVER_BUSY, "Server is shutting down; retry shortly", {"reason": "shutdown"}
+    )
+    return _json_response(body, headers={"Retry-After": "1"}, status=503)
 
 
 def _decode_header_value(value: str) -> str | None:
@@ -269,18 +292,25 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         uvicorn waits for every open connection before the lifespan shutdown
         runs, and a request held in middleware (which no tool timeout
-        bounds) or in a slow tool keeps its connection open: cancel them
-        first.  A cancelled request gets no response (``202``), as on any
-        cancel, and a handshake cut short opens no session.
+        bounds) or in a slow tool keeps its connection open.  So nothing new
+        is served from now on, and the requests still running get
+        ``_SHUTDOWN_GRACE_SECONDS`` to finish, as on stdio; then they are
+        cancelled.  A request stopped or refused this way is answered ``503``
+        with ``-32008`` (retry shortly), and a handshake cut short opens no
+        session.
         """
         self._closing = True
         if self._legacy is not None:
             await self._legacy.close_all_sessions()
+        if self._dispatches:
+            _, running = await asyncio.wait(set(self._dispatches), timeout=_SHUTDOWN_GRACE_SECONDS)
+            for task in running:
+                task.cancel()
+        # Only now: a session's end cancels its requests as a client's cancel
+        # would, and they would go unanswered.
         for session in list(self._sessions.values()):
             if session.opened:  # a handshake still running ends with its dispatch
                 self._end_session(session, reason="shutdown")
-        for task in list(self._dispatches):
-            task.cancel()
 
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
@@ -370,10 +400,15 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         session.active += 1
         try:
-            # A disconnect cancels nothing in this era; shutdown does.
+            # A disconnect cancels nothing in this era; ending the session
+            # (DELETE) and shutdown do.
             response = await self._dispatch_until_disconnect(
-                message, session.context, request, info, disconnect=False
+                message, session.context, request, info, disconnect=False, owner=session
             )
+        except _ShuttingDown:
+            if "id" in message:
+                return _shutting_down(message["id"])
+            return Response(status_code=202)  # a notification gets no answer either way
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()
@@ -433,9 +468,12 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity=identity,
             tool_calls=self._stateless_calls(client_id),
         )
-        response = await self._dispatch_until_disconnect(message, context, request, info)
+        try:
+            response = await self._dispatch_until_disconnect(message, context, request, info)
+        except _ShuttingDown:
+            return _shutting_down(msg_id)
         if response is None:
-            return Response(status_code=202)
+            return Response(status_code=202)  # the client hung up: nobody reads it
         error = response.get("error")
         not_found = isinstance(error, dict) and error.get("code") == METHOD_NOT_FOUND
         return _json_response(response, status=404 if not_found else 200)
@@ -448,26 +486,38 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         info: TransportInfo | None = None,
         *,
         disconnect: bool = True,
+        owner: _Session | None = None,
     ) -> dict[str, Any] | None:
         """Dispatch, cancelling the work if the client closes the connection.
 
         In the stateless era a closed connection is the cancellation signal:
         nobody is left to read the answer.  The session era passes
-        *disconnect* false: there a closed connection cancels nothing.
-        Shutdown cancels the work in both.  Returns ``None`` for work
-        cancelled here (no answer is sent, as for any cancel).
+        *disconnect* false: there a closed connection cancels nothing, and
+        the end of the *owner* session does.  Returns ``None`` for work
+        cancelled either way (no answer is sent, as for any cancel).
+
+        Raises:
+            _ShuttingDown: Shutdown cancelled the work, or had begun before it
+                started; the request must still be answered.
         """
+        if self._closing:
+            raise _ShuttingDown  # nothing new is served
         task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
         self._dispatches.add(task)
-        if self._closing:
-            task.cancel()  # shutdown has begun: nothing new is served
+        if owner is not None:
+            # Registered before the dispatch's first step, so a DELETE handled
+            # before the request is in flight still stops it.
+            owner.dispatches.add(task)
         try:
             while True:
                 timeout = _DISCONNECT_POLL_SECONDS if disconnect else None
                 done, _ = await asyncio.wait({task}, timeout=timeout)
                 if done:
-                    # Cancelled by shutdown: no answer, as for any cancel.
-                    return None if task.cancelled() else task.result()
+                    if not task.cancelled():
+                        return task.result()
+                    if self._closing:
+                        raise _ShuttingDown
+                    return None  # the session ended
                 if await request.is_disconnected():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -481,6 +531,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     return None
         finally:
             self._dispatches.discard(task)
+            if owner is not None:
+                owner.dispatches.discard(task)
             # Our own caller may be cancelled too (shutdown, a timeout in a
             # wrapping app): the call must not outlive its request.
             if not task.done():
@@ -554,6 +606,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             response = await self._dispatch_until_disconnect(
                 message, session.context, request, info, disconnect=False
             )
+        except _ShuttingDown:
+            return _shutting_down(message["id"])  # and no session, below
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()
@@ -625,8 +679,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
     def _end_session(self, session: _Session, *, reason: str) -> None:
         if self._sessions.pop(session.id, None) is None:
             return
-        # Calls still running for this session have nobody left to answer.
-        for task in list(session.context.in_flight.values()):
+        # Calls still running for this session have nobody left to answer,
+        # those whose dispatch has yet to put them in flight included.
+        for task in [*session.dispatches, *session.context.in_flight.values()]:
             task.cancel()
         audit(
             "session_close",

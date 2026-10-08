@@ -968,12 +968,12 @@ class MCPServer:
             if not isinstance(arguments, dict):
                 raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
             # Middleware reads the plain JSON form; the tool gets its own
-            # models, built from it, and whenever middleware can read the
-            # arguments, a copy of its own too: what the tool does to them
-            # (from a thread that may outlive the call) never shows there.
+            # models, built from a copy of its own: what the tool does to its
+            # arguments (from a thread that may outlive the call) never shows
+            # in ToolCall.arguments or RequestInfo.params, which the tool
+            # itself reaches through current_tool_call().
             plain = validate_arguments(arguments, definition.arguments_schema)
-            own = _copy(plain) if request._request_layers or request._tool_layers else plain
-            built = build_param_models(definition.param_models, own)
+            built = build_param_models(definition.param_models, _copy(plain))
         except ProtocolError as exc:
             audit(
                 "tool_denied",
@@ -1054,7 +1054,7 @@ class MCPServer:
                 # the event loop.  Python cannot kill that thread, so a
                 # cancel or timeout reaches the tool through the token.
                 awaitable = self._start_sync_tool(definition, arguments, token, context)
-            call._started = True
+            call._started = call.request._tool_started = True
             async with asyncio.timeout(timeout) as deadline:
                 result = await awaitable
         except ServerBusyError as exc:

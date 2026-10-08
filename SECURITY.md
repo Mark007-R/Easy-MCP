@@ -174,12 +174,12 @@ the client is untrusted, the credential in the environment is trusted.
   your own uvicorn (`build_app()`), set `--timeout-graceful-shutdown`: uvicorn
   waits for open SSE streams to close and running requests to finish (one
   held in middleware never does) before it shuts the app down, and a forced
-  exit skips that wait entirely. `server.run()` closes those streams and
-  cancels those requests itself. A mounted `build_app()` gets no lifespan at
-  all, so the host app must call `wait_for_tool_threads` on shutdown. Threads
-  a sync tool starts itself are daemons as well, because they inherit the
-  flag, and nothing waits for them. Pass `daemon=False` for work that must
-  finish.
+  exit skips that wait entirely. `server.run()` closes those streams itself,
+  gives running requests 5 s to finish and then cancels them, answering each
+  `503` with `-32008`. A mounted `build_app()` gets no lifespan at all, so the
+  host app must call `wait_for_tool_threads` on shutdown. Threads a sync tool
+  starts itself are daemons as well, because they inherit the flag, and
+  nothing waits for them. Pass `daemon=False` for work that must finish.
 - **A MongoDB cancel reaches only the primary, and only calls with a
   session.** `killSessions` is sent to the primary. With a `readPreference`
   that routes reads to a secondary, a cancelled read there keeps running until
@@ -199,8 +199,15 @@ the client is untrusted, the credential in the environment is trusted.
 - **Middleware is not covered by tool timeouts.** A tool's `timeout` bounds the
   tool function only; a middleware must bound its own awaits.
 - **Some messages never reach middleware.** Requests the transport rejects,
-  malformed messages and rate-limited messages are answered before any
-  middleware runs. They are in the audit log.
+  malformed messages, unknown methods and rate-limited messages are answered
+  before any middleware runs, and only some of them are audited: rate-limited
+  messages (`rate_limited`), refused browser origins (`origin_rejected`),
+  stateless header mismatches (`header_mismatch`), session credential
+  mismatches (`session_credential_mismatch`) and oversized stdio lines
+  (`payload_too_large`). An invalid API key, unparseable JSON, a wrong
+  `Content-Type`, an oversized HTTP body, a missing or unknown session, a
+  malformed message and an unknown method leave no audit event; count them at
+  your proxy if you need them.
 - **A refusal after the tool ran cannot undo it.** A middleware that raises
   after `call_next()` replaces the answer, but the tool's side effects stand;
   this is audited as `tool_result_withheld`.
