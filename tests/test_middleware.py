@@ -22,7 +22,9 @@ from easy_mcp.exceptions import (
     AUTHENTICATION_REQUIRED,
     FORBIDDEN,
     INTERNAL_ERROR,
+    INVALID_PARAMS,
     INVALID_REQUEST,
+    METHOD_NOT_FOUND,
 )
 
 LiveServer = Callable[[Any], str]
@@ -106,6 +108,46 @@ async def test_a_client_cancel_still_drops_the_response(logs: LogCapture) -> Non
     assert logs.events("tool_cancelled") == [
         {"type": "tool_cancelled", "client_id": "ip:test", "request_id": 7}
     ]
+    assert context.in_flight == {}
+
+
+async def test_methods_outside_the_table_are_answered_as_before() -> None:
+    server = make_server()
+    context = make_context()
+    unknown = await server.dispatch(rpc("resources/list"), context)
+    assert unknown is not None and unknown["error"]["code"] == METHOD_NOT_FOUND
+    for method in ("ping", "initialize", "notifications/cancelled"):
+        response = await server.dispatch(modern(method), context)
+        assert response is not None and response["error"]["code"] == METHOD_NOT_FOUND
+    # server/discover is always stateless, so without _meta it is malformed.
+    discover = await server.dispatch(rpc("server/discover"), context)
+    assert discover is not None and discover["error"]["code"] == INVALID_PARAMS
+    assert await server.dispatch(notification("notifications/unknown"), context) is None
+    assert await server.dispatch(rpc("notifications/unknown", msg_id=3), context) is None
+
+
+async def test_a_legacy_request_naming_a_notification_acts_as_one() -> None:
+    server = make_server()
+    started, cancelled = with_slow_tool(server)
+    context = make_context()
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "slow"}, 7), context))
+    await asyncio.wait_for(started.wait(), 5)
+    cancel = rpc("notifications/cancelled", {"requestId": 7}, msg_id=8)
+    assert await server.dispatch(cancel, context) is None
+    assert await asyncio.wait_for(call, 5) is None
+    assert cancelled.is_set()
+
+
+async def test_request_ids_that_cannot_be_keys_are_still_served() -> None:
+    server = make_server()
+    context = make_context()
+    ping = await server.dispatch(rpc("ping", msg_id=[1]), context)
+    assert ping == {"jsonrpc": "2.0", "id": [1], "result": {}}
+    call = rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}}, msg_id={"n": 1})
+    called = await server.dispatch(call, context)
+    assert called is not None and called["result"]["content"][0]["text"] == "3"
+    ignored = notification("notifications/cancelled", {"requestId": [1]})
+    assert await server.dispatch(ignored, context) is None
     assert context.in_flight == {}
 
 

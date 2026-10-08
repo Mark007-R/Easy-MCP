@@ -19,7 +19,8 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ._version import __version__
@@ -72,6 +73,42 @@ TOOLS_LIST_TTL_MS = 0
 # Sync tools that may run at once: the most asyncio's default executor, where
 # sync tools used to run, ever allowed.
 DEFAULT_MAX_SYNC_WORKERS = 32
+
+
+@dataclass(frozen=True, slots=True)
+class _Method:
+    """One JSON-RPC method the server implements, and how dispatch serves it."""
+
+    legacy: bool  # served in the initialize era
+    modern: bool  # served statelessly (2026-07-28)
+    notification: bool = False
+    # Middleware may watch it but not refuse it.
+    observe_only: bool = False
+    # Runs as a task of its own that notifications/cancelled can stop.
+    cancellable: bool = True
+    # Served only while the server advertises this capability.
+    capability: str | None = None
+
+
+# Every method dispatch serves.  Anything else is answered -32601 (or, for a
+# notification, ignored) before any middleware runs.
+_METHODS: dict[str, _Method] = {
+    # The initialize request must not be cancelled (2025-11-25 lifecycle).
+    "initialize": _Method(legacy=True, modern=False, cancellable=False),
+    "ping": _Method(legacy=True, modern=False),
+    "tools/list": _Method(legacy=True, modern=True, capability="tools"),
+    "tools/call": _Method(legacy=True, modern=True, capability="tools"),
+    # Refusing server/discover would make a dual-era client take this server
+    # for a legacy one.
+    DISCOVER_METHOD: _Method(legacy=False, modern=True, observe_only=True),
+    # Notifications carry no era of their own and have no response to refuse.
+    "notifications/initialized": _Method(
+        legacy=True, modern=False, notification=True, observe_only=True, cancellable=False
+    ),
+    "notifications/cancelled": _Method(
+        legacy=True, modern=False, notification=True, observe_only=True, cancellable=False
+    ),
+}
 
 
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
@@ -417,9 +454,25 @@ class MCPServer:
         modern = not is_notification and is_modern_request(method, params)
         response: dict[str, Any] | None
         try:
-            response = await self._serve_message(
-                method, params, context, msg_id, is_notification, modern
-            )
+            if modern:
+                check_request_meta(params)
+            notification_method = method.startswith("notifications/")
+            if notification_method and modern:
+                # A notification has no id; a request naming one of these
+                # methods is asking for a method that does not exist.
+                raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+            spec = self._method(method, modern=modern, notification=notification_method)
+            if notification_method:
+                # Unknown notifications are ignored, per JSON-RPC.
+                if spec is not None:
+                    self._handle_notification(method, params, context)
+                return None
+            if spec is None:
+                return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+            if spec.cancellable:
+                response = await self._serve_cancellable(method, params, context, msg_id, modern)
+            else:
+                response = await self._serve(method, params, context, msg_id, modern)
         except ProtocolError as exc:
             response = None if is_notification else _protocol_error_response(msg_id, exc)
         except Exception:
@@ -435,44 +488,101 @@ class MCPServer:
             response = self._finalize_error(response, modern)
         return response
 
-    async def _serve_message(
+    def _method(self, method: str, *, modern: bool, notification: bool) -> _Method | None:
+        """The table row serving *method* in this era, or ``None`` if there is none.
+
+        A method of the other era, or one whose capability is not
+        advertised, does not exist for this request.
+        """
+        spec = _METHODS.get(method)
+        if spec is None or spec.notification != notification:
+            return None
+        if not (spec.modern if modern else spec.legacy):
+            return None
+        if spec.capability is not None and spec.capability not in self._capabilities():
+            return None
+        return spec
+
+    async def _serve_cancellable(
         self,
         method: str,
         params: dict[str, Any],
         context: ClientContext,
         msg_id: Any,
-        is_notification: bool,
         modern: bool,
     ) -> dict[str, Any] | None:
-        if modern:
-            check_request_meta(params)
-        if method.startswith("notifications/"):
-            if modern:
-                # A notification has no id; a request naming one of these
-                # methods is asking for a method that does not exist.
+        """Serve a request as a task of its own, so notifications/cancelled can stop it.
+
+        Returns ``None`` when the client cancelled the request (MCP sends
+        no response then).  When it is our own caller that is cancelled (a
+        timeout around ``dispatch``, a closed stateless connection,
+        shutdown), the cancellation is re-raised instead: the caller's
+        cancel count tells the two apart, since asyncio cancels the task
+        we await in both cases.
+        """
+        caller = asyncio.current_task()
+        baseline = caller.cancelling() if caller is not None else 0
+        task: asyncio.Task[dict[str, Any] | None] = asyncio.create_task(
+            self._serve(method, params, context, msg_id, modern)
+        )
+        self._calls.add(task)
+        task.add_done_callback(self._calls.discard)
+        registered = msg_id is not None and isinstance(msg_id, Hashable)
+        if registered:
+            context.in_flight[msg_id] = task
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if not task.done() or task.cancelled():
+                if method == "tools/call":
+                    audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
+                else:
+                    audit(
+                        "request_cancelled",
+                        method=method,
+                        client_id=context.client_id,
+                        request_id=msg_id,
+                    )
+            if caller is not None and caller.cancelling() > baseline:
+                task.cancel()  # the request must not outlive its caller
+                raise
+            return None  # cancelled by the client: per MCP, no response
+        except Exception:
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            return _error_response(
+                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
+        finally:
+            if registered and context.in_flight.get(msg_id) is task:
+                del context.in_flight[msg_id]
+
+    async def _serve(
+        self,
+        method: str,
+        params: dict[str, Any],
+        context: ClientContext,
+        msg_id: Any,
+        modern: bool,
+    ) -> dict[str, Any] | None:
+        try:
+            if method == "tools/call":
+                result: Any = await self._execute_tool(params, context)
+            elif modern:
+                result = self._dispatch_modern(method, context)
+            elif method == "initialize":
+                result = self._handle_initialize(params, context)
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = self._handle_tools_list(context)
+            else:  # the method table and this routing disagree
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
-            self._handle_notification(method, params, context)
-            return None
-        if method == "tools/call":
-            response = await self._handle_tools_call(params, context, msg_id, is_notification)
-            if modern and response is not None and "result" in response:
-                response["result"] = self._modern_result(response["result"])
-            return response
-        if modern:
-            result: Any = self._dispatch_modern(method, context)
-        elif method == "initialize":
-            result = self._handle_initialize(params, context)
-        elif method == "ping":
-            result = {}
-        elif method == "tools/list":
-            result = self._handle_tools_list(context)
-        else:
-            if is_notification:
-                return None
-            return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        except ProtocolError as exc:
+            return _protocol_error_response(msg_id, exc)
         if modern:
             result = self._modern_result(result)
-        return None if is_notification else _result_response(msg_id, result)
+        return _result_response(msg_id, result)
 
     def _finalize_error(self, response: dict[str, Any], modern: bool) -> dict[str, Any]:
         """The last check on every error response ``dispatch`` returns.
@@ -481,8 +591,9 @@ class MCPServer:
         only ``-32020``..``-32022`` in it; a code from the rest is a server
         bug, whoever raised it, so it is answered as ``-32603`` with an
         ``error_id`` and logged.  And the stateless revision forbids
-        ``-32002`` (``FORBIDDEN``, which means "resource not found" to it),
-        so a stateless answer carries ``-32001`` instead.
+        ``-32002`` (this package's ``FORBIDDEN``; older revisions use it for
+        "resource not found"), so a stateless answer carries ``-32001``
+        instead.
         """
         error = response.get("error")
         if not isinstance(error, dict):
@@ -509,9 +620,7 @@ class MCPServer:
     def _server_info(self) -> dict[str, Any]:
         return {"name": self.name, "version": self.version}
 
-    def _handle_initialize(
-        self, params: dict[str, Any], context: ClientContext
-    ) -> dict[str, Any]:
+    def _handle_initialize(self, params: dict[str, Any], context: ClientContext) -> dict[str, Any]:
         version = negotiate_protocol_version(params.get("protocolVersion"))
         # Later requests on this connection or session are spoken in it.
         context.protocol_version = version
@@ -573,60 +682,10 @@ class MCPServer:
             self._logger.debug("client initialized (session %s)", context.session_id)
         elif method == "notifications/cancelled":
             request_id = params.get("requestId")
-            task = context.in_flight.get(request_id)
+            # A list or an object is no request id this server handed out.
+            task = context.in_flight.get(request_id) if isinstance(request_id, Hashable) else None
             if task is not None:
                 task.cancel()
-        # Unknown notifications are ignored per JSON-RPC semantics.
-
-    async def _handle_tools_call(
-        self,
-        params: dict[str, Any],
-        context: ClientContext,
-        msg_id: Any,
-        is_notification: bool,
-    ) -> dict[str, Any] | None:
-        # The call runs as its own task so notifications/cancelled can abort it.
-        # Whether our own caller is being cancelled is told apart from that by
-        # the caller's cancel count: when the caller is cancelled while it
-        # waits here, asyncio cancels the call's task too, so the task being
-        # cancelled says nothing about who asked.
-        caller = asyncio.current_task()
-        baseline = caller.cancelling() if caller is not None else 0
-        task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
-            self._execute_tool(params, context)
-        )
-        self._calls.add(task)
-        task.add_done_callback(self._calls.discard)
-        if msg_id is not None:
-            context.in_flight[msg_id] = task
-        try:
-            result = await task
-        except asyncio.CancelledError:
-            if not task.done() or task.cancelled():
-                audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
-            if caller is not None and caller.cancelling() > baseline:
-                # Our own caller is being cancelled (a timeout around dispatch,
-                # a closed connection, shutdown): the cancellation is theirs,
-                # and the call must not outlive it.
-                task.cancel()
-                raise
-            # Cancelled via notifications/cancelled: per MCP, the request's
-            # response is dropped.
-            return None
-        except ProtocolError as exc:
-            return None if is_notification else _protocol_error_response(msg_id, exc)
-        except Exception:
-            error_id = uuid.uuid4().hex[:12]
-            self._logger.error("internal error error_id=%s", error_id, exc_info=True)
-            if is_notification:
-                return None
-            return _error_response(
-                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
-            )
-        finally:
-            if msg_id is not None:
-                context.in_flight.pop(msg_id, None)
-        return None if is_notification else _result_response(msg_id, result)
 
     async def _execute_tool(
         self, params: dict[str, Any], context: ClientContext
