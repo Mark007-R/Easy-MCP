@@ -213,11 +213,12 @@ def test_reservation_is_released_when_arguments_are_invalid(live_server: LiveSer
 def test_reservation_is_released_when_workers_are_busy(live_server: LiveServer) -> None:
     hub = FakeHub()
     server = make_server(hub.store(), max_sync_workers=1)
-    release = threading.Event()
+    holding, release = threading.Event(), threading.Event()
 
     @server.tool
     def hold() -> str:
         """Holds the only worker."""
+        holding.set()
         release.wait(10)
         return "held"
 
@@ -231,14 +232,10 @@ def test_reservation_is_released_when_workers_are_busy(live_server: LiveServer) 
         )
         holder.start()
         try:
-            deadline = time.monotonic() + 5
-            busy: dict[str, Any] = {}
-            while time.monotonic() < deadline:
-                once = rpc("tools/call", {"name": "once", "arguments": {"n": 1}}, 3)
-                busy = session_post(client, once, session).json()
-                if "error" in busy and busy["error"]["code"] == SERVER_BUSY:
-                    break
-                time.sleep(0.02)
+            # Only once the worker is taken: a call before would spend the unit.
+            assert holding.wait(5)
+            once = rpc("tools/call", {"name": "once", "arguments": {"n": 1}}, 3)
+            busy = session_post(client, once, session).json()
             assert busy["error"]["code"] == SERVER_BUSY
         finally:
             release.set()
