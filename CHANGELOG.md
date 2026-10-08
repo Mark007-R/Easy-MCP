@@ -73,10 +73,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `WWW-Authenticate: Bearer resource_metadata="..."` challenge, so clients
   find the authorization server themselves. Once `oauth=` is set every
   request needs a credential (`server/discover` and notifications included).
-  It is checked on every request, sessions included, after the `Origin`,
-  `Accept`, `Content-Type`, size and JSON checks and before the MCP header
-  checks, the Streamable HTTP session lookup or any method; legacy SSE still
-  answers an unknown `session_id` with `404` first.
+  It is checked on every request, sessions included. On Streamable HTTP that
+  is after the `Origin`, `Accept`, `Content-Type`, size and JSON checks and
+  before the MCP header checks, the session lookup or any method. On legacy
+  SSE `POST /messages` only the `Origin`, size and unknown-`session_id`
+  (`404`) checks come first: its JSON is parsed after the credential.
 
   Tokens are verified locally as JWTs against the authorization server's
   published keys (new `[oauth]` extra, PyJWT 2.15+), or with token
@@ -84,24 +85,34 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   client_secret)` is passed, which needs no extra. A token must come from a
   listed authorization server and carry this server in `aud` (RFC 8707), or
   a value from `audience=`. Only asymmetric algorithms are accepted. `none`,
-  HMAC, keys supplied in the token's header, `crit`, encrypted tokens and
-  proof-of-possession-bound tokens are refused. Keys are refreshed hourly,
-  and when a token names an unknown key, at most once every 30 s; when the
-  authorization server cannot be reached, the keys already fetched stay in
-  use, and with none the answer is `503` with `-32008`
+  HMAC, keys supplied in the token's header, `crit`, encrypted tokens,
+  proof-of-possession-bound tokens and claims (or introspection answers)
+  nested more than 32 levels deep are refused. Keys are refreshed hourly in
+  the background, without holding up requests, and when a token names an
+  unknown key, at most once every 30 s (that token waits for the fetch).
+  When the authorization server cannot be reached, the keys already fetched
+  stay in use; a key set that arrives with no usable key withdraws them. With
+  no keys the answer is `503` with `-32008`
   (`data.reason: "auth_server_unavailable"`) and `Retry-After: 5`. With
-  introspection, a failed discovery or introspection request is not repeated
-  for 5 s: meanwhile tokens without a cached answer get that `503` at once,
-  and the failure is logged once.
+  introspection, when the authorization server fails a discovery or
+  introspection request (unreachable, timed out, `5xx`, `429`, no JSON, or
+  `401` for this server's credentials), it is not asked again for 5 s:
+  meanwhile tokens without a cached answer get that `503` at once, and the
+  failure is logged once. Any other `4xx`, or an answer over 64 KiB, fails
+  that token alone (`503`, charged to the sender's failed-token budget).
 
   Token scopes map onto the existing per-tool `scopes`, which are
   alternatives: list the narrowest first. A signed-in caller sees every tool,
   and a call its token does not cover gets `403 insufficient_scope` naming
   the scope to ask for (`step_up=False` keeps such tools invisible instead).
-  `required_scopes` are needed by every request. A token's `*` scope is never
-  a wildcard. The `401` and `insufficient_scope` `403` bodies carry `-32001`,
-  never `-32002`; a handshake-era session used with another principal's
-  token still gets `403` with `-32002`, as in 0.3.1.
+  `required_scopes` are needed by every request; a `tools/call` whose token
+  lacks them is also asked for the tool's scope, in the same challenge. A
+  token's `*` scope is never a wildcard. The `401` and `insufficient_scope`
+  `403` bodies carry `-32001`, never `-32002`; a handshake-era session used
+  with another principal's token still gets `403` with `-32002`, as in
+  0.3.1. A token's principal is identified by a 32-hex-digit fingerprint of
+  its issuer, subject and client (the rate-limit and call-count key, and the
+  `client_id` of its audit events), and a session is bound to all three.
 
   `easy_mcp.current_identity()` gives a tool the verified caller (`subject`,
   `client_id`, `issuer`, `scopes`, `claims`); the token itself is never
@@ -116,7 +127,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   key warm-up; closing streams, cancelling what is left, waiting for tool
   threads), for apps that mount it and so run no lifespan of its own.
 - `/healthz` reports `"oauth": "ok"` or `"unavailable"` when OAuth is
-  configured (still with status `200`).
+  configured (still with status `200`). It is unavailable while no signing
+  keys are cached or, with introspection, while the endpoint is unknown and
+  from the moment the authorization server fails (as above) until a request
+  to it succeeds again.
 - `ClientIdentity` gains `subject`, `client_id`, `issuer`, `expires_at` and
   `claims`, all empty for API keys. `claims` is a read-only mapping, and an
   identity can still be copied, pickled and passed to

@@ -126,6 +126,13 @@ async def test_step_up_call_raises_insufficient_scope_with_first_declared(
     assert stateless is not None
     assert stateless["error"]["code"] == AUTHENTICATION_REQUIRED
     assert stateless["error"]["data"]["scope"] == "files:write"
+    # The first scope declared, not the first in sorted order.
+    server.register_tool(
+        lambda: "ok", name="repo", description="A repository.", scopes=("repo:read", "admin")
+    )
+    repo = await call(server, "repo", token_identity("email"))
+    assert repo["error"]["data"] == {"error": "insufficient_scope", "scope": "repo:read"}
+    assert logs.events("tool_denied")[-1]["scope"] == "repo:read"
 
 
 async def test_step_up_off_hides_tools() -> None:
@@ -264,6 +271,14 @@ async def test_authenticate_request_rules(
         await server.authenticate_request(bearer="narrow")
     assert caught.value.scopes == ("mcp:access",)
     assert caught.value.granted == frozenset({"files:read"})
+    # For a tools/call, the scope its tool needs is asked for in the same challenge.
+    with pytest.raises(InsufficientScopeError) as caught:
+        await server.authenticate_request(bearer="narrow", tool="write_file")
+    assert caught.value.scopes == ("mcp:access", "files:write")
+    for covered in ("read_file", "status", "no_such_tool"):
+        with pytest.raises(InsufficientScopeError) as caught:
+            await server.authenticate_request(bearer="narrow", tool=covered)
+        assert caught.value.scopes == ("mcp:access",), covered
     # principal_seen, once per principal.
     verifier.identity = token_identity("mcp:access")
     await server.authenticate_request(bearer="again")

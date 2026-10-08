@@ -32,11 +32,11 @@ Consequences:
 | Credential stuffing / key probing | Constant-time comparison of SHA-256 digests over the full key set (`hmac.compare_digest`); timing reveals neither partial matches nor key length |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
-| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise); with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal (issuer, subject and client) |
+| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise); with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal, comparing its issuer, subject and client in full; the principal's fingerprint (the rate-limit and call-count key) is 128 bits, so no client can grind a client id that shares another's |
 | Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
 | JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
 | Token passthrough | Tools and middleware never receive the token (`Authorization` is withheld from middleware); `current_identity()` exposes only verified fields; the GitHub connector uses its own credential |
-| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight; once the authorization server fails, it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used) |
+| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight; once the authorization server itself fails (unreachable, `5xx`, `429`, no JSON, or `401` for this server's credentials), it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used); any other `4xx` or an oversized answer fails only the token sent, and spends a unit of its sender's budget, so no token can shut the others out |
 | Refresh tokens, ID tokens and bound tokens used as access tokens | Introspected `token_type` must be an access token; `typ` other than `at+jwt`/`JWT` refused; `aud` must be this server; tokens with `cnf` (DPoP, mTLS) refused |
 | Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch |
 | Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
@@ -63,11 +63,13 @@ Consequences:
   valid credential, checked before the MCP header checks
   (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), `initialize`, the
   Streamable HTTP session lookup and any method. A few checks come first and
-  are answered without one: the `Origin` allowlist (`403`), `Accept`,
-  `Content-Type`, body size and JSON parsing (`406`, `415`, `413`, `400`),
-  `GET /mcp` (`405`) and, on legacy SSE, an unknown `session_id` on
-  `POST /messages` (`404`). Only the Protected Resource Metadata and
-  `/healthz` serve anything without a credential.
+  are answered without one. On Streamable HTTP: the `Origin` allowlist
+  (`403`), `Accept`, `Content-Type`, body size and JSON parsing (`406`,
+  `415`, `413`, `400`) and `GET /mcp` (`405`). On legacy SSE
+  `POST /messages`: the `Origin` allowlist, body size and an unknown
+  `session_id` (`404`) only; its JSON is parsed after the credential, so an
+  unparseable body without a valid token gets `401`. Only the Protected
+  Resource Metadata and `/healthz` serve anything without a credential.
 - **stdio** — the client is the *parent process* that launched the server
   (a desktop app, a CLI agent, an agent runtime). There is no network
   surface, but the parent is still treated as an MCP client: schema
@@ -232,7 +234,14 @@ the client is untrusted, the credential in the environment is trusted.
   step-up challenge.
 - **When the authorization server cannot be reached, cached signing keys stay
   in use**, without a time limit; a key removed from its key set stops working
-  at the next successful refresh (at most an hour).
+  at the next successful refresh (at most an hour). A key set that arrives
+  empty, or with no key this server can use, withdraws every cached key:
+  tokens then get `503` until it publishes a usable one.
+- **With step-up, a token that lacks `required_scopes` learns whether a tool
+  it calls exists**: the `403` that asks for the required scopes also names
+  the tool's scope, so one sign-in covers the call. Such a token still comes
+  from a trusted issuer for this audience, and would learn the same after
+  one step-up; `step_up=False` keeps tools hidden.
 - **OAuth caches and the failed-token throttle are per process.** Each worker
   fetches its own keys and counts failures on its own; behind a proxy, all
   clients share the proxy's address for that throttle, as for anonymous rate

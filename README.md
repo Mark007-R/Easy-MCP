@@ -368,9 +368,9 @@ What clients see:
   the token, so a refreshed token keeps it.
 - A tool's `scopes` are alternatives: list the narrowest first and broader
   scopes after it. A signed-in caller sees every tool. Calling one their token
-  does not cover gets `403 insufficient_scope` naming the scope to ask for,
-  and the client asks the user for it; the broader token works at once, in
-  the same session. Pass `step_up=False` to keep protected tools invisible to
+  does not cover gets `403 insufficient_scope` naming the scope to ask for
+  (with `required_scopes` too, if the token also lacks them), and the client
+  asks the user for it; the broader token works at once, in the same session. Pass `step_up=False` to keep protected tools invisible to
   tokens that cannot call them, as with API keys. A token's `*` scope is never
   a wildcard.
 - Inside a tool, `current_identity()` tells you who is calling: `subject`,
@@ -392,13 +392,17 @@ Good to know:
 - `server/discover` needs a token too (its `401` is what starts sign-in), but
   its answer is the same for everyone and stays `cacheScope: "public"`. Write
   `instructions` as public text: never put secrets in them.
-- Signing keys are fetched at startup and refreshed hourly, and when a token
-  names a key the server has not seen, at most once every 30 s. If the
-  authorization server cannot be reached, the keys already fetched stay in
-  use; with none fetched yet, token requests get `503` and `Retry-After: 5`,
-  and `/healthz` reports `"oauth": "unavailable"`. With introspection, a
-  failed discovery or introspection request is not repeated for 5 s: tokens
-  without a cached answer get `503` at once meanwhile.
+- Signing keys are fetched at startup and refreshed hourly in the background,
+  and when a token names a key the server has not seen, at most once every
+  30 s. If the authorization server cannot be reached, the keys already
+  fetched stay in use; with none fetched yet (or a key set that holds no
+  usable key), token requests get `503` and `Retry-After: 5`, and `/healthz`
+  reports `"oauth": "unavailable"`. With introspection, once the
+  authorization server fails a discovery or introspection request it is not
+  asked again for 5 s: tokens without a cached answer get `503` at once
+  meanwhile, and `/healthz` reports `"unavailable"` until a request to it
+  succeeds. A `4xx` for one token (other than `401` or `429`) fails only that
+  token.
 - Token checks are limited per client address with the server's
   `rate_limit_per_minute`: each failed check spends one unit and each check
   still running holds one, so past it presented credentials get `429`
@@ -658,8 +662,10 @@ OAuth adds `auth_failed` (why a token was refused, the client address and a
 fingerprint of the token), `auth_rate_limited`, `auth_unavailable` (the
 authorization server could not be reached) and `principal_seen`, logged once
 per signed-in user and process with the token's issuer, subject and client;
-every other event names that user by fingerprint only. `tool_denied` carries
-the `scope` a step-up asked for. No event ever holds a token or a secret.
+every other event names that user by fingerprint only (32 hex digits, so no
+client can pick a client id that shares another user's). `tool_denied`
+carries the `scope` a step-up asked for. No event ever holds a token or a
+secret.
 
 ## Connecting a client
 

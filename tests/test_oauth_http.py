@@ -10,6 +10,7 @@ the test connects to.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import math
 import time
@@ -38,6 +39,7 @@ from easy_mcp.exceptions import (
     RATE_LIMITED,
     SERVER_BUSY,
 )
+from easy_mcp.security import oauth as oauth_module
 from easy_mcp.security.oauth import principal_fingerprint
 
 LiveServer = Callable[[Any], str]
@@ -265,6 +267,20 @@ def test_non_finite_expiry_is_401_not_500(served: Any, fake_as: FakeAuthorizatio
             assert 'error="invalid_token"' in challenge(response)
 
 
+def test_deeply_nested_claims_are_401_not_500(
+    served: Any, fake_as: FakeAuthorizationServer
+) -> None:
+    base, _ = served()
+    nested: Any = 1
+    for _ in range(600):
+        nested = [nested]
+    with httpx.Client(base_url=base, timeout=10) as client:
+        token = fake_as.mint(claims={"x": nested})
+        response = stateless(client, modern("tools/list"), bearer(token))
+        assert response.status_code == 401
+        assert 'error="invalid_token"' in challenge(response)
+
+
 def test_checks_that_come_before_the_credential(
     live_server: LiveServer, fake_as: FakeAuthorizationServer
 ) -> None:
@@ -292,6 +308,18 @@ def test_checks_that_come_before_the_credential(
         for status, response in responses.items():
             assert response.status_code == status, response.text
             assert "www-authenticate" not in response.headers
+        # Legacy SSE reads a POST's JSON only after its credential: an
+        # unparseable body without a token is challenged like any other.
+        token = bearer(fake_as.mint())
+        json_type = {"Content-Type": "application/json"}
+        with client.stream("GET", "/sse", headers=token) as stream:
+            lines = stream.iter_lines()  # kept: dropping it closes the stream
+            endpoint = next_data(lines)
+            anonymous = client.post(endpoint, content=b"{not json", headers=json_type)
+            assert anonymous.status_code == 401
+            assert challenge(anonymous) == f'Bearer scope="mcp:access", {RM}'
+            signed_in = client.post(endpoint, content=b"{not json", headers={**json_type, **token})
+            assert signed_in.status_code == 400
 
 
 def test_auth_runs_before_header_mirror_checks(served: Any) -> None:
@@ -366,10 +394,47 @@ def test_required_scopes_door_403(served: Any, fake_as: FakeAuthorizationServer)
         assert 'scope="mcp:access files:read"' in challenge(legacy)
 
 
+def test_door_403_for_a_tool_call_also_names_the_tool_scope(
+    served: Any, fake_as: FakeAuthorizationServer
+) -> None:
+    # A token without required_scopes calls a tool it lacks the scope for:
+    # one challenge names both, so one more sign-in is enough.
+    base, _ = served()
+    token = bearer(fake_as.mint(claims={"scope": "files:read"}))
+    with httpx.Client(base_url=base, timeout=10) as client:
+        response = stateless(client, modern_call("write_file", 4, path="a"), token)
+        assert response.status_code == 403
+        assert challenge(response) == (
+            f'Bearer error="insufficient_scope", scope="mcp:access files:write", {RM}, '
+            'error_description="Additional scope required"'
+        )
+        assert rpc_body(response)["error"]["data"] == {
+            "error": "insufficient_scope",
+            "scope": "mcp:access files:write",
+        }
+        # The client adds what it was asked for to what it holds: that is enough.
+        retry = bearer(fake_as.mint(claims={"scope": "files:read mcp:access files:write"}))
+        assert stateless(client, modern_call("write_file", 5, path="a"), retry).status_code == 200
+        # A tool the token covers, or no such tool, adds nothing.
+        for name in ("read_file", "no_such_tool"):
+            other = stateless(client, modern_call(name, path="a"), token)
+            assert 'scope="mcp:access"' in challenge(other), name
+        # Older clients get the needed scopes, then the known ones the token holds.
+        legacy = post(client, call("write_file", path="a"), session="any", headers=token)
+        assert legacy.status_code == 403
+        assert 'scope="mcp:access files:write files:read"' in challenge(legacy)
+    # Without step-up the tool is invisible to this token: nothing is added.
+    hidden, _ = served(step_up=False)
+    with httpx.Client(base_url=hidden, timeout=10) as client:
+        response = stateless(client, modern_call("write_file", path="a"), token)
+        assert response.status_code == 403
+        assert 'scope="mcp:access"' in challenge(response)
+
+
 def test_step_up_403_stateless_lists_needed_only(
     served: Any, fake_as: FakeAuthorizationServer
 ) -> None:
-    base, _ = served()
+    base, server = served()
     token = fake_as.mint(claims={"scope": "mcp:access files:read"})
     with httpx.Client(base_url=base, timeout=10) as client:
         response = stateless(client, modern_call("write_file", 9, path="a"), bearer(token))
@@ -391,6 +456,14 @@ def test_step_up_403_stateless_lists_needed_only(
         narrow = fake_as.mint(claims={"scope": "mcp:access"})
         read = stateless(client, modern_call("read_file", path="a"), bearer(narrow))
         assert 'scope="files:read"' in challenge(read)
+        # The first one declared, that is, not the first in sorted order.
+        server.register_tool(
+            lambda: "ok", name="repo", description="A repository.", scopes=("repo:read", "admin")
+        )
+        repo = stateless(client, modern_call("repo"), bearer(narrow))
+        assert repo.status_code == 403
+        assert 'scope="repo:read"' in challenge(repo)
+        assert "admin" not in repo.headers["www-authenticate"]
 
 
 def test_step_up_403_legacy_adds_granted_relevant(
@@ -447,6 +520,39 @@ def test_session_bound_to_principal_not_token(
             assert hijack.status_code == 403
             assert rpc_body(hijack)["error"]["code"] == -32002  # the handshake era's code
     assert len(logs.events("session_credential_mismatch")) == 2
+
+
+def test_session_bound_to_the_whole_principal_not_its_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, served: Any, fake_as: FakeAuthorizationServer
+) -> None:
+    # Fingerprints cut to 16 bits here, so that a client id matching another
+    # principal's fingerprint can be ground in a test: even then, no principal
+    # can use another's session.
+    real = oauth_module.principal_fingerprint
+    monkeypatch.setattr(oauth_module, "principal_fingerprint", lambda *values: real(*values)[:4])
+    alice_client = "https://good-client.example/meta.json"
+    target = real(fake_as.issuer, "alice", alice_client)[:4]
+    mallory_client = next(
+        client
+        for client in (f"https://attacker.example/c/{n}.json" for n in itertools.count())
+        if real(fake_as.issuer, "mallory", client)[:4] == target
+    )
+    alice = bearer(fake_as.mint(claims={"sub": "alice", "client_id": alice_client}))
+    mallory = bearer(fake_as.mint(claims={"sub": "mallory", "client_id": mallory_client}))
+    base, _ = served()
+    with httpx.Client(base_url=base, timeout=10) as client:
+        session = open_session(client, alice)
+        hijack = post(client, rpc("ping", msg_id=2), session=session, headers=mallory)
+        assert hijack.status_code == 403
+        stolen = client.delete("/mcp", headers={"MCP-Session-Id": session, **mallory})
+        assert stolen.status_code == 403
+        mine = post(client, rpc("ping", msg_id=3), session=session, headers=alice)
+        assert mine.status_code == 200
+        with client.stream("GET", "/sse", headers=alice) as stream:
+            lines = stream.iter_lines()  # kept: dropping it closes the stream
+            endpoint = next_data(lines)
+            assert client.post(endpoint, json=rpc("ping"), headers=mallory).status_code == 403
+            assert client.post(endpoint, json=rpc("ping"), headers=alice).status_code == 202
 
 
 def test_expired_token_mid_session_then_resume(
@@ -621,6 +727,64 @@ async def test_failed_auth_throttle_holds_for_concurrent_requests(
         )
     assert fake_as.counters["introspect"] == 3
     assert Counter(response.status_code for response in responses) == {401: 3, 429: 17}
+
+
+def test_a_refused_token_opens_no_outage_and_is_throttled(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer, logs: LogCapture
+) -> None:
+    # A WAF in front of the introspection endpoint blocks one token value.
+    # That token gets 503; other tokens are still introspected; and sending
+    # it again spends the sender's failed-authentication budget.
+    hostile = "../../../../etc/passwd"
+    fake_as.fail_token(hostile, 403)
+    good = ["good-token-1", "good-token-2"]
+    for token in good:
+        fake_as.set_introspection(
+            token, {"active": True, "aud": OAUTH_RESOURCE, "sub": token, "scope": "mcp:access"}
+        )
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    server = make_server(fake_as, introspection=introspection, rate_limit_per_minute=3)
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        refused = stateless(client, modern("tools/list"), bearer(hostile))
+        assert refused.status_code == 503
+        assert refused.headers["retry-after"] == "5"
+        for token in good:
+            assert stateless(client, modern("tools/list"), bearer(token)).status_code == 200
+        for _ in range(2):
+            assert stateless(client, modern("tools/list"), bearer(hostile)).status_code == 503
+        throttled = stateless(client, modern("tools/list"), bearer(hostile))
+        assert throttled.status_code == 429
+        assert client.get("/healthz").json()["oauth"] == "ok"
+    assert fake_as.counters["introspect"] == 5
+    assert len(logs.events("auth_rate_limited")) == 1
+    assert "introspection_credentials_rejected" not in logs.text
+
+
+def test_healthz_reports_a_failing_introspection_endpoint(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    now = [time.time()]
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    server = make_server(fake_as, introspection=introspection, clock=lambda: now[0])
+    base = live_server(server)
+    token = bearer("opaque-token-healthz")
+    fake_as.set_introspection(
+        "opaque-token-healthz",
+        {"active": True, "aud": OAUTH_RESOURCE, "sub": "user-1", "scope": "mcp:access"},
+    )
+    with httpx.Client(base_url=base, timeout=10) as client:
+        assert client.get("/healthz").json()["oauth"] == "ok"
+        fake_as.fail("introspect", 500)
+        assert stateless(client, modern("tools/list"), token).status_code == 503
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        assert health.json()["oauth"] == "unavailable"
+        now[0] += 6  # the outage window is over; nothing has answered since
+        assert client.get("/healthz").json()["oauth"] == "unavailable"
+        fake_as.heal()
+        assert stateless(client, modern("tools/list"), token).status_code == 200
+        assert client.get("/healthz").json()["oauth"] == "ok"
 
 
 def test_auth_server_down_503(live_server: LiveServer, fake_as: FakeAuthorizationServer) -> None:

@@ -85,6 +85,7 @@ UNAVAILABLE_RETRY_SECONDS = 5  # with no keys at all, retry this often (and Retr
 REQUEST_TIMEOUT_SECONDS = 5.0
 MAX_DOCUMENT_BYTES = 1024 * 1024  # metadata and key sets
 MAX_INTROSPECTION_BYTES = 64 * 1024
+MAX_CLAIM_DEPTH = 32  # objects and arrays nested in a token's claims
 MIN_RSA_BITS = 2048
 INTROSPECTION_TTL_SECONDS = 60  # never past the answer's exp
 INTROSPECTION_REFUSAL_TTL_SECONDS = 10
@@ -156,13 +157,17 @@ def _canonical_or_none(value: str) -> str | None:
 
 
 def principal_fingerprint(issuer: str, subject: str | None, client_id: str | None) -> str:
-    """The stable identifier of a token's principal: 12 hex digits, safe to log.
+    """The stable identifier of a token's principal: 32 hex digits, safe to log.
 
     The same issuer, subject and client give the same fingerprint for every
-    token, refreshed or stepped up, so it can key rate limits and sessions.
+    token, refreshed or stepped up, so it can key rate limits and call
+    counts.  It is 128 bits long, so no client can grind a client id (one it
+    chooses, as with Client ID Metadata Documents) whose fingerprint matches
+    another principal's, and it can never equal an API key's 12 hex digits.
+    The three values are JSON-encoded first, so none can run into the next.
     """
-    material = f"{issuer}\0{subject or ''}\0{client_id or ''}"
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+    material = json.dumps([issuer, subject, client_id])  # ASCII: escapes everything else
+    return hashlib.sha256(material.encode("ascii")).hexdigest()[:32]
 
 
 def _token_hash(token: str) -> str:
@@ -211,13 +216,34 @@ def _split_env(value: str | None) -> list[str]:
     return [item for item in re.split(r"[\s,]+", value or "") if item]
 
 
-def _freeze(value: Any) -> Any:
-    """A deep read-only copy of decoded JSON (one that can still be pickled)."""
-    if isinstance(value, dict):
-        return _ReadOnlyMapping({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze(item) for item in value)
+def _freeze(value: Any, depth: int = 0) -> Any:
+    """A deep read-only copy of decoded JSON (one that can still be pickled).
+
+    Raises:
+        ValueError: Objects and arrays nest deeper than ``MAX_CLAIM_DEPTH``,
+            which would exhaust the recursion limit here or in any code that
+            copies or pickles the identity.
+    """
+    if isinstance(value, dict | list):
+        if depth >= MAX_CLAIM_DEPTH:
+            raise ValueError("claims nested too deeply")
+        if isinstance(value, dict):
+            return _ReadOnlyMapping({key: _freeze(item, depth + 1) for key, item in value.items()})
+        return tuple(_freeze(item, depth + 1) for item in value)
     return value
+
+
+def _frozen_claims(claims: Mapping[str, Any], issuer: str) -> Mapping[str, Any]:
+    """*claims* frozen for the identity.
+
+    Raises:
+        InvalidTokenError: ``malformed``, the claims nest too deeply.
+    """
+    try:
+        frozen: Mapping[str, Any] = _freeze(dict(claims))
+    except Exception:  # ValueError, or a RecursionError however it came about
+        raise InvalidTokenError("malformed", issuer=issuer) from None
+    return frozen
 
 
 def _number(value: object) -> float | None:
@@ -435,6 +461,9 @@ class _IssuerState:
     # nothing is sent to the authorization server before this time.
     unavailable_until: float = 0.0
     unavailable_stage: str = "introspection"
+    # Introspection mode: set with each outage window, cleared by the next
+    # discovery or introspection request that succeeds (for /healthz).
+    failing: bool = False
 
 
 @dataclass(slots=True)
@@ -788,10 +817,19 @@ class OAuthResourceServer:
         return document
 
     def _ready(self) -> bool:
-        """Whether tokens can be verified without reaching the authorization server first."""
+        """Whether tokens can be verified now, as ``/healthz`` reports it.
+
+        With JWTs: every issuer's signing keys are cached.  With
+        introspection: every endpoint is known, and the authorization server
+        did not fail the last discovery or introspection request (one token
+        refused by it does not count).
+        """
         with self._lock:
             if self._introspection is not None:
-                return all(state.introspection_endpoint for state in self._states.values())
+                return all(
+                    state.introspection_endpoint and not state.failing
+                    for state in self._states.values()
+                )
             return all(state.keys for state in self._states.values())
 
     # ---------------------------------------------------------- lifecycle
@@ -966,7 +1004,7 @@ class OAuthResourceServer:
             client_id=client_id,
             issuer=issuer,
             expires_at=int(exp),
-            claims=_freeze(claims),
+            claims=_frozen_claims(claims, issuer),
         )
 
     @staticmethod
@@ -1016,31 +1054,49 @@ class OAuthResourceServer:
     ) -> tuple[_Key, ...]:
         """The issuer's keys: cached, or fetched (one fetch at a time per issuer and loop).
 
+        A refresh that is merely due (the hourly one) runs in the background
+        while the cached keys keep answering, so a slow or silent
+        authorization server holds up no request.  Only a request that
+        cannot go on without it waits for a fetch: one with no keys cached,
+        or with a token naming a key the cache lacks.  Such a request also
+        waits for a fetch already running, which the cooldown would not let
+        it start.
+
         Raises:
             AuthServerUnavailableError: No usable keys are cached and none
                 could be fetched.
         """
         with self._lock:
+            keys = state.keys
             wanted = self._wants_fetch(state, unknown_kid, self._clock())
-        if wanted:
+        needed = keys is None or unknown_kid
+        if wanted or needed:
             refreshes = self._loop_state().refreshes
             task = refreshes.get(state.issuer)
-            if task is None or task.done():
+            if task is not None and task.done():
+                task = None
+            if task is None and wanted:
                 # No await between the look and the start: requests arriving
                 # meanwhile join this fetch instead of starting their own.
                 task = refreshes[state.issuer] = asyncio.ensure_future(self._refresh_keys(state))
                 _forget_when_done(refreshes, state.issuer, task)
-            # Shielded: the fetch serves every request waiting on it, so one
-            # that is cancelled must not stop it.
-            await asyncio.shield(task)
-        with self._lock:
-            keys = state.keys
+            if task is not None and needed:
+                # Shielded: the fetch serves every request waiting on it, so
+                # one that is cancelled must not stop it.
+                await asyncio.shield(task)
+                with self._lock:
+                    keys = state.keys
         if not keys:
             raise AuthServerUnavailableError(issuer=state.issuer, stage="keys")
         return keys
 
     async def _refresh_keys(self, state: _IssuerState) -> None:
-        """Fetch the issuer's key set (and, hourly, its metadata); never raises."""
+        """Fetch the issuer's key set (and, hourly, its metadata); never raises.
+
+        A fetch that fails keeps the cached keys.  A key set that arrives
+        with no usable key withdraws them: the authorization server answered,
+        and every key it no longer publishes must stop working.
+        """
         now = self._clock()
         with self._lock:
             state.attempted_at = now
@@ -1051,9 +1107,6 @@ class OAuthResourceServer:
             jwks_uri = await self._find_jwks_uri(state, now)
             stage = "keys"
             document = await self._get_json(jwks_uri, MAX_DOCUMENT_BYTES)
-            keys = _parse_jwks(document, self._crypto, state.issuer)
-            if not keys:
-                raise _fetch.FetchError(f"the key set at {jwks_uri} holds no usable key")
         except (_fetch.FetchError, AuthServerUnavailableError) as exc:
             if stale:
                 with self._lock:
@@ -1070,6 +1123,19 @@ class OAuthResourceServer:
                 return
             logger.error("no usable signing keys for %s (%s): %s", state.issuer, stage, exc)
             audit("auth_unavailable", issuer=state.issuer, stage=stage)
+            return
+        keys = _parse_jwks(document, self._crypto, state.issuer)
+        if not keys:
+            with self._lock:
+                state.keys = None
+                state.keys_at = now
+                state.warned_at = None
+            logger.error(
+                "no usable signing keys for %s (keys): the key set at %s holds no usable key",
+                state.issuer,
+                jwks_uri,
+            )
+            audit("auth_unavailable", issuer=state.issuer, stage="keys")
             return
         with self._lock:
             state.keys = keys
@@ -1174,6 +1240,7 @@ class OAuthResourceServer:
             opened = now >= state.unavailable_until
             state.unavailable_until = now + UNAVAILABLE_RETRY_SECONDS
             state.unavailable_stage = stage
+            state.failing = True
         return opened
 
     async def _introspection_endpoint(self, state: _IssuerState) -> str:
@@ -1219,6 +1286,7 @@ class OAuthResourceServer:
             raise AuthServerUnavailableError(issuer=state.issuer, stage="metadata")
         with self._lock:
             state.introspection_endpoint = endpoint
+            state.failing = False
         return endpoint
 
     def _cached_introspection(self, digest: str, now: float) -> ClientIdentity | None:
@@ -1281,28 +1349,12 @@ class OAuthResourceServer:
                     executor=self._get_executor(),
                 )
             except _fetch.FetchError as exc:
-                # Logged and audited once per outage window, not per request.
-                if self._open_outage(state, "introspection"):
-                    if exc.status in (401, 403):
-                        logger.error(
-                            "introspection_credentials_rejected: %s refused this server's "
-                            "client credentials (HTTP %s); check the introspection client "
-                            "id and secret",
-                            endpoint,
-                            exc.status,
-                            extra={
-                                "event": {
-                                    "type": "introspection_credentials_rejected",
-                                    "issuer": state.issuer,
-                                }
-                            },
-                        )
-                    else:
-                        logger.error("token introspection failed: %s", exc)
-                    audit("auth_unavailable", issuer=state.issuer, stage="introspection")
+                self._introspection_failed(state, endpoint, exc)
                 raise AuthServerUnavailableError(
-                    issuer=state.issuer, stage="introspection"
+                    issuer=state.issuer, stage="introspection", sent_request=True
                 ) from None
+        with self._lock:
+            state.failing = False
         now = self._clock()
         try:
             identity = self._identity_from_introspection(answer, state.issuer, now)
@@ -1314,6 +1366,40 @@ class OAuthResourceServer:
             until = min(until, float(identity.expires_at))  # RFC 7662 section 4
         self._remember(digest, until, identity)
         return identity
+
+    def _introspection_failed(
+        self, state: _IssuerState, endpoint: str, exc: _fetch.FetchError
+    ) -> None:
+        """Log a failed introspection request; open the outage window if the server is down.
+
+        It is down when it could not be reached, timed out, answered ``5xx``,
+        ``429`` or no JSON, or refused this server's client credentials
+        (``401``): then nothing is sent for ``UNAVAILABLE_RETRY_SECONDS``, and
+        the failure is logged and audited once per window.  Any other ``4xx``,
+        or an answer over the size cap, is about the token sent (a filter in
+        front of the endpoint matching it, a size limit): only that request
+        fails, so no token can shut the others out.
+        """
+        status = exc.status
+        down = not exc.too_large and (status is None or status >= 500 or status in (401, 429))
+        if not down:
+            logger.error("token introspection failed: %s", exc)
+            audit("auth_unavailable", issuer=state.issuer, stage="introspection")
+            return
+        if not self._open_outage(state, "introspection"):
+            return
+        if status == 401:
+            logger.error(
+                "introspection_credentials_rejected: %s refused this server's client "
+                "credentials (HTTP 401); check the introspection client id and secret",
+                endpoint,
+                extra={
+                    "event": {"type": "introspection_credentials_rejected", "issuer": state.issuer}
+                },
+            )
+        else:
+            logger.error("token introspection failed: %s", exc)
+        audit("auth_unavailable", issuer=state.issuer, stage="introspection")
 
     def _identity_from_introspection(
         self, answer: Mapping[str, Any], issuer: str, now: float
@@ -1362,5 +1448,5 @@ class OAuthResourceServer:
             client_id=client_id,
             issuer=issuer,
             expires_at=expires_at,
-            claims=_freeze(dict(answer)),
+            claims=_frozen_claims(answer, issuer),
         )

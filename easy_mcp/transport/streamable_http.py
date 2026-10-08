@@ -88,7 +88,7 @@ from ..protocol import (
     is_modern_request,
 )
 from ..security.auth import ClientIdentity
-from ._http import BaseHTTPTransport, rpc_error
+from ._http import BaseHTTPTransport, rpc_error, token_principal
 from .base import ClientContext
 from .sse import SSETransport
 
@@ -144,6 +144,8 @@ class _Session:
     opened: bool = False  # whether its handshake succeeded
     # Its messages being dispatched, registered before their dispatch starts.
     dispatches: set[asyncio.Task[Any]] = field(default_factory=set)
+    # The token principal it is bound to, compared in full (token_principal).
+    principal: tuple[str, str | None, str | None] | None = None
 
 
 @dataclass(slots=True)
@@ -422,9 +424,13 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         modern = request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
             isinstance(params, dict) and is_modern_request(message.get("method"), params)
         )
+        # The tool a tools/call names: a token refused for required_scopes is
+        # asked for its scope in the same challenge, rather than in a second.
+        name = params.get("name") if isinstance(params, dict) else None
+        tool = name if message.get("method") == "tools/call" and isinstance(name, str) else None
         # Before the MCP header checks, the handshake and the session lookup,
         # so an unauthenticated caller learns nothing about any of them.
-        resolved = await self._resolve_identity(request, modern=modern)
+        resolved = await self._resolve_identity(request, modern=modern, tool=tool)
         if isinstance(resolved, Response):
             return resolved
         identity = resolved
@@ -660,6 +666,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity_fp=identity.fingerprint if identity else None,
             last_seen=time.monotonic(),
             active=1,
+            principal=token_principal(identity),
         )
         # Hold the slot while the handshake runs, so concurrent handshakes
         # cannot overshoot max_sessions.
@@ -709,7 +716,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         # The session must not be usable with a different (or missing)
         # credential than it was opened with.
         presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp:
+        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
             audit(
                 "session_credential_mismatch",
                 session_id=session_id,

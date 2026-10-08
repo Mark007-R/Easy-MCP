@@ -52,7 +52,7 @@ from starlette.routing import Route
 from ..exceptions import PARSE_ERROR, RateLimitError
 from ..logging import audit
 from ..middleware import TransportInfo
-from ._http import BaseHTTPTransport
+from ._http import BaseHTTPTransport, token_principal
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -81,6 +81,8 @@ class _Session:
     identity_fp: str | None
     queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # The token principal it is bound to, compared in full (token_principal).
+    principal: tuple[str, str | None, str | None] | None = None
 
 
 class SSETransport(BaseHTTPTransport):
@@ -205,6 +207,7 @@ class SSETransport(BaseHTTPTransport):
             id=session_id,
             context=context,
             identity_fp=identity.fingerprint if identity else None,
+            principal=token_principal(identity),
         )
         self._sessions[session_id] = session
         audit("session_open", session_id=session_id, client_id=client_id)
@@ -267,7 +270,7 @@ class SSETransport(BaseHTTPTransport):
             return resolved
         identity = resolved
         presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp:
+        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
             audit(
                 "session_credential_mismatch",
                 session_id=session_id,

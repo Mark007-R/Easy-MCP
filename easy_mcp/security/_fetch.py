@@ -40,11 +40,15 @@ _CHUNK = 65536
 
 
 class FetchError(Exception):
-    """A fetch failed; ``status`` is the HTTP status when the server answered."""
+    """A fetch failed; ``status`` is the HTTP status when the server answered.
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    ``too_large`` is set when the answer was longer than the cap.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, too_large: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.too_large = too_large
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -122,7 +126,9 @@ def _exchange(
                     break
                 body.extend(chunk)
                 if len(body) > max_bytes:
-                    raise FetchError(f"response from {url} exceeds {max_bytes} bytes")
+                    raise FetchError(
+                        f"response from {url} exceeds {max_bytes} bytes", too_large=True
+                    )
                 if time.monotonic() > deadline:
                     raise FetchError(f"{url} timed out")
     except urllib.error.HTTPError as exc:

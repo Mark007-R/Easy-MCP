@@ -13,6 +13,7 @@ import gc
 import math
 import pickle
 import sys
+import threading
 import time
 import weakref
 from collections import Counter
@@ -58,6 +59,8 @@ class FakeIntrospection:
         self.running = 0
         self.peak = 0
         self.error: _fetch.FetchError | None = None
+        # Failures for one token only (a WAF rule in front of the endpoint).
+        self.token_errors: dict[str, _fetch.FetchError] = {}
 
     async def __call__(
         self,
@@ -77,6 +80,8 @@ class FakeIntrospection:
                 await asyncio.sleep(self.delay)
             if self.error is not None:
                 raise self.error
+            if form["token"] in self.token_errors:
+                raise self.token_errors[form["token"]]
             return dict(self.answers.get(form["token"], {"active": False}))
         finally:
             self.running -= 1
@@ -201,6 +206,35 @@ async def test_non_finite_times_are_malformed(endpoint: FakeIntrospection, clock
         assert await reason(oauth, f"odd-{index}") == "malformed", fields
 
 
+def nested_dict(depth: int) -> Any:
+    value: Any = 1
+    for _ in range(depth):
+        value = {"a": value}
+    return value
+
+
+def nested_list(depth: int) -> Any:
+    value: Any = 1
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+async def test_deeply_nested_answer_is_malformed_not_a_crash(
+    endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    oauth = make(clock)
+    endpoint.answers["deep-dict"] = active(x=nested_dict(600))
+    endpoint.answers["deep-list"] = active(x=nested_list(600))
+    for token in ("deep-dict", "deep-list"):
+        assert await reason(oauth, token) == "malformed"
+        assert await reason(oauth, token) == "malformed"  # the refusal is cached
+    assert len(endpoint.calls) == 2
+    endpoint.answers["shallow"] = active(x=nested_dict(10))
+    claims = (await oauth.verify("shallow")).claims
+    assert claims["x"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"] == 1
+
+
 async def test_identity_pickles(endpoint: FakeIntrospection, clock: Clock) -> None:
     endpoint.answers[TOKEN] = active(ext={"tenant": "t1"})
     identity = await make(clock).verify(TOKEN)
@@ -311,6 +345,125 @@ async def test_endpoint_failures_are_503(
     assert CLIENT_SECRET not in logs.text
     assert quote_plus(CLIENT_SECRET) not in logs.text
     assert TOKEN not in logs.text
+
+
+async def test_a_token_the_endpoint_refuses_opens_no_outage(
+    endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
+) -> None:
+    # A 4xx for one token (a WAF rule that matches it, a form-size limit), or
+    # an answer too large to read, is that token's failure: it gets 503, and
+    # every other token is still introspected.
+    oauth = make(clock)
+    hostile = "../../../../etc/passwd"
+    refusals = {
+        "HTTP 403": {"status": 403},
+        "HTTP 400": {"status": 400},
+        "HTTP 413": {"status": 413},
+        "an answer over 64 KiB": {"too_large": True},
+    }
+    for index, (what, fields) in enumerate(refusals.items()):
+        endpoint.token_errors[hostile] = _fetch.FetchError(f"the endpoint: {what}", **fields)
+        with pytest.raises(AuthServerUnavailableError) as caught:
+            await oauth.verify(hostile)
+        endpoint.answers[f"good-{index}"] = active()
+        assert (await oauth.verify(f"good-{index}")).subject == "user-1", what
+        assert oauth._ready()
+        assert caught.value.stage == "introspection"
+        assert caught.value.sent_request  # charged to the caller's failed-auth budget
+    assert len(endpoint.calls) == 8
+    assert len(logs.events("auth_unavailable")) == 4
+    assert logs.text.count("token introspection failed") == 4
+    assert "introspection_credentials_rejected" not in logs.text
+    # Nothing is cached for it: sent again, it is asked again (the throttle bounds that).
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify(hostile)
+    assert len(endpoint.calls) == 9
+    # A request refused while a real outage window is open sent nothing.
+    endpoint.error = _fetch.FetchError("the endpoint answered HTTP 502", status=502)
+    with pytest.raises(AuthServerUnavailableError) as opened:
+        await oauth.verify("another-token")
+    assert opened.value.sent_request
+    with pytest.raises(AuthServerUnavailableError) as refused:
+        await oauth.verify("yet-another-token")
+    assert not refused.value.sent_request
+    assert len(endpoint.calls) == 10
+
+
+async def test_concurrent_failures_are_logged_once_per_window(
+    endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
+) -> None:
+    # Every request is in flight when the endpoint fails, so each of them
+    # reaches the outage window: only the first logs and audits it.
+    oauth = make(clock)
+    endpoint.delay = 0.05
+    lines = {500: "token introspection failed", 401: "introspection_credentials_rejected"}
+    for status, line in lines.items():
+        endpoint.calls.clear()
+        endpoint.error = _fetch.FetchError(f"the endpoint answered HTTP {status}", status=status)
+        tokens = [f"token-{status}-{index}" for index in range(8)]
+        results = await asyncio.gather(
+            *(oauth.verify(token) for token in tokens), return_exceptions=True
+        )
+        assert all(isinstance(result, AuthServerUnavailableError) for result in results)
+        assert len(endpoint.calls) == 8
+        assert logs.text.count(line) == 1, line
+        clock.now += 5
+    assert len(logs.events("auth_unavailable")) == 2
+
+
+def test_discovery_failures_in_two_event_loops_are_logged_once(
+    monkeypatch: pytest.MonkeyPatch, endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
+) -> None:
+    # Discovery is shared within one event loop only, so two loops discover
+    # at once and both reach the outage window: only the first logs it.
+    barrier = threading.Barrier(2, timeout=10)
+
+    async def unreachable(
+        url: str, *, max_bytes: int, timeout: float, executor: Any
+    ) -> dict[str, Any]:
+        barrier.wait()  # each loop blocks its own thread until both are here
+        raise _fetch.FetchError(f"{url} answered HTTP 500", status=500)
+
+    monkeypatch.setattr(_fetch, "fetch_json", unreachable)
+    oauth = make(clock, endpoint_url=None)
+    stages: list[str | None] = []
+
+    def verify(token: str) -> None:
+        try:
+            asyncio.run(oauth.verify(token))
+        except AuthServerUnavailableError as exc:
+            stages.append(exc.stage)
+
+    threads = [threading.Thread(target=verify, args=(f"token-{index}",)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert stages == ["metadata", "metadata"]
+    assert logs.events("auth_unavailable") == [
+        {"type": "auth_unavailable", "issuer": ISSUER, "stage": "metadata"}
+    ]
+    assert logs.text.count("cannot find the introspection endpoint") == 1
+
+
+async def test_health_follows_the_introspection_endpoint(
+    fake_as: Any, clock: Clock, logs: LogCapture
+) -> None:
+    fake_as.set_introspection(TOKEN, active(iss=fake_as.issuer))
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        assert oauth._ready()
+        fake_as.fail("introspect", 500)
+        with pytest.raises(AuthServerUnavailableError):
+            await oauth.verify(TOKEN)
+        assert not oauth._ready()
+        clock.now += 6  # the window is over, but the endpoint has not answered since
+        assert not oauth._ready()
+        fake_as.heal()
+        assert (await oauth.verify(TOKEN)).subject == "user-1"
+        assert oauth._ready()
+    finally:
+        oauth.close()
 
 
 async def test_metadata_without_endpoint_is_503(

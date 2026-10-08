@@ -200,6 +200,11 @@ class AuthServerUnavailableError(ProtocolError):
     ``-32008`` with ``data.reason = "auth_server_unavailable"``: the token may
     well be fine, so the client should retry rather than sign in again.  Not
     a :class:`ServerBusyError`, so code that refunds busy calls never catches it.
+
+    ``sent_request`` is set when this token was sent for introspection and
+    that request failed (a refusal during an outage window sends nothing).
+    Such a failure is charged to the caller's failed-authentication budget,
+    since a token can be made to fail it.
     """
 
     code = SERVER_BUSY
@@ -210,7 +215,9 @@ class AuthServerUnavailableError(ProtocolError):
         *,
         issuer: str | None = None,
         stage: str | None = None,
+        sent_request: bool = False,
     ) -> None:
         self.issuer = issuer
         self.stage = stage
+        self.sent_request = sent_request
         super().__init__(message, data={"reason": "auth_server_unavailable"})

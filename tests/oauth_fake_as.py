@@ -8,8 +8,8 @@ runs a minimal authorization-code flow: ``/authorize`` approves at once
 (PKCE S256 required, ``resource`` honoured) and ``/token`` issues signed JWTs.
 
 Everything is controlled from the test: ``rotate()``, ``set_keys()``,
-``fail(route, mode)``, ``delays``, ``set_introspection(token, answer)``,
-``counters``.
+``fail(route, mode)``, ``fail_token(token, status)``, ``delays``,
+``set_introspection(token, answer)``, ``counters``.
 Keys are generated in the test process; nothing leaves the machine.
 """
 
@@ -127,6 +127,8 @@ class FakeAuthorizationServer:
         self.metadata_issuer: str | None = None  # an override, to test mismatches
         self.introspection: dict[str, dict[str, Any]] = {}
         self.introspection_requests: list[dict[str, Any]] = []
+        # Introspection failures for one token only (a WAF rule that matches it).
+        self.token_failures: dict[str, Any] = {}
         self.grant_scopes: str = "mcp:access"
         # How long the "timeout" failure stalls; clients give up long before.
         self.stall_seconds = 2.0
@@ -147,6 +149,10 @@ class FakeAuthorizationServer:
 
     def heal(self) -> None:
         self.failures.clear()
+
+    def fail_token(self, token: str, status: int) -> None:
+        """Answer the introspection of *token* alone with HTTP *status*."""
+        self.token_failures[token_hash(token)] = status
 
     def set_introspection(self, token: str, answer: Mapping[str, Any]) -> None:
         self.introspection[token_hash(token)] = dict(answer)
@@ -219,6 +225,9 @@ class FakeAuthorizationServer:
         failed = await self._failure("introspect")
         if failed is not None:
             return failed
+        status = self.token_failures.get(token_hash(str(form.get("token", ""))))
+        if status is not None:
+            return JSONResponse({"error": "blocked"}, status_code=status)
         expected = "Basic " + base64.b64encode(
             f"{quote_plus(CLIENT_ID)}:{quote_plus(CLIENT_SECRET)}".encode()
         ).decode("ascii")

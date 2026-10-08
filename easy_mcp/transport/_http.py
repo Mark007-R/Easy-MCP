@@ -133,6 +133,20 @@ def bearer_challenge(
     return value
 
 
+def token_principal(
+    identity: ClientIdentity | None,
+) -> tuple[str, str | None, str | None] | None:
+    """The whole principal of a token identity: issuer, subject and client.
+
+    ``None`` for an API key or anonymous caller.  A session compares it as
+    well as the fingerprint, so no principal can use another's session even
+    if their fingerprints matched.
+    """
+    if identity is None or identity.issuer is None:
+        return None
+    return (identity.issuer, identity.subject, identity.client_id)
+
+
 def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get("headers", ()):
         if key == name:
@@ -241,7 +255,7 @@ class BaseHTTPTransport(Transport):
         return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
 
     async def _resolve_identity(
-        self, request: Request, *, modern: bool
+        self, request: Request, *, modern: bool, tool: str | None = None
     ) -> ClientIdentity | None | Response:
         """The request's identity, or the response that rejects its credential.
 
@@ -249,7 +263,9 @@ class BaseHTTPTransport(Transport):
         ``X-API-Key`` as it always has.  With it, an ``Authorization: Bearer``
         value is an API key or an access token, and a request without a
         credential is challenged.  *modern* says which revision's challenge
-        to send.
+        to send; *tool* is the tool a ``tools/call`` names, whose scope a
+        token refused for ``required_scopes`` is asked for in the same
+        challenge.
         """
         server = self._server
         if server.oauth is None:
@@ -263,10 +279,10 @@ class BaseHTTPTransport(Transport):
                 return server.authenticate_key(key)
             except AuthenticationError:
                 return self._invalid_key_response()
-        return await self._resolve_oauth(request, modern=modern)
+        return await self._resolve_oauth(request, modern=modern, tool=tool)
 
     async def _resolve_oauth(
-        self, request: Request, *, modern: bool
+        self, request: Request, *, modern: bool, tool: str | None = None
     ) -> ClientIdentity | None | Response:
         server = self._server
         oauth = server.oauth
@@ -314,7 +330,7 @@ class BaseHTTPTransport(Transport):
                 )
         failed = False
         try:
-            return await server.authenticate_request(bearer=bearer, api_key=api_key)
+            return await server.authenticate_request(bearer=bearer, api_key=api_key, tool=tool)
         except TokenRequiredError:
             # No credential: RFC 6750 sends no error code, only where to sign in.
             challenge = bearer_challenge(metadata_url, scope=server._initial_scopes())
@@ -363,6 +379,11 @@ class BaseHTTPTransport(Transport):
                 data=exc.data,
             )
         except AuthServerUnavailableError as exc:
+            # Charged when this token was sent for introspection and that
+            # request failed: a token can be made to fail it (a filter in
+            # front of the endpoint), so it must not be repeated for free.  A
+            # refusal while an outage window is open sent nothing.
+            failed = exc.sent_request
             return rpc_error(
                 503,
                 exc.code,

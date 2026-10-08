@@ -548,7 +548,11 @@ class MCPServer:
         return self.auth is not None or self.oauth is not None
 
     async def authenticate_request(
-        self, *, bearer: str | None = None, api_key: str | None = None
+        self,
+        *,
+        bearer: str | None = None,
+        api_key: str | None = None,
+        tool: str | None = None,
     ) -> ClientIdentity | None:
         """Resolve one HTTP request's credential to an identity.
 
@@ -559,6 +563,10 @@ class MCPServer:
         token, which must also hold every ``required_scopes``.  An
         ``X-API-Key`` value is never sent for token verification.  Query
         strings and bodies are never consulted.
+
+        *tool* is the tool a ``tools/call`` names.  A token that lacks a
+        required scope is then also asked for the scope that tool needs (with
+        step-up), so one challenge covers the whole call.
 
         Returns:
             The identity, or ``None`` for anonymous access, which only a
@@ -588,6 +596,10 @@ class MCPServer:
             required = self.oauth.required_scopes
             missing = [scope for scope in required if scope not in identity.scopes]
             if missing:
+                definition = self._registry.get(tool) if tool is not None else None
+                step = self._step_up_scope(identity, definition)
+                if step is not None and step not in missing:
+                    missing.append(step)
                 raise InsufficientScopeError(missing, granted=identity.scopes)
             self._note_principal(identity)
             return identity
@@ -657,20 +669,29 @@ class MCPServer:
         """Whether *item* exists for this caller (lists and lookups alike)."""
         return self._steps_up(identity) or visible(identity, item)
 
+    def _step_up_scope(self, identity: ClientIdentity | None, item: Guarded | None) -> str | None:
+        """The scope a token must ask for to use *item*; ``None`` when there is none.
+
+        With step-up, for a token holding none of *item*'s scopes: the first
+        one declared, the narrowest by convention.
+        """
+        if item is None or identity is None or not item.scopes or not self._steps_up(identity):
+            return None
+        if identity.scopes & item.scopes:
+            return None
+        return item.declared_scopes[0] if item.declared_scopes else min(item.scopes)
+
     def _check_step_up(self, identity: ClientIdentity | None, item: Guarded) -> None:
         """Refuse a token that holds none of *item*'s scopes, naming the one to ask for.
 
         Raises:
             InsufficientScopeError: With the narrowest declared scope.
         """
-        if identity is None or not item.scopes or not self._steps_up(identity):
-            return
-        if identity.scopes & item.scopes:
-            return
-        first = item.declared_scopes[0] if item.declared_scopes else min(item.scopes)
-        raise InsufficientScopeError(
-            (first,), f"Insufficient scope for tool '{item.name}'", granted=identity.scopes
-        )
+        first = self._step_up_scope(identity, item)
+        if identity is not None and first is not None:
+            raise InsufficientScopeError(
+                (first,), f"Insufficient scope for tool '{item.name}'", granted=identity.scopes
+            )
 
     def _initial_scopes(self) -> tuple[str, ...]:
         """What a client should ask for up front: the metadata's ``scopes_supported``.
