@@ -209,3 +209,17 @@ def test_declared_scopes_keep_order_and_dedupe(server: MCPServer) -> None:
     assert once.declared_scopes == ("z", "y") and once.scopes == frozenset({"y", "z"})
     plain = server.register_tool(lambda: "p", name="plain")
     assert plain.declared_scopes == () and plain.scopes == frozenset()
+
+
+def test_scope_tokens_checked_only_with_oauth(server: MCPServer) -> None:
+    from easy_mcp import OAuthResourceServer
+
+    # Without oauth=, registration is as in 0.3.1.
+    assert server.register_tool(lambda: "x", name="spaced", scopes=("a b",)).scopes
+    oauth = OAuthResourceServer("https://mcp.example.com/mcp", ["https://auth.example.com"])
+    with_oauth = MCPServer(port=0, oauth=oauth)
+    for bad in ("a b", 'a"b', "a\\b", "offline_access", "café"):
+        with pytest.raises(ToolRegistrationError, match="cannot be used with OAuth"):
+            with_oauth.register_tool(lambda: "x", name="bad", scopes=("ok", bad))
+    assert with_oauth.tools == []
+    assert with_oauth.register_tool(lambda: "x", name="good", scopes=("files:read",)).scopes
