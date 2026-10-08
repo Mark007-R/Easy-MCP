@@ -3,7 +3,8 @@
 Read-only by default.  The write tools (``create_issue``,
 ``comment_on_issue``) are registered only when ``enable_write=True`` (CLI:
 ``--allow-write``) and are additionally gated by the ``github:write`` scope,
-so a client needs an API key carrying that scope to see or call them.
+so a client needs an API key (or, with ``EASY_MCP_OAUTH_*``, an access token)
+carrying that scope to see or call them.
 
 Cancellation: a request is never started for a tool call that has already
 been cancelled or timed out.  One already sent cannot be taken back, so a
@@ -242,18 +243,25 @@ def build_server(
         api_url: API base URL; defaults to ``GITHUB_API_URL`` or the public API.
         enable_write: Also register the write tools (``create_issue``,
             ``comment_on_issue``).  They require the ``github:write`` scope,
-            so ``auth`` must be configured for anyone to reach them.
+            so ``auth`` or ``oauth`` must be configured for anyone to reach
+            them.  Either way the connector calls GitHub with its own
+            token, never the client's credential.
         client: Injectable client (tests).
         **server_options: Passed to :class:`~easy_mcp.server.MCPServer`.
 
     Raises:
-        ValueError: ``enable_write`` without ``auth``: the write tools would
-            be unreachable, which is almost certainly a misconfiguration.
+        ValueError: ``enable_write`` without ``auth`` or ``oauth``: the write
+            tools would be unreachable, which is almost certainly a
+            misconfiguration.
     """
-    if enable_write and server_options.get("auth") is None:
+    if (
+        enable_write
+        and server_options.get("auth") is None
+        and server_options.get("oauth") is None
+    ):
         raise ValueError(
-            "enable_write requires auth: write tools are gated by the "
-            f"'{WRITE_SCOPE}' scope (set EASY_MCP_API_KEYS)"
+            "enable_write requires auth or oauth: write tools are gated by the "
+            f"'{WRITE_SCOPE}' scope (set EASY_MCP_API_KEYS or EASY_MCP_OAUTH_RESOURCE)"
         )
     gh = client or GitHubClient(
         token if token is not None else os.environ.get(TOKEN_ENV_VAR),
@@ -261,7 +269,11 @@ def build_server(
     )
     instructions = "GitHub access. Repositories are addressed as 'owner/name'."
     if enable_write:
-        instructions += f" Write tools need an API key holding the '{WRITE_SCOPE}' scope."
+        credential = "an API key"
+        if server_options.get("oauth") is not None:
+            both = server_options.get("auth") is not None
+            credential = "an API key or access token" if both else "an access token"
+        instructions += f" Write tools need {credential} holding the '{WRITE_SCOPE}' scope."
     else:
         instructions = "Read-only " + instructions
     server_options.setdefault("name", "easy-mcp-github")
