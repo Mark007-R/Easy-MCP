@@ -21,13 +21,17 @@ from .decorators import ToolDefinition
 from .exceptions import (
     AuthenticationError,
     AuthorizationError,
+    AuthServerUnavailableError,
     EasyMCPError,
+    InsufficientScopeError,
+    InvalidTokenError,
     PayloadTooLargeError,
     ProtocolError,
     RateLimitError,
     SchemaError,
     ServerBusyError,
     SessionLimitError,
+    TokenRequiredError,
     ToolError,
     ToolRegistrationError,
     ValidationError,
@@ -41,7 +45,8 @@ from .middleware import (
     current_tool_call,
 )
 from .protocol import SUPPORTED_PROTOCOL_VERSIONS
-from .security.auth import APIKeyAuth, ClientIdentity
+from .security.auth import APIKeyAuth, ClientIdentity, current_identity
+from .security.oauth import Introspection, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
 from .server import PROTOCOL_VERSION, MCPServer
 from .transport.base import ClientContext, Transport
@@ -51,13 +56,18 @@ from .transport.streamable_http import StreamableHTTPTransport
 
 __all__ = [
     "APIKeyAuth",
+    "AuthServerUnavailableError",
     "AuthenticationError",
     "AuthorizationError",
     "CancelToken",
     "ClientContext",
     "ClientIdentity",
     "EasyMCPError",
+    "InsufficientScopeError",
+    "Introspection",
+    "InvalidTokenError",
     "MCPServer",
+    "OAuthResourceServer",
     "PROTOCOL_VERSION",
     "PayloadTooLargeError",
     "ProtocolError",
@@ -72,6 +82,7 @@ __all__ = [
     "SlidingWindowRateLimiter",
     "StdioTransport",
     "StreamableHTTPTransport",
+    "TokenRequiredError",
     "ToolDefinition",
     "ToolError",
     "ToolRegistrationError",
@@ -83,5 +94,6 @@ __all__ = [
     "__version__",
     "cancel_scope",
     "current_cancel_token",
+    "current_identity",
     "current_tool_call",
 ]

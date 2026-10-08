@@ -152,3 +152,66 @@ def logs() -> Iterator[LogCapture]:
     finally:
         logger.removeHandler(capture)
         logger.setLevel(level)
+
+
+# ------------------------------------------------------------------- OAuth
+#
+# Keys are generated in the test process, once per session.  cryptography and
+# PyJWT (the [dev] extra) are imported inside the fixtures, so the rest of the
+# suite never depends on them.  Tokens are minted with oauth_fake_as.mint_token.
+
+# The resource (and audience) of the OAuth test servers.  It need not be the
+# live server's URL: it is what tokens and the metadata document name.
+OAUTH_RESOURCE = "https://mcp.example.com/mcp"
+
+
+@pytest.fixture(scope="session")
+def rsa_key() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture(scope="session")
+def rsa_key_2() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture(scope="session")
+def rsa_1024_key() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=1024)
+
+
+@pytest.fixture(scope="session")
+def ec_p256_key() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+@pytest.fixture(scope="session")
+def ec_p384_key() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return ec.generate_private_key(ec.SECP384R1())
+
+
+@pytest.fixture(scope="session")
+def ed25519_key() -> Any:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    return ed25519.Ed25519PrivateKey.generate()
+
+
+@pytest.fixture
+def fake_as(live_server: Callable[[Any], str], rsa_key: Any) -> Any:
+    """A local authorization server (tests/oauth_fake_as.py) signing with ``rsa_key``."""
+    from oauth_fake_as import FakeAuthorizationServer, SigningKey
+
+    fake = FakeAuthorizationServer(SigningKey("k1", "RS256", rsa_key), audience=OAUTH_RESOURCE)
+    fake.issuer = live_server(fake.app())
+    return fake

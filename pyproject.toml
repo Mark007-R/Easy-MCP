@@ -20,6 +20,7 @@ keywords = [
     "server",
     "streamable-http",
     "sse",
+    "oauth",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -45,12 +46,15 @@ postgres = ["psycopg[binary]>=3.1"]
 mysql = ["pymysql>=1.1"]
 mongodb = ["pymongo>=4.6"]
 pydantic = ["pydantic>=2.0"]
+# Local verification of JWT access tokens; token introspection needs nothing.
+oauth = ["pyjwt[crypto]>=2.15.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
     "pydantic>=2.0",
     "pymongo>=4.6",  # bson, for the MongoDB connector's Extended JSON tests
+    "pyjwt[crypto]>=2.15.0",  # the OAuth tests sign their own tokens
     "ruff>=0.5",
     "mypy>=1.10",
 ]
