@@ -46,6 +46,9 @@ The package installs as `easy-mcp-kit`; the import name is `easy_mcp`.
 Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 `pip install "easy-mcp-kit[oauth]"` adds PyJWT, to verify OAuth access tokens
 locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
+Several worker processes sharing sessions and limits need Redis:
+`pip install "easy-mcp-kit[redis]"` (see
+[Running several workers](#running-several-workers)).
 
 ## Why easy_mcp?
 
@@ -58,6 +61,7 @@ locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 | Rich schemas | A Pydantic model (optional) | The model's own schema and validation, for parameters and results |
 | Auth | `auth=APIKeyAuth({...})` or `oauth=OAuthResourceServer(...)` | Constant-time key checks, OAuth 2.1 bearer tokens with audience checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
+| Several workers | `store=RedisStore.from_env()` | Sessions, call caps and rate limits shared between processes, no sticky routing |
 | Policy & telemetry | `@server.middleware`, `@server.tool_middleware` | Hooks around every request and tool call, after the built-in checks; refuse with an exception |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
 | Crashes | Nothing | One failing tool never takes down the server |
@@ -292,6 +296,84 @@ everything else wants HTTP.
 
 Importing a module runs it, so point this only at code you trust.
 
+### Running several workers
+
+`server.run()` serves from one process. To spread the load over several
+processes or machines, give the server a shared store and run its app under
+uvicorn's `--workers`, or as several copies behind a load balancer:
+
+```python
+# app.py
+from easy_mcp import APIKeyAuth, MCPServer, RedisStore
+
+server = MCPServer(
+    name="reports",                # also the store's namespace
+    auth=APIKeyAuth.from_env(),
+    store=RedisStore.from_env(),   # reads EASY_MCP_REDIS_URL: a rediss:// URL with its ACL user
+)
+
+@server.tool(max_calls_per_session=5)
+def expensive(query: str) -> str:
+    """Run the expensive report."""
+    ...
+
+app = server.build_app()
+```
+
+```bash
+pip install "easy-mcp-kit[redis]"
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4 \
+    --proxy-headers --forwarded-allow-ips 10.0.0.5 --timeout-graceful-shutdown 10
+```
+
+No sticky routing is needed. With the store in place:
+
+- any worker answers any request of a handshake-era session, on Streamable
+  HTTP and on legacy SSE; `DELETE` ends a session on every worker, and
+  sessions survive a worker restart;
+- `notifications/cancelled` reaches a call wherever it runs, and so do the
+  cancel token and a connector's `KILL QUERY` behind it;
+- a legacy SSE message posted to one worker is answered on the stream another
+  worker holds;
+- `max_calls_per_session`, rate limits and `max_sessions` count across all
+  workers together (`max_sessions` still separately for Streamable HTTP and
+  legacy SSE).
+
+Some things stay with one worker: a running call, an open stream,
+`max_sync_workers`, timeouts, and tools registered at runtime (registering
+one while serving logs a warning). Every worker must import the same module,
+with the same tools, keys and settings. Stateless (`2026-07-28`) requests
+never had sessions; the store shares their rate limits and per-client call
+counts, which with `RedisStore` lapse after `session_idle_timeout` without a
+counted (or refused) call, rather than without any request.
+
+The store holds neither API keys nor session ids: sessions are filed under a
+digest of their id, and workers authenticate the messages they exchange with
+a key derived from it, so access to Redis is not enough to cancel, end or
+answer someone else's call. If Redis cannot be reached, requests that need it
+are refused with `-32008` (`data.reason: "store_unavailable"`, HTTP `503`
+with `Retry-After`) instead of being served without their limits, and
+`/healthz` answers `503` with `"store": "unreachable"`, so a load balancer
+can take the worker out. Requests that need no store (a tool without
+`max_calls_per_session` when rate limiting is off, say) are still served.
+
+Give Redis TLS (`rediss://`), a user limited to the `easy-mcp:` keys and
+channels (the ACL is in [SECURITY.md](SECURITY.md)), and the default
+`noeviction` memory policy. Servers that share one Redis need different
+`name=`s, since the name is the store's namespace, or an explicit
+`RedisStore(..., namespace=...)`. `RedisStore.from_client(client)` takes a
+`redis.asyncio` client you configured yourself (a custom TLS context, a
+Sentinel master); Redis Cluster is not supported. Client options may follow
+in the URL's query string (`?socket_timeout=5`); the defaults are 2 s
+timeouts and 64 connections per worker. `--proxy-headers` with
+`--forwarded-allow-ips` lets anonymous clients be told apart by their own
+address rather than the load balancer's. Mounted inside another app, run
+`async with server.lifespan(): ...` from the host app's lifespan, which
+connects the store and closes it.
+
+The stdio transport always keeps its state in the process, whatever store is
+configured.
+
 ### Authentication and per-tool permissions
 
 ```python
@@ -445,6 +527,9 @@ server = MCPServer(
 async def expensive(query: str) -> str:
     """A tool with its own timeout and a per-session usage cap."""
 ```
+
+These limits count per process by default. With a shared store they count
+across every worker (see [Running several workers](#running-several-workers)).
 
 Clients can also cancel long-running calls with the standard MCP
 `notifications/cancelled` message, or on a stateless HTTP request by closing
@@ -636,6 +721,7 @@ caller.
 | No token, or an invalid or expired one (OAuth) | HTTP `401`, `-32001`, with `WWW-Authenticate: Bearer ...` |
 | Token lacks a required or a tool's scope (OAuth) | HTTP `403`, `-32001` with `data.error = "insufficient_scope"` and the scope to ask for; over legacy SSE a missing tool scope arrives on the stream as that `-32001` error, not a `403` |
 | Authorization server unreachable (OAuth) | HTTP `503`, `-32008` with `data.reason = "auth_server_unavailable"`; retry |
+| Shared store unreachable | HTTP `503` with `Retry-After`, `-32008` with `data.reason = "store_unavailable"`; retry shortly |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The
 `error_id` in production responses matches the server-side log entry that
@@ -676,6 +762,18 @@ every other event names that user by fingerprint only (32 hex digits, so no
 client can pick a client id that shares another user's). `tool_denied`
 carries the `scope` a step-up asked for. No event ever holds a token or a
 secret.
+
+Session events (`session_open`, `session_close`,
+`session_credential_mismatch`) carry `session_ref`, a digest of the session
+id that also names the session in the store, and `session_open` the
+negotiated `protocol_version`. The raw `session_id` is still there, but is
+dropped from audit events in 0.4: key log processing on `session_ref`. With a
+shared store, session events carry the `worker` that logged them,
+`bus_message_rejected` records a message between workers that failed its
+authentication (`reason: "mac"`) or names another identity
+(`reason: "identity"`), and `sse_relay_failed` an answer that could not reach
+the worker holding a legacy SSE stream (`reason: "too_large"` or
+`"owner_unreachable"`).
 
 ## Connecting a client
 
@@ -834,9 +932,15 @@ easy_mcp/
 │   ├── oauth.py     OAuthResourceServer: token checks, resource metadata
 │   ├── _fetch.py    outbound HTTP for OAuth (https only, no redirects, size caps)
 │   └── ratelimit.py sliding-window per-client rate limiter
+├── store/
+│   ├── base.py      Store interface (provisional until 1.0)
+│   ├── memory.py    MemoryStore: the default, state in this process
+│   └── redis_store.py  RedisStore: sessions, counts and limits shared between workers
 ├── transport/
 │   ├── base.py      Transport ABC + ClientContext
 │   ├── _http.py     shared HTTP plumbing: Origin allowlist, credentials, uvicorn
+│   ├── _sessions.py session records, cross-worker cancel and SSE relay
+│   ├── _bus.py      authenticated messages between workers
 │   ├── streamable_http.py  Streamable HTTP transport (/mcp, sessions)
 │   ├── sse.py       legacy HTTP + SSE transport (Starlette/uvicorn)
 │   └── stdio.py     stdin/stdout transport (desktop MCP hosts, local agents)
@@ -880,12 +984,12 @@ prefer returning compact structures over huge strings.
 - Browser-based clients on other origins must be listed in `allowed_origins`.
 - With OAuth, set `resource` to the exact URL clients use, and behind a proxy
   forward `/.well-known/oauth-protected-resource/...` to the server too.
-- For multiple workers: stateless (`2026-07-28`) requests can go to any worker.
-  Handshake-era sessions are not shared across processes — run one process,
-  or route each `MCP-Session-Id` to the same worker. Rate limits and
-  `max_calls_per_session` counters are per process either way, and so are
+- For multiple workers, configure a shared store (see
+  [Running several workers](#running-several-workers)). Without one,
+  handshake-era sessions, rate limits and call caps are per process, so
+  sessions need sticky routing (each `MCP-Session-Id` to the same worker).
   OAuth key and introspection caches, the failed-token throttle and
-  `principal_seen`.
+  `principal_seen` are per process either way.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development
@@ -897,8 +1001,12 @@ ruff check .
 mypy easy_mcp
 ```
 
-CI runs the same three commands on Python 3.11 through 3.14. Releases are
-listed in [CHANGELOG.md](CHANGELOG.md).
+CI runs the same three commands on Python 3.11 through 3.14, with a Redis
+service for the shared-store live tests. Those run only when
+`EASY_MCP_LIVE_REDIS_URL` names a scratch database, e.g.
+`docker run -d -p 6379:6379 redis:7-alpine` and
+`EASY_MCP_LIVE_REDIS_URL=redis://127.0.0.1:6379/15 pytest tests/test_live_redis.py`.
+Releases are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
