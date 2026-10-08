@@ -357,3 +357,19 @@ def test_memory_and_redis_rate_limits_agree() -> None:
             assert local_retry is None, step
         else:
             assert local_retry is not None and abs(local_retry - redis_retry / 1e6) < 1e-6, step
+
+
+async def test_the_client_speaks_resp2_with_bounded_waits() -> None:
+    # RESP2: the documented ACL grants no HELLO.  URL options still win.
+    store = RedisStore("redis://127.0.0.1:1/3?socket_timeout=5", namespace="t")
+    try:
+        client = store._ensure()
+        pool = client.connection_pool
+        options = pool.connection_kwargs
+        assert options["protocol"] == 2 and options["decode_responses"] is True
+        assert options["socket_timeout"] == 5.0 and options["socket_connect_timeout"] == 2.0
+        assert options["db"] == 3
+        assert pool.max_connections == 64 and pool.timeout == 2.0
+        assert store._ensure() is client  # one client per event loop
+    finally:
+        await store.aclose()
