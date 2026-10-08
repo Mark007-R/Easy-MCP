@@ -354,8 +354,10 @@ answer someone else's call. If Redis cannot be reached, requests that need it
 are refused with `-32008` (`data.reason: "store_unavailable"`, HTTP `503`
 with `Retry-After`) instead of being served without their limits, and
 `/healthz` answers `503` with `"store": "unreachable"`, so a load balancer
-can take the worker out. Requests that need no store (a tool without
-`max_calls_per_session` when rate limiting is off, say) are still served.
+can take the worker out. Stateless requests that need no store (a call to
+a tool without `max_calls_per_session` when rate limiting is off, say) are
+still served. A session's requests need it, bar a legacy SSE message that
+reaches the worker holding its stream.
 
 Give Redis TLS (`rediss://`), a user limited to the `easy-mcp:` keys and
 channels (the ACL is in [SECURITY.md](SECURITY.md)), and the default
