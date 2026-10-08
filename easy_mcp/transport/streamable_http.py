@@ -69,6 +69,7 @@ from ..exceptions import (
     ProtocolError,
 )
 from ..logging import audit
+from ..middleware import TransportInfo
 from ..protocol import (
     META_PROTOCOL_VERSION,
     MODERN_PROTOCOL_VERSIONS,
@@ -332,15 +333,16 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity = self._resolve_identity(request)
         except AuthenticationError:
             return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
+        info = self._transport_info(request, _TRANSPORT)
 
         params = message.get("params")
         if request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
             isinstance(params, dict) and is_modern_request(message.get("method"), params)
         ):
-            return await self._handle_stateless(message, identity, request)
+            return await self._handle_stateless(message, identity, request, info)
 
         if message.get("method") == "initialize" and "id" in message:
-            return await self._initialize(message, identity, request)
+            return await self._initialize(message, identity, request, info)
 
         session = self._session_for(request, identity)
         if isinstance(session, Response):
@@ -352,7 +354,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         session.active += 1
         try:
-            response = await self._server.dispatch(message, session.context)
+            response = await self._server.dispatch(message, session.context, transport=info)
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()
@@ -363,7 +365,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         return _json_response(response)
 
     async def _handle_stateless(
-        self, message: dict[str, Any], identity: ClientIdentity | None, request: Request
+        self,
+        message: dict[str, Any],
+        identity: ClientIdentity | None,
+        request: Request,
+        info: TransportInfo,
     ) -> Response:
         """Serve one request of the stateless era; no session is read or made."""
         msg_id = message.get("id")
@@ -408,7 +414,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity=identity,
             tool_calls=self._stateless_calls(client_id),
         )
-        response = await self._dispatch_until_disconnect(message, context, request)
+        response = await self._dispatch_until_disconnect(message, context, request, info)
         if response is None:
             return Response(status_code=202)
         error = response.get("error")
@@ -416,14 +422,18 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         return _json_response(response, status=404 if not_found else 200)
 
     async def _dispatch_until_disconnect(
-        self, message: dict[str, Any], context: ClientContext, request: Request
+        self,
+        message: dict[str, Any],
+        context: ClientContext,
+        request: Request,
+        info: TransportInfo | None = None,
     ) -> dict[str, Any] | None:
         """Dispatch, cancelling the work if the client closes the connection.
 
         In the stateless era a closed connection is the cancellation signal:
         nobody is left to read the answer.
         """
-        task = asyncio.ensure_future(self._server.dispatch(message, context))
+        task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
         try:
             while True:
                 done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_SECONDS)
@@ -482,7 +492,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
     # -------------------------------------------------------------- sessions
 
     async def _initialize(
-        self, message: dict[str, Any], identity: ClientIdentity | None, request: Request
+        self,
+        message: dict[str, Any],
+        identity: ClientIdentity | None,
+        request: Request,
+        info: TransportInfo,
     ) -> Response:
         self._expire_idle_sessions()
         if len(self._sessions) >= self._server.max_sessions:
@@ -505,7 +519,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._sessions[session_id] = session
         response: dict[str, Any] | None = None
         try:
-            response = await self._server.dispatch(message, session.context)
+            response = await self._server.dispatch(message, session.context, transport=info)
         finally:
             session.active -= 1
             session.last_seen = time.monotonic()

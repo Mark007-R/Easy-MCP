@@ -6,14 +6,16 @@ import asyncio
 import dataclasses
 import functools
 import gc
+import io
 import json
 import logging
+import os
 import re
 import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from typing import Any
 
@@ -40,6 +42,7 @@ from easy_mcp import (
     RequestInfo,
     RequestOutcome,
     SessionLimitError,
+    StdioTransport,
     ToolCall,
     ToolError,
     ToolOutcome,
@@ -2135,3 +2138,306 @@ async def test_a_finished_call_with_middleware_does_not_keep_its_result_alive() 
         assert [ref for ref in produced if ref() is not None] == []
     finally:
         gc.enable()
+
+
+# --------------------------------------------------------------- transports
+
+ACCEPT = {"Accept": "application/json, text/event-stream"}
+INIT = {
+    "protocolVersion": "2025-11-25",
+    "capabilities": {},
+    "clientInfo": {"name": "tests", "version": "1.0"},
+}
+
+
+def recording_server(**kwargs: Any) -> tuple[MCPServer, list[RequestInfo]]:
+    """A server whose request middleware keeps every RequestInfo it sees."""
+    server = make_server(**kwargs)
+    seen: list[RequestInfo] = []
+
+    @server.middleware
+    async def record(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        seen.append(request)
+        return await call_next()
+
+    return server, seen
+
+
+def holding_server() -> tuple[MCPServer, threading.Event, threading.Event, list[bool]]:
+    """A server whose request middleware holds every tools/call until it is cancelled."""
+    server = make_server()
+    entered = threading.Event()
+    cancelled = threading.Event()
+    ran: list[bool] = []
+
+    @server.tool
+    def touch() -> str:
+        """Records that it ran."""
+        ran.append(True)
+        return "touched"
+
+    @server.middleware
+    async def hold(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "tools/call":
+            entered.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+        return await call_next()
+
+    return server, entered, cancelled, ran
+
+
+def next_data(lines: Iterator[str]) -> str:
+    """Read SSE lines until the next ``data:`` payload."""
+    for line in lines:
+        if line.startswith("data: "):
+            return line[len("data: ") :]
+    raise AssertionError("SSE stream ended without a data event")
+
+
+def test_http_transport_info_and_redacted_headers(live_server: LiveServer) -> None:
+    server, seen = recording_server(auth=APIKeyAuth({KEY: "*"}))
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        listed = modern("tools/list")
+        headers = {**headers_for(listed), "Authorization": f"Bearer {KEY}", "X-Tenant": "acme"}
+        assert client.post("/mcp", json=listed, headers=headers).status_code == 200
+        init = client.post(
+            "/mcp", json=rpc("initialize", INIT), headers={**ACCEPT, "X-API-Key": KEY}
+        )
+        session = init.headers["mcp-session-id"]
+        headers = {**ACCEPT, "X-API-Key": KEY, "MCP-Session-Id": session, "X-Tenant": "acme"}
+        listed_again = client.post("/mcp", json=rpc("tools/list", msg_id=2), headers=headers)
+        assert listed_again.status_code == 200
+    stateless, handshake, in_session = seen
+    for request in seen:
+        transport = request.transport
+        assert transport.name == "streamable-http"
+        assert transport.client_address == "127.0.0.1"
+        assert isinstance(transport.client_port, int)
+        assert transport.http_version == "1.1"
+        for credential in ("authorization", "x-api-key", "mcp-session-id", "cookie"):
+            assert credential not in transport.headers
+        assert KEY not in json.dumps(dict(transport.headers))
+        assert request.identity is not None  # the credential was used, then withheld
+    assert stateless.stateless and stateless.session_id is None
+    assert stateless.transport.headers["x-tenant"] == "acme"
+    assert stateless.transport.headers["mcp-method"] == "tools/list"
+    assert handshake.session_id == session and in_session.session_id == session
+    assert in_session.transport.headers["x-tenant"] == "acme"
+    assert in_session.protocol_version == "2025-11-25"
+
+
+def test_sse_transport_info(live_server: LiveServer) -> None:
+    server, seen = recording_server()
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        with client.stream("GET", "/sse") as stream:
+            lines = stream.iter_lines()
+            endpoint = next_data(lines)
+            session_id = endpoint.split("session_id=", 1)[1]
+            posted = client.post(endpoint, json=rpc("ping"), headers={"X-Tenant": "acme"})
+            assert posted.status_code == 202
+            assert json.loads(next_data(lines))["result"] == {}
+    (request,) = seen
+    assert request.transport.name == "sse"
+    assert request.transport.headers["x-tenant"] == "acme"
+    assert request.transport.client_address == "127.0.0.1"
+    assert request.session_id == session_id
+    assert session_id not in json.dumps(dict(request.transport.headers))
+
+
+async def test_stdio_transport_info() -> None:
+    server, seen = recording_server()
+    stdin = io.BytesIO(json.dumps(rpc("ping")).encode() + b"\n")
+    await StdioTransport(server, stdin=stdin, stdout=io.BytesIO()).serve()
+    (request,) = seen
+    assert request.transport.name == "stdio"
+    assert dict(request.transport.headers) == {}
+    assert request.transport.client_address is None and request.transport.http_version is None
+    assert request.session_id is not None and request.session_id.startswith("stdio-")
+
+
+def test_http_status_of_refusals(live_server: LiveServer) -> None:
+    server = make_server()
+
+    @server.middleware
+    async def refuse(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "tools/list":
+            raise ProtocolError("Not here", code=METHOD_NOT_FOUND)
+        if request.method == "tools/call":
+            raise AuthenticationError("Who are you?")
+        return await call_next()
+
+    base = live_server(server)
+    arguments = {"name": "add", "arguments": {"a": 1, "b": 1}}
+    with httpx.Client(base_url=base, timeout=10) as client:
+        listed = modern("tools/list")
+        response = client.post("/mcp", json=listed, headers=headers_for(listed))
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == METHOD_NOT_FOUND
+        call = modern("tools/call", arguments)
+        response = client.post("/mcp", json=call, headers=headers_for(call))
+        assert response.status_code == 200
+        assert response.json()["error"] == {"code": -32001, "message": "Who are you?"}
+        init = client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+        session = {**ACCEPT, "MCP-Session-Id": init.headers["mcp-session-id"]}
+        response = client.post("/mcp", json=rpc("tools/call", arguments, 2), headers=session)
+        assert response.status_code == 200
+        assert response.json()["error"]["code"] == -32001
+
+
+def test_http_initialize_refused_creates_no_session(live_server: LiveServer) -> None:
+    server = make_server()
+
+    @server.middleware
+    async def closed(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "initialize":
+            raise AuthenticationError("Closed for maintenance")
+        return await call_next()
+
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        refused = client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+        assert refused.status_code == 200
+        assert refused.json()["error"]["code"] == -32001
+        assert "mcp-session-id" not in refused.headers
+        guessed = client.post(
+            "/mcp", json=rpc("ping", msg_id=2), headers={**ACCEPT, "MCP-Session-Id": "guess"}
+        )
+        assert guessed.status_code == 404
+    assert server._transport is not None
+    assert server._transport._sessions == {}  # type: ignore[attr-defined]
+
+
+def test_http_stateless_disconnect_cancels_middleware(live_server: LiveServer) -> None:
+    server, entered, cancelled, ran = holding_server()
+    base = live_server(server)
+    call = modern("tools/call", {"name": "touch"})
+
+    def fire() -> None:
+        try:
+            with httpx.Client(base_url=base, timeout=0.5) as client:
+                client.post("/mcp", json=call, headers=headers_for(call))
+        except httpx.TimeoutException:
+            pass  # the client gives up and closes the connection
+
+    thread = threading.Thread(target=fire)
+    thread.start()
+    assert entered.wait(5)
+    thread.join(5)
+    began = time.monotonic()
+    assert cancelled.wait(2)  # noticed within the transport's poll interval
+    assert time.monotonic() - began < 1.5
+    assert ran == []
+
+
+async def test_http_session_delete_cancels_middleware(live_server: LiveServer) -> None:
+    server, entered, cancelled, ran = holding_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        init = await client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+        session = init.headers["mcp-session-id"]
+        headers = {**ACCEPT, "MCP-Session-Id": session}
+        call = asyncio.create_task(
+            client.post("/mcp", json=rpc("tools/call", {"name": "touch"}, 2), headers=headers)
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        deleted = await client.delete("/mcp", headers={"MCP-Session-Id": session})
+        assert deleted.status_code == 204
+        assert (await asyncio.wait_for(call, 5)).status_code == 202  # no response, per MCP
+    assert await asyncio.to_thread(cancelled.wait, 2)
+    assert ran == []
+
+
+def test_sse_stream_close_cancels_middleware(live_server: LiveServer) -> None:
+    server, entered, cancelled, ran = holding_server()
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        with client.stream("GET", "/sse") as stream:
+            lines = stream.iter_lines()  # kept: a dropped iterator closes the stream
+            endpoint = next_data(lines)
+            posted = client.post(endpoint, json=rpc("tools/call", {"name": "touch"}))
+            assert posted.status_code == 202
+            assert entered.wait(5)
+        # Leaving the block closed the stream.
+    assert cancelled.wait(5)
+    assert ran == []
+
+
+async def test_stdio_shutdown_cancels_middleware() -> None:
+    server = make_server()
+    entered = asyncio.Event()
+    cleaned: list[str] = []
+
+    @server.middleware
+    async def hold(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "tools/call":
+            entered.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                await asyncio.sleep(0.01)  # cleanup that awaits, briefly
+                cleaned.append("finally")
+        return await call_next()
+
+    read_end, write_end = os.pipe()
+    stdin = os.fdopen(read_end, "rb")
+    writer = os.fdopen(write_end, "wb")
+    transport = StdioTransport(server, stdin=stdin, stdout=io.BytesIO(), shutdown_timeout=0.2)
+    serving = asyncio.create_task(transport.serve())
+    try:
+        call = rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 1}})
+        writer.write(json.dumps(call).encode() + b"\n")
+        writer.flush()
+        await asyncio.wait_for(entered.wait(), 5)
+        writer.close()  # EOF: the held request is cancelled after shutdown_timeout
+        await asyncio.wait_for(serving, 5)
+        assert cleaned == ["finally"]  # before serve() returned
+    finally:
+        if not writer.closed:
+            writer.close()
+        stdin.close()
+
+
+async def test_stdio_serves_both_eras_to_middleware() -> None:
+    server = make_server()
+    kept: list[tuple[Any, ...]] = []
+
+    @server.middleware
+    async def keep(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        session = request.session_id
+        kept.append(
+            (
+                request.method,
+                request.stateless,
+                session.startswith("stdio-") if session else None,
+                request.protocol_version,
+                request.transport.name,
+            )
+        )
+        return await call_next()
+
+    lines = [
+        modern("server/discover", msg_id=1),
+        modern("tools/call", {"name": "add", "arguments": {"a": 1, "b": 1}}, msg_id=2),
+        rpc("initialize", {"protocolVersion": "2025-11-25"}, msg_id=3),
+        rpc("tools/list", msg_id=4),
+    ]
+    stdin = io.BytesIO(b"".join(json.dumps(m).encode() + b"\n" for m in lines))
+    stdout = io.BytesIO()
+    await StdioTransport(server, stdin=stdin, stdout=stdout).serve()
+    responses = {r["id"]: r for r in map(json.loads, stdout.getvalue().splitlines())}
+    assert responses[2]["result"]["content"][0]["text"] == "2"
+    assert sorted(kept, key=str) == sorted(
+        [
+            ("server/discover", True, None, "2026-07-28", "stdio"),
+            ("tools/call", True, None, "2026-07-28", "stdio"),
+            ("initialize", False, True, "2025-11-25", "stdio"),
+            ("tools/list", False, True, "2025-11-25", "stdio"),
+        ],
+        key=str,
+    )

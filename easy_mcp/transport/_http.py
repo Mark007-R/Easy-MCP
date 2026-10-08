@@ -24,6 +24,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..exceptions import FORBIDDEN, INVALID_REQUEST
 from ..logging import audit
+from ..middleware import TransportInfo
 from ..protocol import MODERN_PROTOCOL_VERSIONS
 from ..security.auth import ClientIdentity
 from .base import Transport
@@ -180,6 +181,21 @@ class BaseHTTPTransport(Transport):
             key = request.headers.get("x-api-key")
         identity: ClientIdentity | None = self._server.authenticate_key(key)
         return identity
+
+    @staticmethod
+    def _transport_info(request: Request, name: str) -> TransportInfo:
+        """How *request* arrived, for middleware; credential headers are left out."""
+        client = request.client
+        return TransportInfo(
+            name,
+            client_address=client.host if client else None,
+            client_port=client.port if client else None,
+            http_version=request.scope.get("http_version"),
+            headers=[
+                (key.decode("latin-1"), value.decode("latin-1"))
+                for key, value in request.headers.raw
+            ],
+        )
 
     async def _handle_health(self, request: Request) -> Response:
         return JSONResponse(

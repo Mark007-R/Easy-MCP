@@ -43,6 +43,7 @@ from starlette.routing import Route
 
 from ..exceptions import PARSE_ERROR, AuthenticationError, RateLimitError
 from ..logging import audit
+from ..middleware import TransportInfo
 from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport
 from .base import ClientContext
 
@@ -244,12 +245,15 @@ class SSETransport(BaseHTTPTransport):
         # travels over the SSE stream, and holding this POST open would stall
         # clients that send one message at a time (a notifications/cancelled
         # could never overtake the slow call it targets).
-        task = asyncio.create_task(self._deliver(session, message))
+        info = self._transport_info(request, "sse")
+        task = asyncio.create_task(self._deliver(session, message, info))
         session.tasks.add(task)
         task.add_done_callback(session.tasks.discard)
         return Response(status_code=202)
 
-    async def _deliver(self, session: _Session, message: Any) -> None:
-        response = await self._server.dispatch(message, session.context)
+    async def _deliver(
+        self, session: _Session, message: Any, info: TransportInfo | None = None
+    ) -> None:
+        response = await self._server.dispatch(message, session.context, transport=info)
         if response is not None:
             await session.queue.put(response)
