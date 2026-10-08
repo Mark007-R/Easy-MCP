@@ -284,6 +284,21 @@ async def test_an_answer_nested_too_deeply_to_parse_is_malformed(
         oauth.close()
     sent = [request["form"]["token"] for request in fake_as.introspection_requests]
     assert sent == ["deep-token", "good-token"]
+
+
+async def test_an_answer_nested_past_the_depth_limit_is_malformed(
+    fake_as: Any, clock: Clock, logs: LogCapture
+) -> None:
+    # Shallow enough for any parser: only the explicit depth check refuses it,
+    # so the outcome is the same on every platform.
+    deep = b'{"active": true, "x": ' + b"[" * 40 + b"]" * 40 + b"}"
+    fake_as.fail_token("deep-token", deep)
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        assert await reason(oauth, "deep-token") == "malformed"
+        assert oauth._ready()
+    finally:
+        oauth.close()
     assert logs.events("auth_unavailable") == []
 
 

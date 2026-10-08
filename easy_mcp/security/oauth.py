@@ -288,6 +288,10 @@ def _json_segment(segment: str) -> dict[str, Any]:
     value = json.loads(_b64url_bytes(segment))
     if not isinstance(value, dict):
         raise ValueError("not a JSON object")
+    # Checked here, not left to the parser's recursion limit, which differs
+    # between platforms: too deep is malformed everywhere.
+    if _fetch.nested_deeper_than(value, MAX_CLAIM_DEPTH):
+        raise ValueError("nested too deeply")
     return value
 
 

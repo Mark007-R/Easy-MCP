@@ -486,6 +486,19 @@ async def test_deeply_nested_payload_is_invalid_not_crash(fetch: FakeFetch, cloc
     assert await reason(oauth, f"{header}.{b64url(huge)}.c2ln") == "too_large"
 
 
+async def test_payload_nested_past_the_claim_depth_is_malformed(
+    fetch: FakeFetch, clock: Clock
+) -> None:
+    # Far too shallow to trouble any parser, so only the explicit depth check
+    # can refuse it, on every platform alike.
+    oauth = make(clock)
+    header = b64url({"alg": "RS256", "kid": "k1"})
+    nested = b'{"iss": "x", "a": ' + b"[" * 40 + b"]" * 40 + b"}"
+    assert await reason(oauth, f"{header}.{b64url(nested)}.c2ln") == "malformed"
+    deep_header = b'{"alg": "RS256", "x": ' + b"[" * 40 + b"]" * 40 + b"}"
+    assert await reason(oauth, f"{b64url(deep_header)}.{b64url(b'{}')}.c2ln") == "malformed"
+
+
 def nested_dict(depth: int) -> Any:
     value: Any = 1
     for _ in range(depth):
