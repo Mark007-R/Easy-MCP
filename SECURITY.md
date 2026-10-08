@@ -36,7 +36,7 @@ Consequences:
 | Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
 | JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
 | Token passthrough | Tools and middleware never receive the token (`Authorization` is withheld from middleware); `current_identity()` exposes only verified fields; the GitHub connector uses its own credential |
-| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight; once the authorization server itself fails (unreachable, `5xx`, `429`, no JSON, or `401` for this server's credentials), it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used); any other `4xx` or an oversized answer fails only the token sent, and spends a unit of its sender's budget, so no token can shut the others out |
+| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight, each with a fetch thread of its own; once the authorization server itself fails, it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used). A `401` for this server's credentials or a `429` is a failure of the server. So are no answer, a timeout, a `5xx`, and a `2xx` that is not a JSON object, but only if the endpoint also fails a check with a random token (one at a time): a filter in front of it can do any of these to one token, by dropping it or answering with a blocking page. Otherwise, as with any other `4xx` or an oversized answer, only the token sent fails, and it spends a unit of its sender's budget, so no token can shut the others out; an answer nested too deeply to parse is refused as malformed |
 | Refresh tokens, ID tokens and bound tokens used as access tokens | Introspected `token_type` must be an access token; `typ` other than `at+jwt`/`JWT` refused; `aud` must be this server; tokens with `cnf` (DPoP, mTLS) refused |
 | Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch |
 | Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
@@ -233,15 +233,21 @@ the client is untrusted, the credential in the environment is trusted.
   `403`.** The POST has already been answered `202`, so SSE clients get no
   step-up challenge.
 - **When the authorization server cannot be reached, cached signing keys stay
-  in use**, without a time limit; a key removed from its key set stops working
-  at the next successful refresh (at most an hour). A key set that arrives
-  empty, or with no key this server can use, withdraws every cached key:
-  tokens then get `503` until it publishes a usable one.
-- **With step-up, a token that lacks `required_scopes` learns whether a tool
-  it calls exists**: the `403` that asks for the required scopes also names
-  the tool's scope, so one sign-in covers the call. Such a token still comes
-  from a trusted issuer for this audience, and would learn the same after
-  one step-up; `step_up=False` keeps tools hidden.
+  in use**, without a time limit. While it answers, a key removed from its key
+  set stops working within an hour: the hourly refresh starts 5 minutes
+  early, and keys an hour old are not used again before a refresh has been
+  tried (a request waits for it). Only once a refresh has failed do they keep
+  answering while later ones are tried in the background, at most every
+  30 s. A key set that arrives empty, or with no key this server can use,
+  withdraws every cached key: tokens then get `503` until it publishes a
+  usable one.
+- **On Streamable HTTP with step-up, a token that lacks `required_scopes`
+  learns whether a tool it calls exists**: the `403` that asks for the
+  required scopes also names the tool's scope, so one sign-in covers the
+  call. Such a token still comes from a trusted issuer for this audience, and
+  would learn the same after one step-up; `step_up=False` keeps tools hidden.
+  Legacy SSE checks the credential before it reads the body, so its `403`
+  names only `required_scopes`.
 - **OAuth caches and the failed-token throttle are per process.** Each worker
   fetches its own keys and counts failures on its own; behind a proxy, all
   clients share the proxy's address for that throttle, as for anonymous rate

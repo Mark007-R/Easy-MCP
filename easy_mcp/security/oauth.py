@@ -36,6 +36,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import weakref
@@ -79,7 +80,8 @@ DEFAULT_ALGORITHMS: tuple[str, ...] = (
 # Fixed behaviour, not settings.
 LEEWAY_SECONDS = 60  # clock skew allowed on exp, nbf and iat
 MAX_TOKEN_BYTES = 16 * 1024
-KEYS_TTL_SECONDS = 3600  # key sets (and metadata) are refetched hourly
+KEYS_TTL_SECONDS = 3600  # key sets (and metadata) are not used past an hour unrefreshed
+KEY_REFRESH_AHEAD_SECONDS = 300  # the hourly refresh starts, in the background, 5 min early
 KEY_REFRESH_COOLDOWN_SECONDS = 30  # at most one key-set fetch per issuer per 30 s
 UNAVAILABLE_RETRY_SECONDS = 5  # with no keys at all, retry this often (and Retry-After)
 REQUEST_TIMEOUT_SECONDS = 5.0
@@ -91,7 +93,9 @@ INTROSPECTION_TTL_SECONDS = 60  # never past the answer's exp
 INTROSPECTION_REFUSAL_TTL_SECONDS = 10
 INTROSPECTION_CACHE_SIZE = 10_000
 MAX_INTROSPECTIONS_IN_FLIGHT = 8
-FETCH_WORKERS = 4
+# A thread for every introspection slot, plus one for the endpoint check and
+# one for discovery or a key set: a request never waits for a thread.
+FETCH_WORKERS = MAX_INTROSPECTIONS_IN_FLIGHT + 2
 
 _INSTALL_HINT = (
     "verifying JWT access tokens needs the [oauth] extra:\n"
@@ -456,6 +460,9 @@ class _IssuerState:
     keys_at: float = 0.0
     attempted_at: float | None = None  # last key-set fetch, successful or not
     attempts: int = 0
+    # The last key-set fetch to finish failed: keys past their hour then keep
+    # answering while the next fetches run in the background.
+    refresh_failed: bool = False
     warned_at: float | None = None
     # Introspection mode: after a failed discovery or introspection request,
     # nothing is sent to the authorization server before this time.
@@ -478,6 +485,7 @@ class _LoopState:
     refreshes: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     discoveries: dict[str, asyncio.Task[str]] = field(default_factory=dict)
     introspections: dict[str, asyncio.Future[ClientIdentity]] = field(default_factory=dict)
+    endpoint_checks: dict[str, asyncio.Task[bool]] = field(default_factory=dict)
     slots: asyncio.Semaphore | None = None
     slot_users: int = 0
 
@@ -1042,7 +1050,7 @@ class OAuthResourceServer:
             return (
                 state.attempted_at is None or now - state.attempted_at >= UNAVAILABLE_RETRY_SECONDS
             )
-        if unknown_kid or now - state.keys_at >= KEYS_TTL_SECONDS:
+        if unknown_kid or now - state.keys_at >= KEYS_TTL_SECONDS - KEY_REFRESH_AHEAD_SECONDS:
             return (
                 state.attempted_at is None
                 or now - state.attempted_at >= KEY_REFRESH_COOLDOWN_SECONDS
@@ -1054,12 +1062,17 @@ class OAuthResourceServer:
     ) -> tuple[_Key, ...]:
         """The issuer's keys: cached, or fetched (one fetch at a time per issuer and loop).
 
-        A refresh that is merely due (the hourly one) runs in the background
-        while the cached keys keep answering, so a slow or silent
-        authorization server holds up no request.  Only a request that
-        cannot go on without it waits for a fetch: one with no keys cached,
-        or with a token naming a key the cache lacks.  Such a request also
-        waits for a fetch already running, which the cooldown would not let
+        The hourly refresh starts ``KEY_REFRESH_AHEAD_SECONDS`` early and runs
+        in the background while the cached keys keep answering, so on a busy
+        server no request waits for it.  A request waits for a fetch only
+        when it cannot go on without one: no keys are cached, its token
+        names a key the cache lacks, or the cached keys are an hour old (the
+        server was idle, or the refresh has not finished), so a key the
+        authorization server withdrew stops working within the hour.  Once a
+        refresh has failed, keys past their hour keep answering while the
+        next ones run in the background, so a silent authorization server
+        holds up requests once, not every 30 s.  A request that needs a fetch
+        also waits for one already running, which the cooldown would not let
         it start.
 
         Raises:
@@ -1068,8 +1081,14 @@ class OAuthResourceServer:
         """
         with self._lock:
             keys = state.keys
-            wanted = self._wants_fetch(state, unknown_kid, self._clock())
-        needed = keys is None or unknown_kid
+            now = self._clock()
+            wanted = self._wants_fetch(state, unknown_kid, now)
+            expired = (
+                keys is not None
+                and now - state.keys_at >= KEYS_TTL_SECONDS
+                and not state.refresh_failed
+            )
+        needed = keys is None or unknown_kid or expired
         if wanted or needed:
             refreshes = self._loop_state().refreshes
             task = refreshes.get(state.issuer)
@@ -1095,19 +1114,33 @@ class OAuthResourceServer:
 
         A fetch that fails keeps the cached keys.  A key set that arrives
         with no usable key withdraws them: the authorization server answered,
-        and every key it no longer publishes must stop working.
+        and every key it no longer publishes must stop working.  A fetch cut
+        short because its event loop is closing (``asyncio.run()`` returning,
+        say) learnt nothing: the next request may try again at once.
         """
         now = self._clock()
         with self._lock:
             state.attempted_at = now
             state.attempts += 1
+            attempt = state.attempts
             stale = state.keys is not None
         stage = "metadata"
         try:
             jwks_uri = await self._find_jwks_uri(state, now)
             stage = "keys"
             document = await self._get_json(jwks_uri, MAX_DOCUMENT_BYTES)
+        except asyncio.CancelledError:
+            # Nothing learnt: the next request may try again at once and, past
+            # the hour, waits for that fetch (a loop that closes after every
+            # verify() would otherwise never see one finish).
+            with self._lock:
+                if state.attempts == attempt:  # no other fetch started since
+                    state.attempted_at = None
+                    state.refresh_failed = False
+            raise
         except (_fetch.FetchError, AuthServerUnavailableError) as exc:
+            with self._lock:
+                state.refresh_failed = True
             if stale:
                 with self._lock:
                     warn = state.warned_at is None or now - state.warned_at >= KEYS_TTL_SECONDS
@@ -1129,6 +1162,7 @@ class OAuthResourceServer:
             with self._lock:
                 state.keys = None
                 state.keys_at = now
+                state.refresh_failed = False
                 state.warned_at = None
             logger.error(
                 "no usable signing keys for %s (keys): the key set at %s holds no usable key",
@@ -1140,6 +1174,7 @@ class OAuthResourceServer:
         with self._lock:
             state.keys = keys
             state.keys_at = now
+            state.refresh_failed = False
             state.warned_at = None
         logger.debug(
             "jwks_refreshed: %d key(s) for %s",
@@ -1153,7 +1188,11 @@ class OAuthResourceServer:
             return self._configured_jwks_uri
         with self._lock:
             known = state.jwks_uri
-            fresh = state.metadata_at is not None and now - state.metadata_at < KEYS_TTL_SECONDS
+            # Refreshed with the hourly key set, which starts ahead of the hour.
+            fresh = (
+                state.metadata_at is not None
+                and now - state.metadata_at < KEYS_TTL_SECONDS - KEY_REFRESH_AHEAD_SECONDS
+            )
         if known is not None and fresh:
             return known
         metadata = await self._discover(state.issuer)
@@ -1326,37 +1365,49 @@ class OAuthResourceServer:
         # Shielded: a cancelled waiter must not stop the others' answer.
         return await asyncio.shield(pending)
 
+    async def _post_introspection(self, endpoint: str, token: str) -> dict[str, Any]:
+        introspection = self._introspection
+        assert introspection is not None
+        return await _fetch.post_form_json(
+            endpoint,
+            {"token": token, "token_type_hint": "access_token"},
+            auth=(introspection.client_id, introspection.client_secret),
+            max_bytes=MAX_INTROSPECTION_BYTES,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            executor=self._get_executor(),
+        )
+
     async def _introspect_once(
         self, token: str, digest: str, loop_state: _LoopState
     ) -> ClientIdentity:
-        introspection = self._introspection
-        assert introspection is not None
         state = self._states[self._issuers[0]]
         self._check_available(state)
         # Before taking a slot: the slots bound introspection requests only,
         # and one discovery serves every token.
         endpoint = await self._introspection_endpoint(state)
+        answer: dict[str, Any] | None = None
+        failure: _fetch.FetchError | None = None
         async with loop_state.introspection_slot():
             # An outage found while this waited for its slot: no request.
             self._check_available(state)
             try:
-                answer = await _fetch.post_form_json(
-                    endpoint,
-                    {"token": token, "token_type_hint": "access_token"},
-                    auth=(introspection.client_id, introspection.client_secret),
-                    max_bytes=MAX_INTROSPECTION_BYTES,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                    executor=self._get_executor(),
-                )
+                answer = await self._post_introspection(endpoint, token)
             except _fetch.FetchError as exc:
-                self._introspection_failed(state, endpoint, exc)
-                raise AuthServerUnavailableError(
-                    issuer=state.issuer, stage="introspection", sent_request=True
-                ) from None
+                failure = exc
+        if failure is not None and not failure.malformed:
+            # Outside the slot: telling the server's failure from this token's
+            # may take a request of its own.
+            await self._introspection_failed(state, endpoint, failure, loop_state)
+            raise AuthServerUnavailableError(
+                issuer=state.issuer, stage="introspection", sent_request=not failure.queued
+            )
         with self._lock:
             state.failing = False
         now = self._clock()
         try:
+            if answer is None:
+                # JSON nested too deeply to parse: this token's answer, malformed.
+                raise InvalidTokenError("malformed", issuer=state.issuer)
             identity = self._identity_from_introspection(answer, state.issuer, now)
         except InvalidTokenError as exc:
             self._remember(digest, now + INTROSPECTION_REFUSAL_TTL_SECONDS, exc.reason)
@@ -1367,21 +1418,40 @@ class OAuthResourceServer:
         self._remember(digest, until, identity)
         return identity
 
-    def _introspection_failed(
-        self, state: _IssuerState, endpoint: str, exc: _fetch.FetchError
+    async def _introspection_failed(
+        self,
+        state: _IssuerState,
+        endpoint: str,
+        exc: _fetch.FetchError,
+        loop_state: _LoopState,
     ) -> None:
         """Log a failed introspection request; open the outage window if the server is down.
 
-        It is down when it could not be reached, timed out, answered ``5xx``,
-        ``429`` or no JSON, or refused this server's client credentials
-        (``401``): then nothing is sent for ``UNAVAILABLE_RETRY_SECONDS``, and
-        the failure is logged and audited once per window.  Any other ``4xx``,
-        or an answer over the size cap, is about the token sent (a filter in
-        front of the endpoint matching it, a size limit): only that request
-        fails, so no token can shut the others out.
+        The token sent can make its own request fail: a filter in front of
+        the endpoint that matches it may refuse it (``4xx``), answer it with
+        a page that is no JSON (``200`` included), drop it or reset the
+        connection, or a proxy may answer ``5xx``.  So only a ``401`` (this
+        server's client credentials refused) or a ``429`` shows the server
+        down by itself.  When the endpoint could not be reached, timed out,
+        answered ``5xx``, or answered ``2xx`` with no JSON object, it is asked
+        about a token of no account (:meth:`_endpoint_answers`): the server is
+        down only if that fails too.  Any other ``4xx``, an answer over the
+        size cap, or a request that never got a fetch thread fails only the
+        token sent, so no token can shut the others out.
+
+        When the server is down, nothing is sent to it for
+        ``UNAVAILABLE_RETRY_SECONDS``, and the failure is logged and audited
+        once per window.
         """
         status = exc.status
-        down = not exc.too_large and (status is None or status >= 500 or status in (401, 429))
+        if exc.queued or exc.too_large:
+            down = False
+        elif status in (401, 429):
+            down = True
+        elif status is None or status >= 500 or 200 <= status < 300:
+            down = not await self._endpoint_answers(state, endpoint, loop_state)
+        else:
+            down = False
         if not down:
             logger.error("token introspection failed: %s", exc)
             audit("auth_unavailable", issuer=state.issuer, stage="introspection")
@@ -1400,6 +1470,39 @@ class OAuthResourceServer:
         else:
             logger.error("token introspection failed: %s", exc)
         audit("auth_unavailable", issuer=state.issuer, stage="introspection")
+
+    async def _endpoint_answers(
+        self, state: _IssuerState, endpoint: str, loop_state: _LoopState
+    ) -> bool:
+        """Whether the introspection endpoint answers a token of no account.
+
+        Asked after a request failed in a way one token can cause.  One such
+        request runs at a time per issuer and loop, shared by every failure
+        waiting on it, outside the introspection slots; none is sent while
+        an outage window is open.
+        """
+        with self._lock:
+            if self._clock() < state.unavailable_until:
+                return False
+        checks = loop_state.endpoint_checks
+        task = checks.get(state.issuer)
+        if task is None or task.done():
+            task = checks[state.issuer] = asyncio.ensure_future(
+                self._check_endpoint(state, endpoint)
+            )
+            _forget_when_done(checks, state.issuer, task)
+        # Shielded: the check serves every failure waiting on it.
+        return await asyncio.shield(task)
+
+    async def _check_endpoint(self, state: _IssuerState, endpoint: str) -> bool:
+        try:
+            # A random token: a working endpoint answers {"active": false}.
+            await self._post_introspection(endpoint, secrets.token_urlsafe(32))
+        except _fetch.FetchError:
+            return False
+        with self._lock:
+            state.failing = False
+        return True
 
     def _identity_from_introspection(
         self, answer: Mapping[str, Any], issuer: str, now: float

@@ -19,6 +19,7 @@ import json
 import math
 import pickle
 import threading
+import time
 import weakref
 from collections import Counter
 from collections.abc import Iterator
@@ -37,7 +38,12 @@ from easy_mcp import (
     OAuthResourceServer,
 )
 from easy_mcp.security import _fetch
-from easy_mcp.security.oauth import principal_fingerprint
+from easy_mcp.security.oauth import (
+    KEY_REFRESH_AHEAD_SECONDS,
+    KEYS_TTL_SECONDS,
+    MAX_CLAIM_DEPTH,
+    principal_fingerprint,
+)
 
 ISSUER = "https://auth.example.com"
 RESOURCE = "https://mcp.example.com/mcp"
@@ -496,6 +502,20 @@ async def test_deeply_nested_signed_claims_are_malformed_not_a_crash(
     assert claims["x"] == ((((((((((1,),),),),),),),),),)
 
 
+async def test_claims_nested_32_levels_deep_are_the_limit(
+    fetch: FakeFetch, clock: Clock, rsa: SigningKey
+) -> None:
+    # The claims object is level 1: MAX_CLAIM_DEPTH levels in all are kept,
+    # one more is refused, far below any recursion limit.
+    assert MAX_CLAIM_DEPTH == 32  # what the CHANGELOG promises
+    oauth = make(clock)
+    for nest in (nested_dict, nested_list):
+        within = mint(rsa, clock, claims={"x": nest(MAX_CLAIM_DEPTH - 1)})
+        assert (await oauth.verify(within)).subject == "user-1", nest.__name__
+        beyond = mint(rsa, clock, claims={"x": nest(MAX_CLAIM_DEPTH)})
+        assert await reason(oauth, beyond) == "malformed", nest.__name__
+
+
 async def test_decode_gets_fresh_options_each_call(
     monkeypatch: pytest.MonkeyPatch, fetch: FakeFetch, clock: Clock, rsa: SigningKey
 ) -> None:
@@ -555,10 +575,11 @@ async def test_kid_spray_bounded_by_cooldown(
 async def test_keys_refresh_after_ttl(fetch: FakeFetch, clock: Clock, rsa: SigningKey) -> None:
     oauth = make(clock)
     await oauth.verify(mint(rsa, clock))
-    clock.now += 3599
+    clock.now += KEYS_TTL_SECONDS - KEY_REFRESH_AHEAD_SECONDS - 1
     await oauth.verify(mint(rsa, clock))
+    await settle(oauth)
     assert fetch.key_fetches == 1
-    clock.now += 2
+    clock.now += 2  # the hourly refresh starts ahead of the hour
     await oauth.verify(mint(rsa, clock))
     await settle(oauth)
     assert fetch.key_fetches == 2
@@ -571,8 +592,8 @@ async def test_due_refresh_does_not_hold_up_verification(
     oauth = make(clock)
     await oauth.verify(mint(rsa, clock))
     fetch.delay = 0.5  # an authorization server that answers slowly, or not at all
-    clock.now += 3601
-    # The cached keys answer at once; the refresh runs behind them.
+    clock.now += KEYS_TTL_SECONDS - KEY_REFRESH_AHEAD_SECONDS + 1
+    # The cached keys answer at once; the refresh runs behind them, ahead of the hour.
     identity = await asyncio.wait_for(oauth.verify(mint(rsa, clock)), 0.25)
     assert identity.subject == "user-1"
     # A token naming a key the cache lacks waits for that refresh, and
@@ -583,6 +604,31 @@ async def test_due_refresh_does_not_hold_up_verification(
     assert fetch.key_fetches == 2
     await settle(oauth)
     assert fetch.key_fetches == 2
+
+
+async def test_a_withdrawn_key_stops_working_once_the_keys_are_an_hour_old(
+    fetch: FakeFetch, clock: Clock, rsa: SigningKey, rsa_key_2: Any
+) -> None:
+    # Keys an hour old are not trusted again before a refresh has been
+    # tried, however slow the authorization server: requests wait for it.
+    other = SigningKey("k2", "RS256", rsa_key_2)
+    fetch.keys = [rsa, other]
+    oauth = make(clock)
+    await oauth.verify(mint(rsa, clock))
+    fetch.keys = [other]  # k1 withdrawn
+    fetch.delay = 0.2
+    for idle in (KEYS_TTL_SECONDS + 1, 2 * 24 * 3600):
+        clock.now += idle
+        withdrawn, kept = await asyncio.gather(
+            reason(oauth, mint(rsa, clock)), oauth.verify(mint(other, clock))
+        )
+        assert withdrawn == "unknown_key"
+        assert kept.subject == "user-1"
+        fetch.keys = [rsa, other]  # k1 back, then withdrawn again
+        clock.now += 31
+        assert (await oauth.verify(mint(rsa, clock))).subject == "user-1"
+        fetch.keys = [other]
+    assert fetch.key_fetches == 5
 
 
 async def test_a_request_arriving_during_the_first_fetch_waits_for_it(
@@ -631,6 +677,14 @@ async def test_stale_keys_used_when_refresh_fails(
         await oauth.verify(mint(rsa, clock))
     assert fetch.total == attempts
     assert logs.text.count("jwks_refresh_failed") == 1
+    # Once a refresh has failed, keys past their hour answer at once while
+    # the next one runs behind them: a silent server holds requests up once.
+    fetch.delay = 0.5
+    clock.now += 31
+    assert (await asyncio.wait_for(oauth.verify(mint(rsa, clock)), 0.25)).subject == "user-1"
+    await settle(oauth)
+    assert fetch.total > attempts
+    assert logs.text.count("jwks_refresh_failed") == 1
 
 
 async def test_a_key_set_without_usable_keys_withdraws_the_cached_ones(
@@ -649,7 +703,7 @@ async def test_a_key_set_without_usable_keys_withdraws_the_cached_ones(
     ]
     for round_, raw_keys in enumerate(unusable, start=1):
         fetch.raw_keys = raw_keys
-        clock.now += 3601
+        clock.now += KEYS_TTL_SECONDS - KEY_REFRESH_AHEAD_SECONDS + 1
         await oauth.verify(mint(rsa, clock))  # answered while the refresh runs
         await settle(oauth)
         with pytest.raises(AuthServerUnavailableError):
@@ -757,6 +811,7 @@ async def test_fetch_refuses_redirects_oversize_and_plain_http(fake_as: Any) -> 
         with pytest.raises(_fetch.FetchError, match="JSON") as not_json:
             await fetch(f"{fake_as.issuer}/jwks")
         assert not not_json.value.too_large
+        assert not_json.value.status == 200  # the server answered: not an unreachable one
         fake_as.fail("jwks", 500)
         with pytest.raises(_fetch.FetchError) as failed:
             await fetch(f"{fake_as.issuer}/jwks")
@@ -786,6 +841,93 @@ async def test_fetch_times_out(fake_as: Any) -> None:
             )
     finally:
         executor.shutdown(wait=False)
+
+
+async def test_fetch_deadline_starts_when_a_thread_runs_it() -> None:
+    # Waiting for a free thread is not part of the exchange: work queued
+    # behind a slow fetch gets its whole deadline once a thread runs it.
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    def slow() -> dict[str, Any]:
+        time.sleep(0.6)
+        return {"ok": True}
+
+    try:
+        # timeout=0: each deadline is 1 s; the second fetch ends 1.2 s in.
+        results = await asyncio.gather(
+            _fetch._run(executor, 0.0, slow), _fetch._run(executor, 0.0, slow)
+        )
+        assert results == [{"ok": True}, {"ok": True}]
+    finally:
+        executor.shutdown(wait=False)
+
+
+async def test_a_fetch_that_never_gets_a_thread_sends_nothing() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    release = threading.Event()
+    ran: list[str] = []
+
+    def blocking() -> dict[str, Any]:
+        release.wait(10)
+        return {}
+
+    def queued() -> dict[str, Any]:
+        ran.append("queued")
+        return {}
+
+    try:
+        first = asyncio.ensure_future(_fetch._run(executor, 5.0, blocking))
+        await asyncio.sleep(0.05)  # it holds the only thread
+        with pytest.raises(_fetch.FetchError) as caught:
+            await _fetch._run(executor, 0.0, queued)
+        assert caught.value.queued
+        assert caught.value.status is None
+        release.set()
+        assert await first == {}
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+    assert ran == []  # given up before a thread was free: never sent
+
+
+def test_a_refresh_cut_short_by_its_loop_closing_is_tried_again(
+    fake_as: Any, rsa_key_2: Any
+) -> None:
+    # verify() from sync code, one asyncio.run() per call: each loop closes
+    # once verify() returns, cancelling a background refresh mid-fetch.  The
+    # next call may try again at once and, past the hour, waits for it, so a
+    # key the issuer withdrew stops working.
+    clock = Clock()
+    oauth = OAuthResourceServer(RESOURCE, [fake_as.issuer], clock=clock)
+    first = fake_as.keys[0]
+    second = SigningKey("k2", "RS256", rsa_key_2)
+    fake_as.set_keys([first, second])
+
+    async def verify_and_leave(token: str) -> str | None:
+        identity = await oauth.verify(token)
+        await asyncio.sleep(0.05)  # a background refresh is under way as the loop closes
+        return identity.subject
+
+    def outcome(key: SigningKey) -> str | None:
+        try:
+            return asyncio.run(verify_and_leave(fake_as.mint(key, now=clock.now)))
+        except InvalidTokenError as exc:
+            return exc.reason
+
+    try:
+        assert outcome(first) == "user-1"
+        fake_as.rotate(second)  # k1 withdrawn
+        fake_as.delays["jwks"] = 1.0
+        clock.now += KEYS_TTL_SECONDS - 10
+        assert outcome(first) == "user-1"  # still within the hour
+        fake_as.delays.clear()
+        clock.now += 15  # past the hour, within the cooldown of the attempt cut short
+        assert outcome(first) == "unknown_key"
+        assert outcome(second) == "user-1"
+        keys = oauth._states[fake_as.issuer].keys or ()
+        assert [key.kid for key in keys] == ["k2"]
+    finally:
+        oauth.close()
 
 
 async def test_concurrent_verifications_single_flight(

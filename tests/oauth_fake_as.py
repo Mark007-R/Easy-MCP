@@ -8,7 +8,7 @@ runs a minimal authorization-code flow: ``/authorize`` approves at once
 (PKCE S256 required, ``resource`` honoured) and ``/token`` issues signed JWTs.
 
 Everything is controlled from the test: ``rotate()``, ``set_keys()``,
-``fail(route, mode)``, ``fail_token(token, status)``, ``delays``,
+``fail(route, mode)``, ``fail_token(token, mode)``, ``delays``,
 ``set_introspection(token, answer)``, ``counters``.
 Keys are generated in the test process; nothing leaves the machine.
 """
@@ -150,9 +150,13 @@ class FakeAuthorizationServer:
     def heal(self) -> None:
         self.failures.clear()
 
-    def fail_token(self, token: str, status: int) -> None:
-        """Answer the introspection of *token* alone with HTTP *status*."""
-        self.token_failures[token_hash(token)] = status
+    def fail_token(self, token: str, mode: Any) -> None:
+        """Answer the introspection of *token* alone with *mode*.
+
+        An HTTP status; "timeout" (stall); "not_json" (``200`` with an HTML
+        page, as many WAFs block); or bytes, sent as a ``200`` JSON body as is.
+        """
+        self.token_failures[token_hash(token)] = mode
 
     def set_introspection(self, token: str, answer: Mapping[str, Any]) -> None:
         self.introspection[token_hash(token)] = dict(answer)
@@ -225,9 +229,16 @@ class FakeAuthorizationServer:
         failed = await self._failure("introspect")
         if failed is not None:
             return failed
-        status = self.token_failures.get(token_hash(str(form.get("token", ""))))
-        if status is not None:
-            return JSONResponse({"error": "blocked"}, status_code=status)
+        mode = self.token_failures.get(token_hash(str(form.get("token", ""))))
+        if mode == "timeout":
+            await asyncio.sleep(self.stall_seconds)
+            return Response(status_code=504)
+        if mode == "not_json":
+            return Response(b"<html>Request rejected</html>", media_type="text/html")
+        if isinstance(mode, bytes):
+            return Response(mode, media_type="application/json")
+        if mode is not None:
+            return JSONResponse({"error": "blocked"}, status_code=int(mode))
         expected = "Basic " + base64.b64encode(
             f"{quote_plus(CLIENT_ID)}:{quote_plus(CLIENT_SECRET)}".encode()
         ).decode("ascii")

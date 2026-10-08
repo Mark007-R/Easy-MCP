@@ -370,7 +370,11 @@ What clients see:
   scopes after it. A signed-in caller sees every tool. Calling one their token
   does not cover gets `403 insufficient_scope` naming the scope to ask for
   (with `required_scopes` too, if the token also lacks them), and the client
-  asks the user for it; the broader token works at once, in the same session. Pass `step_up=False` to keep protected tools invisible to
+  asks the user for it; the broader token works at once, in the same session.
+  Over legacy SSE the call is answered on the stream instead, with a `-32001`
+  JSON-RPC error whose `data.error` is `"insufficient_scope"`, and the SSE
+  `403` (sent before the body is read) names only `required_scopes`.
+  Pass `step_up=False` to keep protected tools invisible to
   tokens that cannot call them, as with API keys. A token's `*` scope is never
   a wildcard.
 - Inside a tool, `current_identity()` tells you who is calling: `subject`,
@@ -392,17 +396,21 @@ Good to know:
 - `server/discover` needs a token too (its `401` is what starts sign-in), but
   its answer is the same for everyone and stays `cacheScope: "public"`. Write
   `instructions` as public text: never put secrets in them.
-- Signing keys are fetched at startup and refreshed hourly in the background,
-  and when a token names a key the server has not seen, at most once every
-  30 s. If the authorization server cannot be reached, the keys already
-  fetched stay in use; with none fetched yet (or a key set that holds no
-  usable key), token requests get `503` and `Retry-After: 5`, and `/healthz`
-  reports `"oauth": "unavailable"`. With introspection, once the
-  authorization server fails a discovery or introspection request it is not
-  asked again for 5 s: tokens without a cached answer get `503` at once
-  meanwhile, and `/healthz` reports `"unavailable"` until a request to it
-  succeeds. A `4xx` for one token (other than `401` or `429`) fails only that
-  token.
+- Signing keys are fetched at startup and refreshed hourly, in the background
+  from 5 minutes before the hour, and when a token names a key the server has
+  not seen, at most once every 30 s. Keys an hour old are not used again
+  before a refresh has been tried (an idle server's next request waits for
+  it), so a withdrawn key stops working within the hour. If the authorization
+  server cannot be reached, the keys already fetched stay in use; with none
+  fetched yet (or a key set that holds no usable key), token requests get
+  `503` and `Retry-After: 5`, and `/healthz` reports `"oauth": "unavailable"`.
+  With introspection, once the authorization server fails a discovery or
+  introspection request it is not asked again for 5 s: tokens without a
+  cached answer get `503` at once meanwhile, and `/healthz` reports
+  `"unavailable"` until a request to it succeeds. A failure one token can
+  cause (a `4xx` other than `401` or `429`; or no answer, a timeout, a `5xx`
+  or a `2xx` that is no JSON object while the endpoint still answers a check
+  with a random token) fails only that token.
 - Token checks are limited per client address with the server's
   `rate_limit_per_minute`: each failed check spends one unit and each check
   still running holds one, so past it presented credentials get `429`
@@ -624,7 +632,7 @@ caller.
 | Middleware raises `ToolError` | `isError: true` with your message verbatim (`-32603` with the message outside `tools/call`) |
 | Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run if it failed before `call_next()` |
 | No token, or an invalid or expired one (OAuth) | HTTP `401`, `-32001`, with `WWW-Authenticate: Bearer ...` |
-| Token lacks a required or a tool's scope (OAuth) | HTTP `403`, `-32001` with `data.error = "insufficient_scope"` and the scope to ask for |
+| Token lacks a required or a tool's scope (OAuth) | HTTP `403`, `-32001` with `data.error = "insufficient_scope"` and the scope to ask for; over legacy SSE a missing tool scope arrives on the stream as that `-32001` error, not a `403` |
 | Authorization server unreachable (OAuth) | HTTP `503`, `-32008` with `data.reason = "auth_server_unavailable"`; retry |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The

@@ -761,6 +761,30 @@ def test_a_refused_token_opens_no_outage_and_is_throttled(
     assert "introspection_credentials_rejected" not in logs.text
 
 
+def test_a_token_a_filter_answers_with_a_page_opens_no_outage(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    # A WAF in front of the introspection endpoint answers one token with its
+    # blocking page: HTTP 200, HTML.  Users who sign in next are still let in.
+    hostile = "../../../../etc/passwd"
+    fake_as.fail_token(hostile, "not_json")
+    for name in ("alice", "bob", "carol"):
+        fake_as.set_introspection(
+            f"{name}-token",
+            {"active": True, "aud": OAUTH_RESOURCE, "sub": name, "scope": "mcp:access"},
+        )
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    base = live_server(make_server(fake_as, introspection=introspection))
+    with httpx.Client(base_url=base, timeout=10) as client:
+        assert stateless(client, modern("tools/list"), bearer("alice-token")).status_code == 200
+        refused = stateless(client, modern("tools/list"), bearer(hostile))
+        assert refused.status_code == 503
+        for name in ("bob", "carol"):
+            response = stateless(client, modern("tools/list"), bearer(f"{name}-token"))
+            assert response.status_code == 200, name
+        assert client.get("/healthz").json()["oauth"] == "ok"
+
+
 def test_healthz_reports_a_failing_introspection_endpoint(
     live_server: LiveServer, fake_as: FakeAuthorizationServer
 ) -> None:
@@ -847,6 +871,29 @@ def test_legacy_sse_with_oauth(served: Any, fake_as: FakeAuthorizationServer) ->
             written = client.post(endpoint, json=call("write_file", 6, path="a"), headers=refreshed)
             assert written.status_code == 202
             assert json.loads(next_data(lines))["result"]["content"][0]["text"] == "wrote a"
+
+
+def test_legacy_sse_door_403_asks_only_for_the_required_scopes(
+    served: Any, fake_as: FakeAuthorizationServer
+) -> None:
+    # Streamable HTTP reads the call before its door check, so its 403 also
+    # names the tool's scope.  Legacy SSE checks the credential before it
+    # reads the body: its 403 asks for required_scopes only (as the docs say).
+    base, _ = served()
+    lacking = bearer(fake_as.mint(claims={"scope": "files:read"}))
+    with httpx.Client(base_url=base, timeout=10) as client:
+        modern_door = stateless(client, modern_call("write_file", path="a"), lacking)
+        assert modern_door.status_code == 403
+        assert 'scope="mcp:access files:write"' in challenge(modern_door)
+        signed_in = bearer(fake_as.mint(claims={"scope": "mcp:access files:read"}))
+        with client.stream("GET", "/sse", headers=signed_in) as stream:
+            lines = stream.iter_lines()  # kept: dropping it would close the stream
+            endpoint = next_data(lines)
+            door = client.post(endpoint, json=call("write_file", 5, path="a"), headers=lacking)
+            assert door.status_code == 403
+            assert 'error="insufficient_scope"' in challenge(door)
+            assert "files:write" not in challenge(door)
+            assert rpc_body(door)["error"]["data"]["scope"] == "mcp:access"
 
 
 # --------------------------------------------------------- the record

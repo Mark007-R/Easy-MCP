@@ -87,27 +87,41 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   a value from `audience=`. Only asymmetric algorithms are accepted. `none`,
   HMAC, keys supplied in the token's header, `crit`, encrypted tokens,
   proof-of-possession-bound tokens and claims (or introspection answers)
-  nested more than 32 levels deep are refused. Keys are refreshed hourly in
-  the background, without holding up requests, and when a token names an
-  unknown key, at most once every 30 s (that token waits for the fetch).
-  When the authorization server cannot be reached, the keys already fetched
-  stay in use; a key set that arrives with no usable key withdraws them. With
-  no keys the answer is `503` with `-32008`
-  (`data.reason: "auth_server_unavailable"`) and `Retry-After: 5`. With
-  introspection, when the authorization server fails a discovery or
-  introspection request (unreachable, timed out, `5xx`, `429`, no JSON, or
-  `401` for this server's credentials), it is not asked again for 5 s:
+  nested more than 32 levels deep are refused. Keys are refreshed hourly, in
+  the background from 5 minutes before the hour so that a busy server holds
+  up no request, and when a token names an unknown key, at most once every
+  30 s (that token waits for the fetch). Keys an hour old are not used again
+  before a refresh has been tried (a request waits for it), so a key the
+  authorization server withdraws stops working within the hour. When the
+  authorization server cannot be reached, the keys already fetched stay in
+  use, and after one failed refresh they answer without waiting; a key set
+  that arrives with no usable key withdraws them. With no keys the answer is
+  `503` with `-32008` (`data.reason: "auth_server_unavailable"`) and
+  `Retry-After: 5`. With introspection, when the authorization server fails
+  a discovery or introspection request, it is not asked again for 5 s:
   meanwhile tokens without a cached answer get that `503` at once, and the
-  failure is logged once. Any other `4xx`, or an answer over 64 KiB, fails
-  that token alone (`503`, charged to the sender's failed-token budget).
+  failure is logged once. An introspection request shows the server failing
+  when it gets `401` (this server's credentials) or `429`, or when it gets
+  no answer, times out, or gets `5xx` or a `2xx` that is not a JSON object
+  and a check with a random token fails too. Otherwise, as with any other
+  `4xx` or an answer over 64 KiB, that token alone fails (`503`, charged to
+  the sender's failed-token budget), so a token that a filter in front of
+  the endpoint blocks or drops cannot shut the others out. An answer nested
+  too deeply to parse is refused as malformed (`401`, cached). Each of the 8
+  introspection requests in flight gets a fetch thread at once, so a slow
+  but working authorization server is not taken for a failing one.
 
   Token scopes map onto the existing per-tool `scopes`, which are
   alternatives: list the narrowest first. A signed-in caller sees every tool,
   and a call its token does not cover gets `403 insufficient_scope` naming
   the scope to ask for (`step_up=False` keeps such tools invisible instead).
-  `required_scopes` are needed by every request; a `tools/call` whose token
-  lacks them is also asked for the tool's scope, in the same challenge. A
-  token's `*` scope is never a wildcard. The `401` and `insufficient_scope`
+  `required_scopes` are needed by every request; on Streamable HTTP a
+  `tools/call` whose token lacks them is also asked for the tool's scope, in
+  the same challenge. Legacy SSE `POST /messages` checks the credential
+  before it reads the body, so its `403` asks only for `required_scopes`; a
+  missing tool scope arrives there as a `-32001` JSON-RPC error on the
+  stream (`data.error = "insufficient_scope"`), not a `403`. A token's `*`
+  scope is never a wildcard. The `401` and `insufficient_scope`
   `403` bodies carry `-32001`, never `-32002`; a handshake-era session used
   with another principal's token still gets `403` with `-32002`, as in
   0.3.1. A token's principal is identified by a 32-hex-digit fingerprint of

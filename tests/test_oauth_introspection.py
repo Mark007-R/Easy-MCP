@@ -235,6 +235,45 @@ async def test_deeply_nested_answer_is_malformed_not_a_crash(
     assert claims["x"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"]["a"] == 1
 
 
+async def test_answers_nested_32_levels_deep_are_the_limit(
+    endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    # The answer itself is level 1: MAX_CLAIM_DEPTH levels in all are kept,
+    # one more is refused (and the refusal cached), far below any recursion limit.
+    depth = oauth_module.MAX_CLAIM_DEPTH
+    oauth = make(clock)
+    for name, nest in (("dict", nested_dict), ("list", nested_list)):
+        endpoint.answers[f"within-{name}"] = active(x=nest(depth - 1))
+        assert (await oauth.verify(f"within-{name}")).subject == "user-1", name
+        endpoint.answers[f"beyond-{name}"] = active(x=nest(depth))
+        calls = len(endpoint.calls)
+        assert await reason(oauth, f"beyond-{name}") == "malformed", name
+        assert await reason(oauth, f"beyond-{name}") == "malformed"
+        assert len(endpoint.calls) == calls + 1
+
+
+async def test_an_answer_nested_too_deeply_to_parse_is_malformed(
+    fake_as: Any, clock: Clock, logs: LogCapture
+) -> None:
+    # Valid JSON well under 64 KiB, but nested deeper than the parser can
+    # recurse: that token's answer, refused as malformed and cached, not a
+    # failure of the authorization server that shuts every other token out.
+    deep = b'{"active": true, "x": ' + b"[" * 5000 + b"]" * 5000 + b"}"
+    fake_as.fail_token("deep-token", deep)
+    fake_as.set_introspection("good-token", active(iss=fake_as.issuer))
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        assert await reason(oauth, "deep-token") == "malformed"
+        assert await reason(oauth, "deep-token") == "malformed"  # cached
+        assert (await oauth.verify("good-token")).subject == "user-1"
+        assert oauth._ready()
+    finally:
+        oauth.close()
+    sent = [request["form"]["token"] for request in fake_as.introspection_requests]
+    assert sent == ["deep-token", "good-token"]
+    assert logs.events("auth_unavailable") == []
+
+
 async def test_identity_pickles(endpoint: FakeIntrospection, clock: Clock) -> None:
     endpoint.answers[TOKEN] = active(ext={"tenant": "t1"})
     identity = await make(clock).verify(TOKEN)
@@ -386,7 +425,63 @@ async def test_a_token_the_endpoint_refuses_opens_no_outage(
     with pytest.raises(AuthServerUnavailableError) as refused:
         await oauth.verify("yet-another-token")
     assert not refused.value.sent_request
-    assert len(endpoint.calls) == 10
+    assert len(endpoint.calls) == 11  # and one check of the endpoint, which failed too
+
+
+@pytest.mark.parametrize("mode", ["not_json", "timeout", 500])
+async def test_a_failure_one_token_causes_opens_no_outage(
+    fake_as: Any, clock: Clock, logs: LogCapture, monkeypatch: pytest.MonkeyPatch, mode: Any
+) -> None:
+    # A filter in front of the endpoint answers one token with its blocking
+    # page (HTTP 200 and HTML, as many WAFs do), drops it (a timeout), or has
+    # a proxy answer 5xx.  The endpoint still answers other tokens, so that
+    # token alone fails (charged to its sender), and the others are still
+    # introspected: none is refused unasked, and /healthz stays "ok".
+    monkeypatch.setattr(oauth_module, "REQUEST_TIMEOUT_SECONDS", 0.5)
+    fake_as.stall_seconds = 1.5
+    hostile = "../../../../etc/passwd"
+    fake_as.fail_token(hostile, mode)
+    for name in ("alice", "bob", "carol"):
+        fake_as.set_introspection(f"{name}-token", active(iss=fake_as.issuer, sub=name))
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        assert (await oauth.verify("alice-token")).subject == "alice"
+        for _ in range(2):
+            with pytest.raises(AuthServerUnavailableError) as caught:
+                await oauth.verify(hostile)
+            assert caught.value.sent_request
+            assert oauth._ready()
+        for name in ("bob", "carol"):
+            assert (await oauth.verify(f"{name}-token")).subject == name
+    finally:
+        oauth.close()
+    sent = [request["form"]["token"] for request in fake_as.introspection_requests]
+    assert sent.count(hostile) == 2
+    assert {"bob-token", "carol-token"} <= set(sent)
+    assert len(logs.events("auth_unavailable")) == 2
+    assert logs.text.count("token introspection failed") == 2
+
+
+async def test_a_slow_endpoint_with_every_slot_in_use_is_no_outage(
+    fake_as: Any, clock: Clock
+) -> None:
+    # An authorization server that answers in 3.5 s, inside the 5 s timeout,
+    # with all 8 introspection slots in use: every request gets a thread at
+    # once, so none times out waiting for one and no outage window opens.
+    fake_as.delays["introspect"] = 3.5
+    tokens = [f"token-{index}" for index in range(8)]
+    for token in tokens:
+        fake_as.set_introspection(token, active(iss=fake_as.issuer, sub=token))
+    fake_as.set_introspection("later", active(iss=fake_as.issuer, sub="later"))
+    oauth = make(clock, endpoint_url=f"{fake_as.issuer}/introspect", issuer=fake_as.issuer)
+    try:
+        identities = await asyncio.gather(*(oauth.verify(token) for token in tokens))
+        assert [identity.subject for identity in identities] == tokens
+        assert oauth._ready()
+        fake_as.delays.clear()
+        assert (await oauth.verify("later")).subject == "later"
+    finally:
+        oauth.close()
 
 
 async def test_concurrent_failures_are_logged_once_per_window(
@@ -397,6 +492,8 @@ async def test_concurrent_failures_are_logged_once_per_window(
     oauth = make(clock)
     endpoint.delay = 0.05
     lines = {500: "token introspection failed", 401: "introspection_credentials_rejected"}
+    # A 5xx may be one token's doing: one check of the endpoint, shared by all.
+    checks = {500: 1, 401: 0}
     for status, line in lines.items():
         endpoint.calls.clear()
         endpoint.error = _fetch.FetchError(f"the endpoint answered HTTP {status}", status=status)
@@ -405,7 +502,7 @@ async def test_concurrent_failures_are_logged_once_per_window(
             *(oauth.verify(token) for token in tokens), return_exceptions=True
         )
         assert all(isinstance(result, AuthServerUnavailableError) for result in results)
-        assert len(endpoint.calls) == 8
+        assert len(endpoint.calls) == 8 + checks[status]
         assert logs.text.count(line) == 1, line
         clock.now += 5
     assert len(logs.events("auth_unavailable")) == 2
@@ -493,7 +590,8 @@ async def test_outage_window_bounds_introspection_calls(
             await oauth.verify(f"random-token-{index}")
         assert caught.value.stage == "introspection"
         clock.now += 0.2  # 20 requests within 4 s
-    assert len(endpoint.calls) == 2  # the cached token's, then one failed attempt
+    # The cached token's, then one failed attempt and the check of the endpoint.
+    assert len(endpoint.calls) == 3
     assert len(logs.events("auth_unavailable")) == 1
     assert logs.text.count("token introspection failed") == 1
     # Cached answers keep working meanwhile.
@@ -502,14 +600,14 @@ async def test_outage_window_bounds_introspection_calls(
     clock.now = failed_at + 5
     with pytest.raises(AuthServerUnavailableError):
         await oauth.verify("random-token-again")
-    assert len(endpoint.calls) == 3
-    # Wrong client credentials are told once per window too.
+    assert len(endpoint.calls) == 5
+    # Wrong client credentials are told once per window too (no check needed).
     endpoint.error = _fetch.FetchError("the endpoint answered HTTP 401", status=401)
     clock.now += 5
     for index in range(5):
         with pytest.raises(AuthServerUnavailableError):
             await oauth.verify(f"another-token-{index}")
-    assert len(endpoint.calls) == 4
+    assert len(endpoint.calls) == 6
     assert logs.text.count("introspection_credentials_rejected") == 1
     endpoint.error = None
     clock.now += 5

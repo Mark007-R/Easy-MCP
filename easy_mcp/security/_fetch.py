@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import functools
 import http.client
 import json
@@ -27,7 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Executor
 from typing import Any
 
@@ -42,13 +43,25 @@ _CHUNK = 65536
 class FetchError(Exception):
     """A fetch failed; ``status`` is the HTTP status when the server answered.
 
-    ``too_large`` is set when the answer was longer than the cap.
+    ``too_large`` is set when the answer was longer than the cap, and
+    ``malformed`` when it was JSON nested too deeply to parse.  ``queued`` is
+    set when no fetch thread became free in time: nothing was sent.
     """
 
-    def __init__(self, message: str, *, status: int | None = None, too_large: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        too_large: bool = False,
+        malformed: bool = False,
+        queued: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.too_large = too_large
+        self.malformed = malformed
+        self.queued = queued
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -117,6 +130,7 @@ def _exchange(
     )
     try:
         with _opener(url).open(request, timeout=timeout) as response:
+            status: int = response.status
             body = bytearray()
             # read1 returns what one read of the socket brings, so a server
             # that trickles its answer meets the deadline between reads.
@@ -143,27 +157,58 @@ def _exchange(
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         reason = getattr(exc, "reason", None) or type(exc).__name__
         raise FetchError(f"{url} unreachable: {reason}") from None
+    # The server answered: these keep its status, so a caller can tell an
+    # answer it cannot use from a server it cannot reach.
     try:
         document = json.loads(bytes(body).decode("utf-8"))
-    except Exception:  # invalid UTF-8 or JSON, or nested deep enough to recurse out
-        raise FetchError(f"{url} did not answer with JSON") from None
+    except RecursionError:  # JSON nested deeper than the parser recurses
+        raise FetchError(
+            f"{url} answered JSON nested too deeply", status=status, malformed=True
+        ) from None
+    except Exception:  # invalid UTF-8 or JSON
+        raise FetchError(f"{url} did not answer with JSON", status=status) from None
     if not isinstance(document, dict):
-        raise FetchError(f"{url} did not answer with a JSON object")
+        raise FetchError(f"{url} did not answer with a JSON object", status=status)
     return document
 
 
-async def _run(executor: Executor, timeout: float, work: Any) -> dict[str, Any]:
+def _set_started(started: asyncio.Future[None]) -> None:
+    if not started.done():
+        started.set_result(None)
+
+
+async def _run(
+    executor: Executor, timeout: float, work: Callable[[], dict[str, Any]]
+) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
+    started: asyncio.Future[None] = loop.create_future()
+
+    def run() -> dict[str, Any]:
+        with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
+            loop.call_soon_threadsafe(_set_started, started)
+        return work()
+
     try:
-        future = loop.run_in_executor(executor, work)
+        job = executor.submit(run)
     except RuntimeError:  # the executor was shut down meanwhile
         raise FetchError("the fetch threads are shut down") from None
+    future = asyncio.wrap_future(job)
     try:
+        # Waiting for a free thread is not part of the exchange: its deadline
+        # starts once a thread runs it, so a fetch queued behind slow ones is
+        # not timed out for their slowness.
+        await asyncio.wait(
+            (started, future), timeout=timeout + 1.0, return_when=asyncio.FIRST_COMPLETED
+        )
+        if job.cancel():  # still waiting for a thread: nothing was sent
+            raise FetchError(f"no fetch thread was free within {timeout + 1.0:g} s", queued=True)
         # The exchange keeps its own deadline; this one also covers what
         # urllib cannot bound, such as a name lookup that hangs.
         return await asyncio.wait_for(future, timeout + 1.0)
     except TimeoutError:
         raise FetchError("request timed out") from None
+    finally:
+        future.cancel()  # nothing once it is done; otherwise no one wants it
 
 
 async def fetch_json(
@@ -174,7 +219,9 @@ async def fetch_json(
     Raises:
         FetchError: The URL is not allowed, the server could not be reached,
             answered anything but ``2xx`` (redirects included), took longer
-            than *timeout*, sent more than *max_bytes*, or sent no JSON object.
+            than *timeout*, sent more than *max_bytes*, or sent no JSON object;
+            or no thread of *executor* became free in time to send it
+            (``queued``).
     """
     if not allowed_url(url):
         raise FetchError(f"refusing to fetch {url!r}: https, or http to a loopback host, only")
