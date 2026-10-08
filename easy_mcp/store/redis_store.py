@@ -163,7 +163,8 @@ return 0
 
 # KEYS: window   ARGV: max_requests, window_ms, nonce.  The sliding window of
 # SlidingWindowRateLimiter, in microseconds of Redis time: the same algorithm
-# and the same retry-after.
+# and the same retry-after.  A member is the time as TIME gives it (Lua would
+# print the number in exponent form) plus a nonce, so no two hits share one.
 RATE_HIT = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
@@ -173,7 +174,7 @@ if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then
   local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
   return math.max(0, tonumber(oldest[2]) + win - now)
 end
-redis.call('ZADD', KEYS[1], now, now .. ':' .. ARGV[3])
+redis.call('ZADD', KEYS[1], now, t[1] .. '.' .. t[2] .. ':' .. ARGV[3])
 redis.call('PEXPIRE', KEYS[1], ARGV[2])
 return -1
 """
