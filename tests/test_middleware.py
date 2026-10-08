@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
-from conftest import LogCapture, make_context, notification, rpc
+from conftest import (
+    LogCapture,
+    headers_for,
+    make_context,
+    modern,
+    notification,
+    rpc,
+)
 
-from easy_mcp import MCPServer
+from easy_mcp import AuthorizationError, MCPServer, ProtocolError
+from easy_mcp.exceptions import (
+    AUTHENTICATION_REQUIRED,
+    FORBIDDEN,
+    INTERNAL_ERROR,
+    INVALID_REQUEST,
+)
+
+LiveServer = Callable[[Any], str]
 
 
 def make_server(**kwargs: Any) -> MCPServer:
@@ -90,3 +107,66 @@ async def test_a_client_cancel_still_drops_the_response(logs: LogCapture) -> Non
         {"type": "tool_cancelled", "client_id": "ip:test", "request_id": 7}
     ]
     assert context.in_flight == {}
+
+
+# ------------------------------------------------------------ error codes
+
+
+async def test_reserved_codes_never_reach_the_wire(
+    monkeypatch: pytest.MonkeyPatch, logs: LogCapture
+) -> None:
+    server = make_server()
+
+    def refuse(context: Any) -> dict[str, Any]:
+        raise ProtocolError("made-up code", code=-32050)
+
+    monkeypatch.setattr(server, "_handle_tools_list", refuse)
+    response = await server.dispatch(rpc("tools/list"), make_context())
+    assert response is not None
+    assert response["error"]["code"] == INTERNAL_ERROR
+    assert "error_id=" in response["error"]["message"]
+    assert "made-up" not in response["error"]["message"]
+    assert "-32050" in logs.text
+
+
+async def test_the_spec_defined_reserved_codes_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = make_server()
+    for code in (-32020, -32021, -32022, -32001):
+
+        def refuse(context: Any, code: int = code) -> dict[str, Any]:
+            raise ProtocolError("defined", code=code)
+
+        monkeypatch.setattr(server, "_handle_tools_list", refuse)
+        response = await server.dispatch(rpc("tools/list"), make_context())
+        assert response is not None and response["error"]["code"] == code
+
+
+async def test_forbidden_is_never_sent_statelessly(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = make_server()
+
+    def refuse(*args: Any) -> dict[str, Any]:
+        raise AuthorizationError("no")
+
+    monkeypatch.setattr(server, "_dispatch_modern", refuse)
+    monkeypatch.setattr(server, "_handle_tools_list", refuse)
+    stateless = await server.dispatch(modern("tools/list"), make_context())
+    assert stateless is not None and stateless["error"]["code"] == AUTHENTICATION_REQUIRED
+    legacy = await server.dispatch(rpc("tools/list"), make_context())
+    assert legacy is not None and legacy["error"]["code"] == FORBIDDEN
+
+
+def test_the_origin_refusal_speaks_the_requests_era(live_server: LiveServer) -> None:
+    base = live_server(make_server())
+    evil = {"Origin": "http://evil.example:8000"}
+    with httpx.Client(base_url=base, timeout=10) as client:
+        call = modern("tools/list")
+        rejected = client.post("/mcp", json=call, headers={**headers_for(call), **evil})
+        assert rejected.status_code == 403
+        assert rejected.json()["error"]["code"] == INVALID_REQUEST
+        legacy = client.post(
+            "/mcp",
+            json=rpc("initialize", {"protocolVersion": "2025-11-25"}),
+            headers={"Accept": "application/json, text/event-stream", **evil},
+        )
+        assert legacy.status_code == 403
+        assert legacy.json()["error"]["code"] == FORBIDDEN

@@ -26,6 +26,8 @@ from ._version import __version__
 from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
+    AUTHENTICATION_REQUIRED,
+    FORBIDDEN,
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -45,6 +47,7 @@ from .protocol import (
     SUPPORTED_PROTOCOL_VERSIONS,
     check_request_meta,
     is_modern_request,
+    is_reserved_error_code,
     negotiate_protocol_version,
 )
 from .schema import build_param_models, dump_model, validate_arguments, validate_result
@@ -412,47 +415,93 @@ class MCPServer:
         # A request carrying the modern per-request _meta is served statelessly
         # (2026-07-28); anything else keeps the initialize-era behaviour.
         modern = not is_notification and is_modern_request(method, params)
+        response: dict[str, Any] | None
         try:
-            if modern:
-                check_request_meta(params)
-            if method.startswith("notifications/"):
-                if modern:
-                    # A notification has no id; a request naming one of these
-                    # methods is asking for a method that does not exist.
-                    raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
-                self._handle_notification(method, params, context)
-                return None
-            if method == "tools/call":
-                response = await self._handle_tools_call(params, context, msg_id, is_notification)
-                if modern and response is not None and "result" in response:
-                    response["result"] = self._modern_result(response["result"])
-                return response
-            if modern:
-                result: Any = self._dispatch_modern(method, context)
-            elif method == "initialize":
-                result = self._handle_initialize(params, context)
-            elif method == "ping":
-                result = {}
-            elif method == "tools/list":
-                result = self._handle_tools_list(context)
-            else:
-                if is_notification:
-                    return None
-                return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+            response = await self._serve_message(
+                method, params, context, msg_id, is_notification, modern
+            )
         except ProtocolError as exc:
-            return None if is_notification else _protocol_error_response(msg_id, exc)
+            response = None if is_notification else _protocol_error_response(msg_id, exc)
         except Exception:
             # Sanitize: clients get an opaque error_id; the log gets the trace.
             error_id = uuid.uuid4().hex[:12]
             self._logger.error("internal error error_id=%s", error_id, exc_info=True)
             if is_notification:
                 return None
-            return _error_response(
+            response = _error_response(
                 msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
+        if response is not None and "error" in response:
+            response = self._finalize_error(response, modern)
+        return response
+
+    async def _serve_message(
+        self,
+        method: str,
+        params: dict[str, Any],
+        context: ClientContext,
+        msg_id: Any,
+        is_notification: bool,
+        modern: bool,
+    ) -> dict[str, Any] | None:
+        if modern:
+            check_request_meta(params)
+        if method.startswith("notifications/"):
+            if modern:
+                # A notification has no id; a request naming one of these
+                # methods is asking for a method that does not exist.
+                raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+            self._handle_notification(method, params, context)
+            return None
+        if method == "tools/call":
+            response = await self._handle_tools_call(params, context, msg_id, is_notification)
+            if modern and response is not None and "result" in response:
+                response["result"] = self._modern_result(response["result"])
+            return response
+        if modern:
+            result: Any = self._dispatch_modern(method, context)
+        elif method == "initialize":
+            result = self._handle_initialize(params, context)
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = self._handle_tools_list(context)
+        else:
+            if is_notification:
+                return None
+            return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
         if modern:
             result = self._modern_result(result)
         return None if is_notification else _result_response(msg_id, result)
+
+    def _finalize_error(self, response: dict[str, Any], modern: bool) -> dict[str, Any]:
+        """The last check on every error response ``dispatch`` returns.
+
+        The MCP specification reserves ``-32020``..``-32099`` and defines
+        only ``-32020``..``-32022`` in it; a code from the rest is a server
+        bug, whoever raised it, so it is answered as ``-32603`` with an
+        ``error_id`` and logged.  And the stateless revision forbids
+        ``-32002`` (``FORBIDDEN``, which means "resource not found" to it),
+        so a stateless answer carries ``-32001`` instead.
+        """
+        error = response.get("error")
+        if not isinstance(error, dict):
+            return response
+        code = error.get("code")
+        if isinstance(code, int) and is_reserved_error_code(code):
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error(
+                "refused to send error code %d, which MCP reserves, error_id=%s: %s",
+                code,
+                error_id,
+                error.get("message"),
+            )
+            return _error_response(
+                response.get("id"), INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
+        if modern and code == FORBIDDEN:
+            return {**response, "error": {**error, "code": AUTHENTICATION_REQUIRED}}
+        return response
 
     def _capabilities(self) -> dict[str, Any]:
         return {"tools": {"listChanged": False}}

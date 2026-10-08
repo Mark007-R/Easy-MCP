@@ -46,6 +46,15 @@ _MODERN_REQUEST_KEYS = (META_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CL
 
 DISCOVER_METHOD = "server/discover"
 
+# The MCP specification reserves -32020..-32099 for itself and defines only
+# -32020..-32022 so far; no implementation may send the rest.
+_RESERVED_ERROR_CODES = range(-32099, -32022)
+
+
+def is_reserved_error_code(code: int) -> bool:
+    """Whether *code* is one MCP reserves without defining (``-32023``..``-32099``)."""
+    return code in _RESERVED_ERROR_CODES
+
 
 def negotiate_protocol_version(requested: object) -> str:
     """The version to answer an ``initialize`` request with.

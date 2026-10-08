@@ -22,8 +22,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from ..exceptions import FORBIDDEN
+from ..exceptions import FORBIDDEN, INVALID_REQUEST
 from ..logging import audit
+from ..protocol import MODERN_PROTOCOL_VERSIONS
 from ..security.auth import ClientIdentity
 from .base import Transport
 
@@ -103,7 +104,12 @@ class OriginGuard:
             origin = _header(scope, b"origin")
             if origin is not None and not origin_allowed(origin, self.allowed_origins):
                 audit("origin_rejected", origin=origin[:200], path=scope.get("path", ""))
-                response = rpc_error(403, FORBIDDEN, "Forbidden: origin not allowed")
+                # The stateless revision forbids -32002 in any response, so a
+                # request that names it gets the generic -32600; older clients
+                # keep the code they have always seen.
+                version = _header(scope, b"mcp-protocol-version")
+                code = INVALID_REQUEST if version in MODERN_PROTOCOL_VERSIONS else FORBIDDEN
+                response = rpc_error(403, code, "Forbidden: origin not allowed")
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
