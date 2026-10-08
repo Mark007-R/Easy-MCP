@@ -55,6 +55,15 @@ KEEPALIVE_SECONDS = 15.0
 _CLOSE = object()  # sentinel pushed into session queues on shutdown
 
 
+def _shutting_down() -> Response:
+    """The answer to a stream or message arriving once shutdown has begun."""
+    return JSONResponse(
+        {"error": "server is shutting down; retry shortly"},
+        status_code=503,
+        headers={"Retry-After": "1"},
+    )
+
+
 @dataclass(slots=True)
 class _Session:
     """One live SSE connection and its outbound message queue."""
@@ -80,6 +89,8 @@ class SSETransport(BaseHTTPTransport):
         self._sse_path = sse_path
         self._messages_path = messages_path
         self._sessions: dict[str, _Session] = {}
+        # Set once shutdown closes the streams: nothing new is served after.
+        self._closing = False
 
     def describe(self) -> str:
         return f"sse on {self._server.host}:{self._server.port}"
@@ -98,6 +109,7 @@ class SSETransport(BaseHTTPTransport):
 
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
+            self._closing = False  # an app built again from this transport serves anew
             try:
                 yield
             finally:
@@ -119,8 +131,12 @@ class SSETransport(BaseHTTPTransport):
 
         Calls still running have nobody left to answer; they are cancelled
         now rather than when each stream winds down, so shutdown can wait
-        for their cancel callbacks.
+        for their cancel callbacks.  From now on new streams and messages
+        are refused (``503``): uvicorn may still be accepting connections,
+        and a stream opened now would never be closed, so shutdown would
+        wait for it forever.
         """
+        self._closing = True
         for session in list(self._sessions.values()):
             for task in list(session.tasks):
                 task.cancel()
@@ -129,6 +145,8 @@ class SSETransport(BaseHTTPTransport):
     # ------------------------------------------------------------- endpoints
 
     async def _handle_sse(self, request: Request) -> Response:
+        if self._closing:
+            return _shutting_down()
         try:
             identity = self._resolve_identity(request)
         except AuthenticationError:
@@ -240,6 +258,11 @@ class SSETransport(BaseHTTPTransport):
                 },
                 status_code=400,
             )
+
+        if self._closing:
+            # Checked after the last await: its stream may have closed
+            # already, and nothing would cancel the call.
+            return _shutting_down()
 
         # Dispatch in the background and answer 202 now: the JSON-RPC response
         # travels over the SSE stream, and holding this POST open would stall

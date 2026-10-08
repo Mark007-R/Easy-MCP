@@ -42,7 +42,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   deleted session, a closed SSE stream, shutdown) reaches middleware as
   `CancelledError`. A middleware that swallows it is overruled and no response
   is sent. A `CancelledError` a middleware raises when nothing cancelled the
-  request is a failure like any other. Notifications and `server/discover`
+  request is a failure like any other. One the tool raised on its own, passed
+  on from `call_next()`, is answered as it would be without middleware.
+  Notifications and `server/discover`
   pass through middleware but cannot be refused.
 
   Middleware runs on the event loop. Context variables it sets before
@@ -73,9 +75,12 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - With request middleware registered, a stateless `tools/list` carries
   `cacheScope: "private"`, because its answer may now depend on the caller.
   `server/discover` stays `public`.
-- A `tools/call` is counted against `max_calls_per_session` only once its tool
-  starts. A call refused by middleware or cancelled before it starts is not
-  counted. Before, only a call refused as busy was refunded.
+- A `tools/call` holds one unit of `max_calls_per_session` from the moment it
+  passes the built-in checks. The unit is returned if the tool never starts:
+  a middleware refusal or failure, a busy answer, or a cancel before the tool
+  starts. So a refused call does not count, but while a call waits in tool
+  middleware, concurrent calls beyond the cap get `-32006`. Before, only a
+  call refused as busy was refunded.
 - The `403` that refuses a browser `Origin` carries `-32600` when the
   request's `MCP-Protocol-Version` header names the stateless revision, which
   forbids `-32002` in any response. Older clients still get `-32002`.
@@ -83,6 +88,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `-32001`), or a code from `-32023` to `-32099`, which MCP reserves without
   defining (it becomes `-32603` with an `error_id`, and the original is
   logged).
+- A stateless Streamable HTTP error carrying `-32020`, `-32021` or `-32022`,
+  which middleware may raise, is answered with HTTP `400`, as the stateless
+  revision requires for these codes. Before, only the transport's own checks
+  answered them with `400`; any other source got `200`.
 - A request (a message with an `id`) that names a `notifications/*` method is
   answered `-32601`, as an unknown method. Before, it was treated as that
   notification and got no response at all: over HTTP a bare `202`, on stdio
@@ -92,9 +101,13 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   does, then cancels them and ends the sessions, before uvicorn waits for
   connections to close. A request cancelled this way, or sent once shutdown
   has begun, is answered `503` with `-32008` (`data.reason: "shutdown"`) and
-  `Retry-After: 1`, and a handshake cut short opens no session. Before,
-  shutdown waited for every running request to finish, without a bound for a
-  tool with no timeout.
+  `Retry-After: 1`, and a handshake cut short opens no session. A
+  `notifications/cancelled` sent meanwhile still cancels the call it names,
+  which then gets no answer. The legacy SSE endpoints close their streams as
+  shutdown begins, cancelling the requests they carry (which get no answer,
+  as before), and answer new streams and messages `503`. Before, shutdown
+  waited for every running request to finish, without a bound for a tool with
+  no timeout.
 
 ### Fixed
 

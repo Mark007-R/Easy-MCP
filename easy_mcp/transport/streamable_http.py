@@ -62,10 +62,12 @@ from ..exceptions import (
     HEADER_MISMATCH,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     PARSE_ERROR,
     PAYLOAD_TOO_LARGE,
     SERVER_BUSY,
     TOO_MANY_SESSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION,
     AuthenticationError,
     ProtocolError,
 )
@@ -93,6 +95,15 @@ NAME_HEADER = "Mcp-Name"
 
 # Methods whose Mcp-Name header mirrors a body field, and that field.
 _NAME_FIELDS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+
+# The HTTP status the stateless revision gives a stateless error, by code
+# (middleware may raise any of these); every other error is answered 200.
+_STATELESS_ERROR_STATUS: dict[object, int] = {
+    METHOD_NOT_FOUND: 404,
+    HEADER_MISMATCH: 400,
+    MISSING_REQUIRED_CLIENT_CAPABILITY: 400,
+    UNSUPPORTED_PROTOCOL_VERSION: 400,
+}
 
 # Stateless requests have no session to hang per-client accounting on
 # (max_calls_per_session), so it is kept per client id instead, for at most
@@ -293,11 +304,13 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         uvicorn waits for every open connection before the lifespan shutdown
         runs, and a request held in middleware (which no tool timeout
         bounds) or in a slow tool keeps its connection open.  So nothing new
-        is served from now on, and the requests still running get
-        ``_SHUTDOWN_GRACE_SECONDS`` to finish, as on stdio; then they are
-        cancelled.  A request stopped or refused this way is answered ``503``
-        with ``-32008`` (retry shortly), and a handshake cut short opens no
-        session.
+        is served from now on (the legacy endpoints included, or a stream
+        opened meanwhile would hold shutdown up for good; a
+        ``notifications/cancelled`` is still acted on), and the requests
+        still running get ``_SHUTDOWN_GRACE_SECONDS`` to finish, as on stdio;
+        then they are cancelled.  A request stopped or refused this way is
+        answered ``503`` with ``-32008`` (retry shortly), and a handshake cut
+        short opens no session.
         """
         self._closing = True
         if self._legacy is not None:
@@ -325,6 +338,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
             self._closing = False  # an app built again from this transport serves anew
+            if legacy is not None:
+                legacy._closing = False
             try:
                 yield
             finally:
@@ -475,8 +490,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         if response is None:
             return Response(status_code=202)  # the client hung up: nobody reads it
         error = response.get("error")
-        not_found = isinstance(error, dict) and error.get("code") == METHOD_NOT_FOUND
-        return _json_response(response, status=404 if not_found else 200)
+        code = error.get("code") if isinstance(error, dict) else None
+        return _json_response(response, status=_STATELESS_ERROR_STATUS.get(code, 200))
 
     async def _dispatch_until_disconnect(
         self,
@@ -498,9 +513,18 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         Raises:
             _ShuttingDown: Shutdown cancelled the work, or had begun before it
-                started; the request must still be answered.
+                started (a ``notifications/cancelled`` is still acted on);
+                the request must still be answered.
         """
         if self._closing:
+            if message.get("method") == "notifications/cancelled" and "id" not in message:
+                # Still acted on, without middleware (which could start new
+                # work): the call it names stops now, and is not answered,
+                # rather than running on until shutdown cancels it.
+                params = message.get("params")
+                cancel = params if isinstance(params, dict) else {}
+                self._server._handle_notification("notifications/cancelled", cancel, context)
+                return None
             raise _ShuttingDown  # nothing new is served
         task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
         self._dispatches.add(task)

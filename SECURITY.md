@@ -174,9 +174,11 @@ the client is untrusted, the credential in the environment is trusted.
   your own uvicorn (`build_app()`), set `--timeout-graceful-shutdown`: uvicorn
   waits for open SSE streams to close and running requests to finish (one
   held in middleware never does) before it shuts the app down, and a forced
-  exit skips that wait entirely. `server.run()` closes those streams itself,
-  gives running requests 5 s to finish and then cancels them, answering each
-  `503` with `-32008`. A mounted `build_app()` gets no lifespan at all, so the
+  exit skips that wait entirely. `server.run()` closes those streams itself
+  and refuses new ones with `503`; the requests they carry are cancelled as
+  shutdown begins and get no answer. Over Streamable HTTP it gives running
+  `/mcp` requests 5 s to finish and then cancels them, answering each `503`
+  with `-32008`. A mounted `build_app()` gets no lifespan at all, so the
   host app must call `wait_for_tool_threads` on shutdown. Threads a sync tool
   starts itself are daemons as well, because they inherit the flag, and
   nothing waits for them. Pass `daemon=False` for work that must finish.

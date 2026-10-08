@@ -2567,6 +2567,68 @@ async def test_a_cancellation_nobody_asked_for_is_a_middleware_failure(logs: Log
         {"type": "tool_cancelled", "client_id": "ip:test", "request_id": 7}
     ]
 
+
+async def test_a_stray_cancellation_from_the_tool_is_not_blamed_on_middleware(
+    logs: LogCapture,
+) -> None:
+    # The tool raises a CancelledError nobody asked for.  A middleware that
+    # passes it on did what it must, so the client gets what it would get
+    # without middleware, and the audit trail says the same.
+    async def passthrough(info: Any, call_next: Any) -> Any:
+        return await call_next()
+
+    async def aside(info: Any, call_next: Any) -> Any:
+        return await asyncio.ensure_future(call_next())
+
+    def serving(kind: str) -> MCPServer:
+        server = make_server()
+
+        @server.tool
+        async def flaky() -> str:
+            """Awaits a shared lookup that was cancelled."""
+            await cancelled_future()
+            return "unreachable"
+
+        if kind in ("request", "both"):
+            server.middleware(passthrough)
+        if kind in ("tool", "both"):
+            server.tool_middleware(passthrough)
+        if kind == "aside":
+            server.middleware(aside)
+            server.tool_middleware(aside)
+        return server
+
+    answered = []
+    for kind in ("none", "request", "tool", "both", "aside"):
+        first = len(logs.records)
+        response = await serving(kind).dispatch(
+            rpc("tools/call", {"name": "flaky"}, 7), make_context()
+        )
+        records = logs.records[first:]
+        events = [r.event for r in records if r.name == "easy_mcp.audit"]  # type: ignore[attr-defined]
+        errors = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+        answered.append((kind, response, events, errors))
+    cancelled = [{"type": "tool_cancelled", "client_id": "ip:test", "request_id": 7}]
+    assert answered == [
+        (kind, None, cancelled, []) for kind in ("none", "request", "tool", "both", "aside")
+    ]
+
+    # A middleware that cancels the call_next() it started and raises that
+    # cancel still fails the request: the CancelledError is its own doing.
+    server = make_server()
+    started, _ = with_slow_tool(server)
+
+    @server.middleware
+    async def impatient(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        inner = asyncio.ensure_future(call_next())
+        await asyncio.wait_for(started.wait(), 5)
+        inner.cancel()
+        return await inner
+
+    response = await server.dispatch(rpc("tools/call", {"name": "slow"}, 8), make_context())
+    assert response is not None and response["error"]["code"] == INTERNAL_ERROR
+    assert logs.events("middleware_failed")[-1]["middleware"] == describe(impatient)
+
     # An outer middleware's own timeout cancels the inner one: that is a cancel.
     bounded = make_server()
 
@@ -3214,11 +3276,27 @@ async def test_stdio_transport_info() -> None:
 
 def test_http_status_of_refusals(live_server: LiveServer) -> None:
     server = make_server()
+    # The codes the stateless revision defines, which it answers with HTTP 400.
+    defined = {
+        3: ProtocolError(
+            "Missing required client capability",
+            code=-32021,
+            data={"requiredCapabilities": {"sampling": {}}},
+        ),
+        4: ProtocolError(
+            "Unsupported protocol version",
+            code=-32022,
+            data={"supported": ["2026-07-28"], "requested": "2026-07-28"},
+        ),
+        5: ProtocolError("Header mismatch: not from this proxy", code=-32020),
+    }
 
     @server.middleware
     async def refuse(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
         if request.method == "tools/list":
             raise ProtocolError("Not here", code=METHOD_NOT_FOUND)
+        if request.request_id in defined:
+            raise defined[request.request_id]
         if request.method == "tools/call":
             raise AuthenticationError("Who are you?")
         return await call_next()
@@ -3234,11 +3312,23 @@ def test_http_status_of_refusals(live_server: LiveServer) -> None:
         response = client.post("/mcp", json=call, headers=headers_for(call))
         assert response.status_code == 200
         assert response.json()["error"] == {"code": -32001, "message": "Who are you?"}
+        for msg_id, refusal in defined.items():
+            call = modern("tools/call", arguments, msg_id)
+            response = client.post("/mcp", json=call, headers=headers_for(call))
+            assert response.status_code == 400, refusal.code
+            error = {"code": refusal.code, "message": str(refusal)}
+            if refusal.data is not None:
+                error["data"] = refusal.data
+            assert response.json() == {"jsonrpc": "2.0", "id": msg_id, "error": error}
         init = client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
         session = {**ACCEPT, "MCP-Session-Id": init.headers["mcp-session-id"]}
         response = client.post("/mcp", json=rpc("tools/call", arguments, 2), headers=session)
         assert response.status_code == 200
         assert response.json()["error"]["code"] == -32001
+        # The session era defines none of them: its answers stay 200.
+        response = client.post("/mcp", json=rpc("tools/call", arguments, 3), headers=session)
+        assert response.status_code == 200
+        assert response.json()["error"]["code"] == -32021
 
 
 def test_http_initialize_refused_creates_no_session(live_server: LiveServer) -> None:
@@ -3669,6 +3759,129 @@ async def test_http_requests_arriving_during_shutdown_are_answered() -> None:
     assert ran == []
     assert stateless.headers["retry-after"] == "1"
     assert len(transport._sessions) == 1  # the one opened before shutdown began
+
+
+async def test_http_cancel_during_shutdown_stops_the_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp import StreamableHTTPTransport
+    from easy_mcp.transport import streamable_http
+
+    monkeypatch.setattr(streamable_http, "_SHUTDOWN_GRACE_SECONDS", 2.0)
+    server = make_server()
+    started, cancelled = with_slow_tool(server)
+    transport = StreamableHTTPTransport(server)
+    app = transport.build_app()  # its lifespan never runs here
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        init = await client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+        session = {**ACCEPT, "MCP-Session-Id": init.headers["mcp-session-id"]}
+        call = asyncio.create_task(
+            client.post("/mcp", json=rpc("tools/call", {"name": "slow"}, 2), headers=session)
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        closing = asyncio.create_task(transport.close_streams())
+        while not transport._closing:
+            await asyncio.sleep(0)
+        # The client cancels its call while shutdown waits for it: the cancel
+        # takes effect at once, and the call gets no answer, as for any cancel.
+        cancel = notification("notifications/cancelled", {"requestId": 2})
+        assert answer(await client.post("/mcp", json=cancel, headers=session)) == (202, None, None)
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert answer(await asyncio.wait_for(call, 1)) == (202, None, None)
+        await asyncio.wait_for(closing, 1)  # long before the 2 s grace is up
+    assert transport._sessions == {}
+
+
+def test_http_shutdown_refuses_legacy_sse_streams_opened_during_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from easy_mcp import StreamableHTTPTransport
+    from easy_mcp.transport import streamable_http
+
+    monkeypatch.setattr(streamable_http, "_SHUTDOWN_GRACE_SECONDS", 1.0)
+    server = make_server()
+
+    @server.tool
+    async def slow() -> str:
+        """Takes longer than shutdown waits."""
+        started.set()
+        await asyncio.sleep(30)
+        return "too late"
+
+    started = threading.Event()
+    base, serving = run_http(server)
+    transport = server._transport
+    assert isinstance(transport, StreamableHTTPTransport)
+    answers: list[Answer] = []
+    streams: list[tuple[int, str | None]] = []
+
+    def call() -> None:
+        message = modern("tools/call", {"name": "slow"}, 7)
+        try:
+            sent = httpx.post(f"{base}/mcp", json=message, headers=headers_for(message), timeout=20)
+            answers.append(answer(sent))
+        except httpx.TransportError:
+            answers.append((0, None, None))
+
+    def reconnect() -> None:
+        # A legacy client connecting (or reconnecting, as EventSource does)
+        # while shutdown waits for the call; it reads what it gets to the end.
+        try:
+            with httpx.Client(base_url=base, timeout=20) as client:
+                with client.stream("GET", "/sse") as stream:
+                    for _ in stream.iter_lines():
+                        pass
+                    streams.append((stream.status_code, stream.headers.get("retry-after")))
+        except httpx.TransportError:
+            streams.append((0, None))
+
+    caller = threading.Thread(target=call, daemon=True)
+    legacy = threading.Thread(target=reconnect, daemon=True)
+    caller.start()
+    assert started.wait(5)
+    try:
+        server.stop()
+        deadline = time.monotonic() + 5
+        while not transport._closing:
+            assert time.monotonic() < deadline, "shutdown never began"
+            time.sleep(0.01)
+        legacy.start()
+        serving.join(3)  # the 1 s grace, and some
+        assert not serving.is_alive(), "shutdown waited for a stream opened during it"
+    finally:
+        if serving.is_alive():
+            transport._uvicorn.force_exit = True
+            serving.join(5)
+    legacy.join(5)
+    caller.join(5)
+    assert streams == [(503, "1")]
+    assert answers == [shutting_down(7)]
+
+
+def test_sse_refuses_new_streams_and_messages_once_shutdown_begins(
+    live_server: LiveServer,
+) -> None:
+    from easy_mcp import SSETransport
+
+    transport = SSETransport(make_server())
+    app = transport.build_app()
+    base = live_server(app)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        with client.stream("GET", "/sse") as stream:
+            lines = stream.iter_lines()  # kept: its end would close the stream
+            endpoint = next_data(lines)
+            transport._closing = True  # shutdown is closing the streams
+            posted = client.post(endpoint, json=rpc("ping"))
+            with client.stream("GET", "/sse") as opened:
+                refused = (opened.status_code, opened.headers.get("retry-after"))
+    assert (posted.status_code, posted.headers.get("retry-after")) == (503, "1")
+    assert refused == (503, "1")
+    # Served again, the transport opens streams anew.
+    base = live_server(app)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        with client.stream("GET", "/sse") as stream:
+            assert stream.status_code == 200
+            assert next_data(stream.iter_lines()).startswith("/messages?session_id=")
 
 
 async def test_stdio_serves_both_eras_to_middleware() -> None:

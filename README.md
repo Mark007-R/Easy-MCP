@@ -374,11 +374,14 @@ The threads are daemons, so the transports give them a bounded time to finish
 as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
 a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
 yourself, `await server.wait_for_tool_threads(5)` before exiting does the
-same. `server.run()` closes open legacy SSE streams as shutdown begins, gives
-the requests still running 5 s to finish and then cancels them, since uvicorn
-waits for every connection to close before it shuts the app down. A request
+same. `server.run()` closes open legacy SSE streams as shutdown begins,
+cancelling the requests they carry (those get no answer), and refuses new
+streams and messages with `503`. It gives the Streamable HTTP `/mcp` requests
+still running 5 s to finish and then cancels them, since uvicorn waits for
+every connection to close before it shuts the app down. A `/mcp` request
 cancelled this way, or sent once shutdown has begun, is answered `503` with
-`-32008` and `Retry-After: 1`, so the client can retry. When you serve
+`-32008` and `Retry-After: 1`, so the client can retry; a
+`notifications/cancelled` sent meanwhile still cancels its call. When you serve
 `server.build_app()` with your own uvicorn, pass `--timeout-graceful-shutdown`,
 or shutdown waits for SSE clients to leave and for running requests (one held
 in middleware included) to finish.
@@ -438,9 +441,11 @@ To refuse, raise before `call_next()`. A `ProtocolError` such as
 `ToolError` becomes an `isError` result whose message the model can read (on
 methods other than `tools/call` there is no result to carry it, so it becomes
 `-32603` with your message). The tool does not run and the call does not
-count against `max_calls_per_session`. Raising after `call_next()` replaces
-the answer, but the tool has already run; the audit log records
-`tool_result_withheld`.
+count against `max_calls_per_session`. (A call holds its unit of that cap
+from the moment it passes the built-in checks, and gets it back if its tool
+never starts, so while it waits in tool middleware, concurrent calls beyond
+the cap get `-32006`.) Raising after `call_next()` replaces the answer, but
+the tool has already run; the audit log records `tool_result_withheld`.
 
 Middleware observes; it does not rewrite. `params`, `meta` and `arguments` are
 read-only, and the outcome `call_next()` returns describes what the client
@@ -462,9 +467,11 @@ last one added the outermost.)
 
 A cancel reaches middleware as `CancelledError` wherever the call is. Re-raise
 it: a middleware that swallows one is overruled, and no response is sent. A
-`CancelledError` raised when nothing cancelled the request (from a shared task
-someone else cancelled, say) is a failure like any other. A tool's `timeout`
-covers the tool only, so bound your own awaits:
+`CancelledError` your middleware raises when nothing cancelled the request
+(from a shared task someone else cancelled, say) is a failure like any other.
+One the tool raised on its own reaches you from `call_next()`; re-raise it
+too, and the client gets what it would get without middleware. A tool's
+`timeout` covers the tool only, so bound your own awaits:
 `async with asyncio.timeout(2): ...`. A middleware that waits forever holds
 its request until it is cancelled, and in a Streamable HTTP session a closed
 connection cancels nothing (SECURITY.md lists what does).
@@ -515,7 +522,7 @@ caller.
 | Every sync-tool worker busy (`max_sync_workers`) | `-32008`; retry shortly |
 | Stateless request names a version the server does not speak | `-32022` with `supported` and `requested` |
 | HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
-| Middleware refuses with a `ProtocolError` | its code (e.g. `-32001`, `-32003`) |
+| Middleware refuses with a `ProtocolError` | its code (e.g. `-32001`, `-32003`); on stateless HTTP, `-32020` to `-32022` get HTTP `400` and `-32601` gets `404` |
 | Middleware raises `ToolError` | `isError: true` with your message verbatim (`-32603` with the message outside `tools/call`) |
 | Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run if it failed before `call_next()` |
 

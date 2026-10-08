@@ -910,6 +910,8 @@ class _Chain(Generic[_OutcomeT]):
         # Set once the middleware has returned or raised: the call is being
         # answered, and the inner chain (the tool included) must not start.
         over = [False]
+        # Set when the inner chain raised a CancelledError nobody asked for.
+        stray = [False]
         home = _current_task_ref()  # the task the middleware runs in
 
         async def collect() -> _OutcomeT:
@@ -923,7 +925,16 @@ class _Chain(Generic[_OutcomeT]):
             # that task, not every cancel of the request.
             aside = not home or home[0]() is not asyncio.current_task()
             before = _task_cancels() if aside else request._cancels()
-            outcome = await self.layer(index + 1)
+            task_before, request_before = _task_cancels(), request._cancels()
+            try:
+                outcome = await self.layer(index + 1)
+            except asyncio.CancelledError:
+                # If neither this task nor the request was cancelled, the
+                # tool awaited something cancelled elsewhere.  A middleware
+                # that passes that on is not to blame for it.
+                if _task_cancels() == task_before and request._cancels() == request_before:
+                    stray[0] = True
+                raise
             # A cancel the inner chain took in and answered anyway (a tool
             # that swallows its own, say) is not this layer's doing.
             absorbed[0] = (_task_cancels() if aside else request._cancels()) - before
@@ -948,10 +959,11 @@ class _Chain(Generic[_OutcomeT]):
                 over[0] = True
         except asyncio.CancelledError as cancel:
             await _abandon(pending, runner)
-            if request._cancels() > baseline or _task_cancels() > own_baseline:
+            if request._cancels() > baseline or _task_cancels() > own_baseline or stray[0]:
                 # The request was cancelled, or the work this layer runs in
                 # was (left behind by an outer middleware, or bounded by its
-                # timeout).
+                # timeout), or the tool raised it on its own: answered as
+                # without middleware.
                 raise
             # Nobody cancelled anything here: the middleware awaited something
             # cancelled elsewhere (a shared lookup, say).  A failure, not a
