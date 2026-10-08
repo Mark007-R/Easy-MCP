@@ -22,7 +22,15 @@ import traceback
 import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine, Hashable, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Hashable,
+    Iterable,
+    Mapping,
+)
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -95,7 +103,7 @@ from .security.auth import (
 )
 from .security.oauth import OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
-from .transport._http import BaseHTTPTransport, normalize_origins
+from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -1641,10 +1649,50 @@ class MCPServer:
         """Return the ASGI app (for tests, mounting, or ``uvicorn --factory``).
 
         It serves Streamable HTTP at ``/mcp`` plus the legacy SSE endpoints.
+        An app mounted inside another one runs no lifespan of its own: run
+        :meth:`lifespan` from the host app's.
         """
         if not isinstance(self._transport, BaseHTTPTransport):
             self._transport = StreamableHTTPTransport(self)
         return self._transport.build_app()
+
+    def lifespan(self) -> contextlib.AbstractAsyncContextManager[None]:
+        """Startup and shutdown of the app :meth:`build_app` returned, for mounting it.
+
+        A Starlette or FastAPI app that mounts ``server.build_app()`` does
+        not run the mounted app's lifespan, so run this from its own::
+
+            @contextlib.asynccontextmanager
+            async def lifespan(app):
+                async with server.lifespan():
+                    yield
+
+            mcp_app = server.build_app()
+            app = Starlette(routes=[Mount("/", mcp_app)], lifespan=lifespan)
+
+        At startup it fetches the OAuth authorization servers' metadata and
+        keys (best effort).  At shutdown it closes the streams and sessions,
+        cancels the requests still running after their grace, gives sync
+        tool threads and cancel callbacks 5 s, and releases the OAuth fetch
+        threads.  ``build_app()``'s own lifespan does exactly this.
+        """
+        transport = self._transport if isinstance(self._transport, BaseHTTPTransport) else None
+        return self._lifespan(transport)
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, transport: BaseHTTPTransport | None) -> AsyncIterator[None]:
+        if transport is not None:
+            transport._reopen()  # an app started again serves anew
+        if self.oauth is not None:
+            await self.oauth.warm_up()
+        try:
+            yield
+        finally:
+            if transport is not None:
+                await transport.close_streams()
+            await self.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
+            if self.oauth is not None:
+                self.oauth.close()
 
     def run(self, transport: Transport | str | None = None) -> None:
         """Start the server (blocking).  Ctrl-C shuts down gracefully.
@@ -1725,6 +1773,19 @@ class MCPServer:
             self._logger.warning("debug mode is ON: clients will receive tracebacks")
 
     def _warn_about_oauth(self, oauth: OAuthResourceServer) -> None:
+        transport = self._transport
+        if isinstance(transport, BaseHTTPTransport):
+            path = urlsplit(oauth.resource).path
+            # The origin is a valid resource for every endpoint of the host.
+            if path and path not in transport._endpoint_paths():
+                self._logger.warning(
+                    "oauth resource %s names the path %r, but the MCP endpoint is %s: tokens "
+                    "must carry the resource clients use. Fine behind a path-rewriting proxy; "
+                    "otherwise set resource to the endpoint's public URL",
+                    oauth.resource,
+                    path,
+                    " and ".join(transport._endpoint_paths()),
+                )
         for issuer in oauth.authorization_servers:
             if urlsplit(issuer).scheme == "http":
                 self._logger.warning(

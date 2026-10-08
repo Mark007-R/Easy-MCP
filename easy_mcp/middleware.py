@@ -346,7 +346,7 @@ class RequestInfo:
 
     @property
     def client_id(self) -> str:
-        """The rate-limit key: the API key's fingerprint, or ``ip:<address>``."""
+        """The rate-limit key: an API key's or OAuth principal's fingerprint, or ``ip:<addr>``."""
         return self._client_id
 
     @property
@@ -360,7 +360,11 @@ class RequestInfo:
 
     @property
     def identity(self) -> ClientIdentity | None:
-        """The authenticated caller (key fingerprint and scopes), or ``None``."""
+        """The authenticated caller, or ``None``.
+
+        A fingerprint and scopes; for an OAuth token also its verified
+        subject, client, issuer, expiry and claims (never the token).
+        """
         return self._identity
 
     @property

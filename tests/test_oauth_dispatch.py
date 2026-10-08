@@ -6,6 +6,9 @@ would return them, and handed to ``dispatch``.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from types import MappingProxyType
 from typing import Any
 
@@ -304,6 +307,29 @@ def test_request_context_shares_the_session() -> None:
     assert MCPServer._request_context(keyed, auth.authenticate(KEY)) is keyed
     anonymous = make_context(None)
     assert MCPServer._request_context(anonymous, None) is anonymous
+
+
+async def test_lifespan_warms_up_and_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = oauth_server()
+    assert server.oauth is not None
+    calls: list[str] = []
+
+    async def warm_up() -> None:
+        calls.append("warm_up")
+
+    monkeypatch.setattr(server.oauth, "warm_up", warm_up)
+    monkeypatch.setattr(server.oauth, "close", lambda: calls.append("close"))
+    server.build_app()
+
+    @contextlib.asynccontextmanager
+    async def host(app: Any) -> AsyncIterator[None]:
+        async with server.lifespan():
+            calls.append("serving")
+            yield
+
+    async with host(None):
+        await asyncio.sleep(0)
+    assert calls == ["warm_up", "serving", "close"]
 
 
 def test_oauth_must_be_a_resource_server() -> None:

@@ -18,8 +18,12 @@ if TYPE_CHECKING:
 class ClientContext:
     """Per-connection state threaded through the dispatcher.
 
-    ``client_id`` is the rate-limiting key: the API-key fingerprint when the
-    client authenticated, otherwise a transport address such as ``ip:...``.
+    ``client_id`` is the rate-limiting key: the API-key fingerprint or the
+    OAuth principal's fingerprint when the client authenticated, otherwise a
+    transport address such as ``ip:...``.  In a session, ``identity`` is the
+    one the current request's own credential resolved to (see
+    ``MCPServer._request_context``); for an API key that is always the
+    session's.
 
     ``protocol_version`` is the version negotiated by ``initialize`` on this
     connection or session, ``None`` before it; stateless requests carry
