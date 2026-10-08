@@ -430,7 +430,7 @@ class MCPServer:
             if modern:
                 result: Any = self._dispatch_modern(method, context)
             elif method == "initialize":
-                result = self._handle_initialize(params)
+                result = self._handle_initialize(params, context)
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -460,9 +460,14 @@ class MCPServer:
     def _server_info(self) -> dict[str, Any]:
         return {"name": self.name, "version": self.version}
 
-    def _handle_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_initialize(
+        self, params: dict[str, Any], context: ClientContext
+    ) -> dict[str, Any]:
+        version = negotiate_protocol_version(params.get("protocolVersion"))
+        # Later requests on this connection or session are spoken in it.
+        context.protocol_version = version
         result: dict[str, Any] = {
-            "protocolVersion": negotiate_protocol_version(params.get("protocolVersion")),
+            "protocolVersion": version,
             "capabilities": self._capabilities(),
             "serverInfo": self._server_info(),
         }

@@ -20,6 +20,11 @@ class ClientContext:
 
     ``client_id`` is the rate-limiting key: the API-key fingerprint when the
     client authenticated, otherwise a transport address such as ``ip:...``.
+
+    ``protocol_version`` is the version negotiated by ``initialize`` on this
+    connection or session, ``None`` before it; stateless requests carry
+    their own.  New fields are only ever appended, with defaults, so
+    positional construction keeps working.
     """
 
     client_id: str
@@ -27,6 +32,7 @@ class ClientContext:
     identity: ClientIdentity | None = None
     tool_calls: dict[str, int] = field(default_factory=dict)
     in_flight: dict[Any, asyncio.Task[Any]] = field(default_factory=dict)
+    protocol_version: str | None = None
 
 
 class Transport(abc.ABC):
