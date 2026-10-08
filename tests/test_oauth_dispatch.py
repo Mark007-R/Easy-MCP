@@ -32,6 +32,7 @@ from easy_mcp.security.oauth import principal_fingerprint
 ISSUER = "https://auth.example.com"
 RESOURCE = "https://mcp.example.com/mcp"
 KEY = "dispatch-test-key-" + "k" * 14
+NOT_A_KEY = "not-a-key-" + "x" * 12
 
 
 def token_identity(
@@ -261,7 +262,7 @@ async def test_authenticate_request_rules(
     assert key_identity is not None and key_identity.issuer is None
     assert await server.authenticate_request(api_key=KEY) == key_identity
     with pytest.raises(AuthenticationError, match="Invalid API key"):
-        await server.authenticate_request(api_key="not-a-key-but-maybe-a-token")
+        await server.authenticate_request(api_key=NOT_A_KEY)
     assert verifier.tokens == []
     # A bearer value that is no key is a token, verified for whoever sent it.
     token = await server.authenticate_request(bearer="a-token", api_key=KEY, client="ip:10.0.0.1")

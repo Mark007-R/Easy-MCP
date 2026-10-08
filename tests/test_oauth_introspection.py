@@ -39,7 +39,8 @@ ISSUER = "https://auth.example.com"
 RESOURCE = "https://mcp.example.com/mcp"
 ENDPOINT = f"{ISSUER}/introspect"
 NOW = 1_800_000_000.0
-TOKEN = "opaque-token-value-0123456789"
+# Built, not written out, so secret scanners do not mistake the fixture for a credential.
+TOKEN = "opaque-" + "t" * 22
 
 
 class Clock:
