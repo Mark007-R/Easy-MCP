@@ -339,8 +339,8 @@ class Stream:
             for line in lines:
                 if line.startswith("data: "):
                     self.events.append(line[len("data: ") :])
-        except httpx.HTTPError:
-            pass
+        except Exception:
+            pass  # closed under the reader by close(), or by the server
         finally:
             self.ended.set()
 

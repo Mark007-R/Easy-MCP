@@ -152,6 +152,28 @@ def pair(serve: Callable[..., Worker], **options: Any) -> tuple[FakeHub, Worker,
     return hub, serve(hub.store(WORKER_A), **options), serve(hub.store(WORKER_B), **options)
 
 
+# One client per thread, kept open: a client of its own per request costs a
+# new connection and certificate store each time, which on a slow machine
+# eats the short idle timeouts some tests use.
+_local = threading.local()
+_clients: list[httpx.Client] = []
+
+
+def client() -> httpx.Client:
+    found: httpx.Client | None = getattr(_local, "client", None)
+    if found is None:
+        found = _local.client = httpx.Client(timeout=10)
+        _clients.append(found)
+    return found
+
+
+@pytest.fixture(scope="module", autouse=True)
+def close_clients() -> Iterator[None]:
+    yield
+    while _clients:
+        _clients.pop().close()
+
+
 def post(
     worker: Worker,
     message: dict[str, Any],
@@ -165,7 +187,7 @@ def post(
         headers["Authorization"] = f"Bearer {key}"
     if session is not None:
         headers["MCP-Session-Id"] = session
-    return httpx.post(f"{worker.base}/mcp", json=message, headers=headers, timeout=timeout)
+    return client().post(f"{worker.base}/mcp", json=message, headers=headers, timeout=timeout)
 
 
 def open_session(worker: Worker, key: str | None = KEY_A) -> str:
@@ -396,9 +418,9 @@ def test_idle_expiry_is_audited_with_a_session_ref(
 
 
 def test_a_long_call_keeps_its_session_alive(serve: Callable[..., Worker]) -> None:
-    _, a, b = pair(serve, idle=0.3)
+    _, a, b = pair(serve, idle=0.5)
     session = open_session(a)
-    answered = post(a, call("slow", 2, seconds=1.0), session=session)
+    answered = post(a, call("slow", 2, seconds=1.5), session=session)
     assert text(answered) == "slept"
     assert post(b, rpc("ping", msg_id=3), session=session).status_code == 200
 
@@ -406,7 +428,7 @@ def test_a_long_call_keeps_its_session_alive(serve: Callable[..., Worker]) -> No
 def test_a_session_ended_elsewhere_cancels_local_calls_on_heartbeat(
     serve: Callable[..., Worker],
 ) -> None:
-    hub, a, _ = pair(serve, idle=0.6)
+    hub, a, _ = pair(serve, idle=1.5)
     session = open_session(a)
     running = Background(lambda: post(a, call("slow", 2), session=session, timeout=20))
     assert a.signals.started.wait(5)
@@ -473,11 +495,8 @@ def sse() -> Iterator[Callable[[Worker], tuple[Any, Iterator[str], str]]]:
 
 
 def post_message(worker: Worker, endpoint: str, message: dict[str, Any]) -> httpx.Response:
-    return httpx.post(
-        f"{worker.base}{endpoint}",
-        json=message,
-        headers={"Authorization": f"Bearer {KEY_A}"},
-        timeout=10,
+    return client().post(
+        f"{worker.base}{endpoint}", json=message, headers={"Authorization": f"Bearer {KEY_A}"}
     )
 
 
