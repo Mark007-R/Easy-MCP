@@ -220,7 +220,7 @@ class RequestInfo:
     _request_id: Any
     _request_layers: tuple[RequestMiddleware, ...]
     _session_id: str | None
-    _state: dict[str, Any] | None
+    _state: dict[str, Any]
     _stateless: bool
     _tool: ToolDefinition | None
     _tool_layers: tuple[ToolMiddleware, ...]
@@ -261,7 +261,9 @@ class RequestInfo:
         self._params = params
         self._params_view = None
         self._meta = None
-        self._state = None
+        # Made now rather than on first use: a sync tool's thread and a
+        # middleware on the loop may reach for it at the same time.
+        self._state = {}
         # The middleware registered when the request arrived; registering
         # more while it is served affects only later requests.
         self._request_layers = request_layers
@@ -356,9 +358,11 @@ class RequestInfo:
 
     @property
     def state(self) -> dict[str, Any]:
-        """Scratch space shared by this request's middleware and its tool."""
-        if self._state is None:
-            self._state = {}
+        """Scratch space shared by this request's middleware and its tool.
+
+        The one mutable thing middleware gets.  A sync tool writing to it from
+        its thread while a middleware reads it on the loop needs its own lock.
+        """
         return self._state
 
     def __repr__(self) -> str:

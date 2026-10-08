@@ -1599,7 +1599,7 @@ def test_credential_headers_are_never_exposed() -> None:
 # ------------------------------------------------------------- cancellation
 
 
-async def test_cancel_reaches_middleware_before_the_tool_starts(logs: LogCapture) -> None:
+async def test_cancel_reaches_request_middleware_before_the_tool_starts(logs: LogCapture) -> None:
     server = make_server()
     entered = asyncio.Event()
     saw: list[str] = []
