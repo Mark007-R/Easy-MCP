@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from typing import Any
 
 import httpx
 import pytest
+from conftest import rpc
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
-from easy_mcp import MCPServer, MemoryStore
+from easy_mcp import MCPServer, MemoryStore, SSETransport, StreamableHTTPTransport
+from easy_mcp.exceptions import TOO_MANY_SESSIONS
 from easy_mcp.security.ratelimit import SlidingWindowRateLimiter
 from easy_mcp.store import Reservation, SessionRecord
 from easy_mcp.store.base import session_ref
 from easy_mcp.store.memory import STATELESS_CLIENTS_MAX
+
+ACCEPT = {"Accept": "application/json, text/event-stream"}
+INIT = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
 
 
 class Clock:
@@ -204,6 +211,71 @@ def test_memory_store_records_the_negotiated_version() -> None:
     # The kind is part of a session's identity.
     assert run_now(store.acquire_session("sse", rec.ref, ttl=None)) == (None, [])
     assert run_now(store.delete_session("sse", rec.ref)) is None
+
+
+def test_memory_sessions_stay_with_the_endpoint_that_opened_them(
+    live_server: Callable[[Any], str],
+) -> None:
+    # One server behind two transports of each kind: as in 0.3.1, a session
+    # is unknown to every endpoint but the one that opened it.
+    server = MCPServer(port=0, rate_limit_per_minute=None, max_sessions=1)
+    ran: list[int] = []
+
+    @server.tool
+    def add(a: int, b: int) -> int:
+        """Add two integers."""
+        ran.append(a + b)
+        return a + b
+
+    http_one = StreamableHTTPTransport(server, legacy_sse=False)
+    http_two = StreamableHTTPTransport(server, legacy_sse=False)
+    sse_one, sse_two = SSETransport(server), SSETransport(server)
+    mounts = {"/h1": http_one, "/h2": http_two, "/s1": sse_one, "/s2": sse_two}
+    base = live_server(
+        Starlette(routes=[Mount(path, transport.build_app()) for path, transport in mounts.items()])
+    )
+    with httpx.Client(base_url=base, timeout=10) as client:
+        opened = client.post("/h1/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        session = opened.headers["mcp-session-id"]
+        headers = {**ACCEPT, "MCP-Session-Id": session}
+        assert (
+            client.post("/h2/mcp", json=rpc("ping", msg_id=2), headers=headers).status_code == 404
+        )
+        assert client.delete("/h2/mcp", headers=headers).status_code == 404
+        assert (
+            client.post("/h1/mcp", json=rpc("ping", msg_id=3), headers=headers).status_code == 200
+        )
+        # max_sessions counts the server's sessions of a kind, on every endpoint.
+        refused = client.post("/h2/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        assert refused.status_code == 503
+        assert refused.json()["error"]["code"] == TOO_MANY_SESSIONS
+        with client.stream("GET", "/s1/sse") as stream:
+            endpoint = next(
+                line[len("data: ") :] for line in stream.iter_lines() if line.startswith("data: ")
+            )
+            call = rpc("tools/call", {"name": "add", "arguments": {"a": 40, "b": 2}}, 4)
+            assert client.post(f"/s2{endpoint}", json=call).status_code == 404
+    assert ran == []
+    assert http_two._manager.local_sessions() == [] and sse_two._manager.local_sessions() == []
+
+
+async def test_memory_sessions_expire_by_their_own_endpoints_timeout() -> None:
+    clock = Clock()
+    server = MCPServer(port=0, rate_limit_per_minute=None, store=MemoryStore(clock=clock))
+    patient = StreamableHTTPTransport(server, session_idle_timeout=3600)
+    hasty = StreamableHTTPTransport(server, session_idle_timeout=1)
+
+    def client(transport: StreamableHTTPTransport) -> httpx.AsyncClient:
+        app = httpx.ASGITransport(app=transport.build_app())
+        return httpx.AsyncClient(transport=app, base_url="http://127.0.0.1")
+
+    async with client(patient) as one, client(hasty) as two:
+        opened = await one.post("/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        headers = {**ACCEPT, "MCP-Session-Id": opened.headers["mcp-session-id"]}
+        clock.now += 60
+        # Opening a session on the other endpoint prunes only what has expired.
+        assert (await two.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)).is_success
+        assert (await one.post("/mcp", json=rpc("ping", msg_id=2), headers=headers)).is_success
 
 
 def test_a_store_binds_to_one_server() -> None:

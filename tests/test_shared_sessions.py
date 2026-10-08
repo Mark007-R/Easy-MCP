@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime
 import json
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,13 +24,21 @@ import uvicorn
 from conftest import LogCapture, headers_for, modern, notification, rpc
 from shared_store_fake import FakeHub, everything, records
 
-from easy_mcp import APIKeyAuth, MCPServer, StreamableHTTPTransport, current_cancel_token
+from easy_mcp import (
+    APIKeyAuth,
+    MCPServer,
+    SSETransport,
+    StreamableHTTPTransport,
+    current_cancel_token,
+)
 from easy_mcp.exceptions import (
     FORBIDDEN,
     INTERNAL_ERROR,
     RATE_LIMITED,
+    SERVER_BUSY,
     SESSION_LIMIT_EXCEEDED,
     TOO_MANY_SESSIONS,
+    ProtocolError,
 )
 from easy_mcp.security.auth import fingerprint
 from easy_mcp.store.base import session_ref
@@ -126,10 +136,15 @@ def make_server(store: Any, signals: Signals, **options: Any) -> MCPServer:
 def serve() -> Iterator[Callable[..., Worker]]:
     running: list[Worker] = []
 
-    def start(store: Any, *, idle: float | None = 3600.0, **options: Any) -> Worker:
+    def start(
+        store: Any, *, idle: float | None = 3600.0, sse_only: bool = False, **options: Any
+    ) -> Worker:
         signals = Signals()
         server = make_server(store, signals, **options)
-        app = StreamableHTTPTransport(server, session_idle_timeout=idle).build_app()
+        if sse_only:
+            app = SSETransport(server).build_app()
+        else:
+            app = StreamableHTTPTransport(server, session_idle_timeout=idle).build_app()
         uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
         thread = threading.Thread(target=uv.run, daemon=True)
         thread.start()
@@ -281,6 +296,35 @@ def test_credential_binding_holds_on_every_worker(
     assert hijack.status_code == 200
     assert hijack.json()["error"]["message"] == "Unknown tool: admin"
     assert post(b, call("admin", 4), session=session, key=KEY_A).status_code == 403
+
+
+class Clock:
+    """A hand-moved clock for a FakeHub, read from every worker's thread."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_refused_requests_do_not_keep_a_session_alive(serve: Callable[..., Worker]) -> None:
+    # As with MemoryStore: a request refused for its credential (403) or its
+    # version header (400) leaves the session's idle time running.
+    clock = Clock()
+    hub = FakeHub(clock=clock)
+    a = serve(hub.store(WORKER_A), idle=1.0)
+    b = serve(hub.store(WORKER_B), idle=1.0)
+    other_key, bad_version = open_session(a), open_session(a)
+    clock.now += 0.8
+    assert post(b, rpc("ping", msg_id=2), session=other_key, key=KEY_B).status_code == 403
+    headers = {**ACCEPT, "Authorization": f"Bearer {KEY_A}", "MCP-Session-Id": bad_version}
+    headers["MCP-Protocol-Version"] = "1999-01-01"
+    refused = client().post(f"{b.base}/mcp", json=rpc("ping", msg_id=3), headers=headers)
+    assert refused.status_code == 400
+    clock.now += 0.8  # 1.6 s after the last accepted request
+    for session in (other_key, bad_version):
+        assert post(a, rpc("ping", msg_id=4), session=session).status_code == 404
 
 
 def test_delete_on_one_worker_ends_the_session_everywhere(serve: Callable[..., Worker]) -> None:
@@ -589,6 +633,92 @@ def test_sse_relay_of_an_oversized_answer_is_an_error(
     # Under the cap, it is relayed.
     assert post_message(b, endpoint, call("big", 2, size=1000)).status_code == 202
     assert len(json.loads(next_data(lines))["result"]["content"][0]["text"]) == 1000
+
+
+def test_sse_relay_of_an_answer_that_is_not_plain_json(
+    serve: Callable[..., Worker], sse: Callable[[Worker], Any], logs: LogCapture
+) -> None:
+    # Answered on the stream whichever worker the message reached, as the
+    # stream's own worker writes it: str() for what JSON has no type for.
+    _, a, b = pair(serve)
+    ticket = uuid.uuid4()
+    data: dict[Any, Any] = {"ticket": ticket, "until": datetime.date(2030, 1, 1), 7: "mixed keys"}
+
+    async def refuse(request: Any, call_next: Any) -> Any:
+        if request.method == "tools/call":
+            name = request.params.get("name")
+            raise ProtocolError(
+                "refused", code=-32001, data={(1, 2): "x"} if name == "big" else data
+            )
+        return await call_next()
+
+    for worker in (a, b):
+        worker.server.middleware(refuse)
+    _, lines, endpoint = sse(a)
+    expected = {"ticket": str(ticket), "until": "2030-01-01", "7": "mixed keys"}
+    for worker, msg_id in ((a, 1), (b, 2)):
+        assert post_message(worker, endpoint, call("add", msg_id, a=1, b=1)).status_code == 202
+        answer = json.loads(next_data(lines))
+        assert answer["id"] == msg_id and answer["error"]["data"] == expected
+    # What no JSON can carry still gets an answer, rather than none.
+    assert post_message(b, endpoint, call("big", 3, size=1)).status_code == 202
+    answer = json.loads(next_data(lines))
+    assert answer["id"] == 3 and answer["error"]["code"] == INTERNAL_ERROR
+    (failed,) = logs.events("sse_relay_failed")
+    assert failed["reason"] == "unserializable"
+    assert failed["error_id"] in answer["error"]["message"]
+
+
+def test_sse_relay_that_fails_still_answers(
+    serve: Callable[..., Worker],
+    sse: Callable[[Worker], Any],
+    logs: LogCapture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*args: Any) -> None:
+        raise RuntimeError("a bug in the relay")
+
+    _, a, b = pair(serve)
+    _, lines, endpoint = sse(a)
+    monkeypatch.setattr("easy_mcp.transport.sse._negotiated", broken)
+    assert post_message(b, endpoint, call("add", 1, a=1, b=1)).status_code == 202
+    answer = json.loads(next_data(lines))
+    assert answer["id"] == 1 and answer["error"]["code"] == INTERNAL_ERROR
+    error_id = answer["error"]["message"].split("error_id=")[1].rstrip(")")
+    assert f"could not relay an answer error_id={error_id}" in logs.text
+
+
+@pytest.mark.parametrize("sse_only", [False, True], ids=["streamable-http", "sse"])
+def test_sse_calls_a_stopping_worker_relays_are_answered(
+    serve: Callable[..., Worker],
+    sse: Callable[[Worker], Any],
+    monkeypatch: pytest.MonkeyPatch,
+    sse_only: bool,
+) -> None:
+    # B stops while it serves calls for the stream A holds, whose client
+    # still listens: they get the grace a Streamable HTTP request gets, then
+    # an answer to retry shortly.
+    for module in ("streamable_http", "sse"):
+        monkeypatch.setattr(f"easy_mcp.transport.{module}._SHUTDOWN_GRACE_SECONDS", 1.0)
+    hub = FakeHub()
+    a = serve(hub.store(WORKER_A))
+    b = serve(hub.store(WORKER_B), sse_only=sse_only)
+    _, lines, endpoint = sse(a)
+    assert post_message(b, endpoint, call("slow", 1, seconds=0.3)).status_code == 202
+    assert post_message(b, endpoint, call("slow", 2, seconds=30)).status_code == 202
+    assert b.signals.started.wait(5)
+    b.stop()
+    answers = {}
+    for _ in range(2):
+        answer = json.loads(next_data(lines))
+        answers[answer["id"]] = answer
+    assert answers[1]["result"]["content"][0]["text"] == "slept"  # within the grace
+    error = answers[2]["error"]
+    assert error["code"] == SERVER_BUSY and error["data"] == {"reason": "shutdown"}
+    assert b.signals.cancelled.is_set()
+    # The stream lives on, served by A.
+    assert post_message(a, endpoint, call("add", 3, a=1, b=2)).status_code == 202
+    assert json.loads(next_data(lines))["id"] == 3
 
 
 def test_sse_relay_to_a_dead_owner_is_audited(

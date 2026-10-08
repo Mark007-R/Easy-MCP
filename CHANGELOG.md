@@ -191,8 +191,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `Retry-After: 1`) rather than served without their limits. No new error
   code: the stateless revision allows none in `-32000..-32019`.
 
-  `MemoryStore` is the default and behaves as 0.3.1 did. The stdio transport
-  keeps its state in process whatever store is configured.
+  `MemoryStore` is the default and behaves as 0.3.1 did, bar one change to
+  `max_sessions` (see Changed). The stdio transport keeps its state in
+  process whatever store is configured.
 - `MCPServer.acheck_rate_limit(client_id)`, the async counterpart of
   `check_rate_limit()` that charges the store's budget, shared between
   workers with `RedisStore`. `check_rate_limit()` is unchanged and keeps the
@@ -202,9 +203,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   dispatch the session's (or stateless client's) state in the store; the HTTP
   transports set it, and a context without one (stdio, a direct `dispatch`)
   counts and cancels in the context itself, as before.
-- Audit events for sessions carry `session_ref`, a digest of the session id
-  (and `protocol_version` on `session_open`, `transport` on legacy SSE
-  events); with a shared store they also carry `worker`. New events:
+- Audit events for sessions carry `session_ref`, a digest of the session id,
+  and `transport` on legacy SSE events; with a shared store they also carry
+  `worker`. On Streamable HTTP, `session_open` carries the negotiated
+  `protocol_version` (legacy SSE and stdio sessions are audited as open
+  before their `initialize` arrives). New events:
   `bus_message_rejected` and `sse_relay_failed`. Legacy SSE `session_close`
   events now carry a `reason` (`stream_closed`, `shutdown`, `lease_lost`).
 - `MCPServer.lifespan()` also connects the store at startup and closes it
@@ -272,11 +275,17 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   needs `EASY_MCP_API_KEYS`.
 - `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`,
   where metadata is served.
-- With a shared store, `max_sessions` caps the sessions of all workers
-  together (still separately for Streamable HTTP and legacy SSE), and
-  `session_idle_timeout=None` is refused, because sessions in a shared store
-  must expire. Stopping a worker no longer ends the sessions it served,
-  except those whose legacy SSE stream it held.
+- `max_sessions` caps the sessions of a server, still separately for
+  Streamable HTTP and legacy SSE: those of every endpoint serving it count
+  together (in 0.3.1 each transport counted its own), and with a shared
+  store those of all workers. A session is still known only to the endpoint
+  that opened it.
+- With a shared store, `session_idle_timeout=None` is refused, because
+  sessions in a shared store must expire. Stopping a worker no longer ends
+  the sessions it served, except those whose legacy SSE stream it held; the
+  legacy SSE messages it serves for a stream another worker holds get the
+  same 5 s as its Streamable HTTP requests, then a `-32008` answer
+  (`data.reason: "shutdown"`) on that stream.
 - With a shared store, `/healthz` reports `"store"` and answers 503 when the
   store cannot be reached. Its response is unchanged with the default store.
 - With `RedisStore`, a stateless client's call counts lapse after

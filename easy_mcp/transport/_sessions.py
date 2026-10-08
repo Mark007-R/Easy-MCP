@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import time
 import uuid
 from collections import OrderedDict
@@ -310,11 +311,19 @@ class SessionManager:
 
     # ------------------------------------------------------------- lookups
 
-    async def acquire(self, session_id: str | None) -> LocalSession | Rejection:
+    async def acquire(
+        self,
+        session_id: str | None,
+        *,
+        identity: ClientIdentity | None = None,
+        extend: bool = True,
+    ) -> LocalSession | Rejection:
         """The session *session_id* names, held for one request until :meth:`finish`.
 
         Neither the credential nor the version header is checked
-        (:meth:`resolve` does both).
+        (:meth:`resolve` does both).  A shared store extends the session's
+        life only for a request that may be served: with *extend*, and if
+        the session is bound to *identity*.
         """
         if not session_id:
             return Rejection.MISSING_HEADER
@@ -326,15 +335,25 @@ class SessionManager:
             # Its stream is here: this worker knows all there is to know.
             local.active += 1
             return local
+        if local is None and not self.store.shared:
+            # Every session of this endpoint in this process is held here
+            # until it ends; another endpoint's is none of its business.
+            return Rejection.NOT_FOUND
         self._pending_add(ref, session_id)
+        binding = (identity.fingerprint if identity is not None else None, principal_ref(identity))
         try:
-            record, expired = await self.store.acquire_session(self._kind, ref, ttl=self._touch_ttl)
+            record, expired = await self.store.acquire_session(
+                self._kind, ref, ttl=self._touch_ttl if extend else None, binding=binding
+            )
         except StoreUnavailableError:
             return Rejection.UNAVAILABLE
         finally:
             self._pending_remove(ref)
         self._expire(expired)
         if record is None:
+            local = self._local.get(ref)
+            if local is not None and not self.store.shared:
+                self._end_here(local)  # expired, and removed by another endpoint
             return Rejection.NOT_FOUND
         if self._recently_ended(ref):
             # Ended while the store was asked: the end has been announced.
@@ -382,16 +401,20 @@ class SessionManager:
 
         In order: a missing id, an unknown session (or the store out of
         reach), another credential than the one it was opened with, an
-        unsupported ``MCP-Protocol-Version`` header.
+        unsupported ``MCP-Protocol-Version`` header.  A refused request
+        does not keep the session alive.
         """
-        local = await self.acquire(session_id)
+        bad_version = version_header is not None and (
+            version_header not in SUPPORTED_PROTOCOL_VERSIONS
+        )
+        local = await self.acquire(session_id, identity=identity, extend=not bad_version)
         if isinstance(local, Rejection):
             return local
         if not self.binds(local, identity):
             self.credential_mismatch(local)
             await self.finish(local, touch=False)
             return Rejection.FORBIDDEN
-        if version_header is not None and version_header not in SUPPORTED_PROTOCOL_VERSIONS:
+        if bad_version:
             await self.finish(local, touch=False)
             return Rejection.BAD_VERSION
         return local
@@ -440,6 +463,9 @@ class SessionManager:
             )
         except StoreUnavailableError:
             pass  # it lapses on its own; the store logged the outage
+        except Exception:
+            # Never raised to the caller: the request has been answered.
+            self._server._logger.error("could not release a session in the store", exc_info=True)
 
     # -------------------------------------------------------------- ending
 
@@ -642,16 +668,28 @@ class SessionManager:
     ) -> None:
         """Send *message*, an answer for *local*'s legacy SSE stream, to the worker holding it.
 
-        An answer larger than the relay cap is replaced by a ``-32603``
-        error, so the client still learns the request failed.
+        It travels as the stream's worker would write an answer of its own,
+        ``str()`` standing in for anything JSON has no type for.  An answer
+        larger than the relay cap, or that no JSON can carry, is replaced by
+        a ``-32603`` error, so the client still learns the request failed.
         """
-        if len(_bus.canonical(message)) > _bus.RELAY_MAX_BYTES:
+        try:
+            # Without sort_keys, as the stream writes it: keys of mixed types
+            # are fine there.  canonical() alone would refuse a UUID.
+            message = json.loads(json.dumps(message, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            failure: str | None = "unserializable"
+        else:
+            too_large = len(_bus.canonical(message)) > _bus.RELAY_MAX_BYTES
+            failure = "too_large" if too_large else None
+        if failure is not None:
             error_id = uuid.uuid4().hex[:12]
             self._server._logger.error(
-                "answer too large to relay to the worker holding the stream error_id=%s",
+                "could not relay an answer to the worker holding the stream (%s) error_id=%s",
+                failure,
                 error_id,
             )
-            audit("sse_relay_failed", session_ref=local.ref, reason="too_large", error_id=error_id)
+            audit("sse_relay_failed", session_ref=local.ref, reason=failure, error_id=error_id)
             message = {
                 "jsonrpc": "2.0",
                 "id": message.get("id"),

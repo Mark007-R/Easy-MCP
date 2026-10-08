@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import json
 import math
 from collections.abc import Iterable
@@ -245,6 +246,22 @@ class BaseHTTPTransport(Transport):
     def _forced_exit(self) -> bool:
         """Whether uvicorn was told to quit without waiting (a second Ctrl-C)."""
         return self._uvicorn is not None and bool(self._uvicorn.force_exit)
+
+    async def _grace(self, tasks: set[asyncio.Task[Any]], seconds: float) -> set[asyncio.Task[Any]]:
+        """Give *tasks* up to *seconds* to finish at shutdown; returns those still running.
+
+        A forced quit (a second Ctrl-C) ends the grace at once; uvicorn
+        checks for one as often while it waits for connections.
+        """
+        running = set(tasks)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while running and not self._forced_exit():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _, running = await asyncio.wait(running, timeout=min(0.1, remaining))
+        return running
 
     def stop(self) -> None:
         """Ask the running uvicorn server to exit gracefully."""

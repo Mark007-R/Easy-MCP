@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from conftest import LogCapture
-from shared_store_fake import FakeHub
+from shared_store_fake import FakeHub, FakeSharedStore
 
 from easy_mcp import MCPServer, StreamableHTTPTransport
 from easy_mcp.store.base import session_ref
@@ -211,5 +211,41 @@ async def test_an_end_announced_while_a_lookup_is_under_way_is_not_missed() -> N
     manager._on_bus(from_peer("end"))
     manager._pending_remove(session_ref(SESSION))
     assert await manager.acquire(SESSION) is _sessions.Rejection.NOT_FOUND
+    await manager.shutdown()
+    await opener.shutdown()
+
+
+class EndedDuringLookup(FakeSharedStore):
+    """A store whose session another worker ends while it is being looked up."""
+
+    manager: Any = None
+
+    async def acquire_session(self, *args: Any, **kwargs: Any) -> Any:
+        found = await super().acquire_session(*args, **kwargs)
+        # With Redis, the bus listener runs while the lookup's round trip is
+        # suspended: here, between the store's answer and acquire() seeing it.
+        self.manager._on_bus(from_peer("end"))
+        return found
+
+
+async def test_an_end_announced_during_the_store_call_is_not_missed() -> None:
+    hub = FakeHub()
+    store = EndedDuringLookup(hub, WORKER)
+    hub.stores.append(store)
+    manager = StreamableHTTPTransport(
+        MCPServer(port=0, rate_limit_per_minute=None, store=store)
+    )._manager
+    store.manager = manager
+    opener = StreamableHTTPTransport(
+        MCPServer(port=0, rate_limit_per_minute=None, store=hub.store("1" * 16))
+    )._manager
+    local = await opener.open(SESSION, client_id="ip:x", identity=None)
+    assert local is not None
+    await opener.finish(local)
+    del hub.calls[:]
+    # The store found the session, but it ended meanwhile: not served.
+    assert await manager.acquire(SESSION) is _sessions.Rejection.NOT_FOUND
+    assert hub.calls == ["acquire", "release"]  # the hold is given back, untouched
+    assert session_ref(SESSION) not in manager._local
     await manager.shutdown()
     await opener.shutdown()

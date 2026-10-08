@@ -21,6 +21,7 @@ from easy_mcp import (
     RedisStore,
     SSETransport,
     StdioTransport,
+    StoreUnavailableError,
     StreamableHTTPTransport,
     Transport,
 )
@@ -172,6 +173,23 @@ def test_a_rate_limit_without_its_store_refuses_everything(live_server: LiveServ
         refused = client.post("/mcp", json=listed, headers=headers_for(listed))
     assert refused.status_code == 503
     assert refused.json()["error"]["data"] == {"reason": "store_unavailable"}
+
+
+async def test_a_stateless_request_whose_client_cannot_be_noted_gets_503() -> None:
+    # Any Store method may raise StoreUnavailableError: touch_client too.
+    class Unreachable(MemoryStore):
+        async def touch_client(self, client_id: str, *, ttl: float | None) -> None:
+            raise StoreUnavailableError()
+
+    app = StreamableHTTPTransport(make_server(Unreachable())).build_app()
+    listed = modern("tools/list", msg_id=5)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        refused = await client.post("/mcp", json=listed, headers=headers_for(listed))
+    assert refused.status_code == 503 and refused.headers["retry-after"] == "1"
+    body = refused.json()
+    assert body["id"] == 5 and body["error"]["code"] == SERVER_BUSY
+    assert body["error"]["data"] == {"reason": "store_unavailable"}
 
 
 def test_healthz_reports_the_store(live_server: LiveServer) -> None:

@@ -338,24 +338,20 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         they are cancelled.  A request stopped or refused this way is
         answered ``503`` with ``-32008`` (retry shortly), and a handshake cut
         short opens no session.  With a shared store the sessions live on:
-        other workers serve them.
+        other workers serve them, and the legacy SSE messages relayed here
+        for a stream another worker holds get the same grace, then the same
+        answer on that stream.
         """
         self._closing = True
+        relays: set[asyncio.Task[Any]] = set()
         if self._legacy is not None:
             await self._legacy.close_all_sessions()
-        if self._dispatches:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + _SHUTDOWN_GRACE_SECONDS
-            running = set(self._dispatches)
-            # A forced quit (a second Ctrl-C) ends the grace at once; uvicorn
-            # checks for one as often while it waits for connections.
-            while running and not self._forced_exit():
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                _, running = await asyncio.wait(running, timeout=min(0.1, remaining))
-            for task in running:
-                task.cancel()
+            relays = self._legacy._relays()
+        running = await self._grace(self._dispatches | relays, _SHUTDOWN_GRACE_SECONDS)
+        for task in running - relays:
+            task.cancel()
+        if self._legacy is not None:
+            await self._legacy._stop_relays(running & relays)
         # Only now: a session's end cancels its requests as a client's cancel
         # would, and they would go unanswered.
         await self._manager.shutdown()
@@ -523,7 +519,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         # A context of its own, so nothing in flight is shared with other
         # requests; only the per-client call counts are, kept in the store.
         store = self._server.store
-        await store.touch_client(client_id, ttl=self._idle_timeout)
+        try:
+            await store.touch_client(client_id, ttl=self._idle_timeout)
+        except StoreUnavailableError:
+            return store_unavailable(msg_id)
         context = ClientContext(
             client_id=client_id,
             session_id="stateless",

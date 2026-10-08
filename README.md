@@ -354,10 +354,13 @@ answer someone else's call. If Redis cannot be reached, requests that need it
 are refused with `-32008` (`data.reason: "store_unavailable"`, HTTP `503`
 with `Retry-After`) instead of being served without their limits, and
 `/healthz` answers `503` with `"store": "unreachable"`, so a load balancer
-can take the worker out. Stateless requests that need no store (a call to
-a tool without `max_calls_per_session` when rate limiting is off, say) are
-still served. A session's requests need it, bar a legacy SSE message that
-reaches the worker holding its stream.
+can take the worker out. A request is refused the same way when Redis
+answers but refuses a write it needs (Redis full, read-only or failing to
+persist), while `/healthz`, which checks only that Redis answers, stays
+`200`. Stateless requests that need no store (a call to a tool without
+`max_calls_per_session` when rate limiting is off, say) are still served. A
+session's requests need it, bar a legacy SSE message that reaches the worker
+holding its stream.
 
 Give Redis TLS (`rediss://`), a user limited to the `easy-mcp:` keys and
 channels (the ACL is in [SECURITY.md](SECURITY.md)), and the default
@@ -530,8 +533,10 @@ async def expensive(query: str) -> str:
     """A tool with its own timeout and a per-session usage cap."""
 ```
 
-These limits count per process by default. With a shared store they count
-across every worker (see [Running several workers](#running-several-workers)).
+The rate limit and `max_calls_per_session` count per process by default; with
+a shared store they count across every worker (see
+[Running several workers](#running-several-workers)). Timeouts, payload caps
+and `max_sync_workers` always apply per process.
 
 Clients can also cancel long-running calls with the standard MCP
 `notifications/cancelled` message, or on a stateless HTTP request by closing
@@ -767,15 +772,18 @@ secret.
 
 Session events (`session_open`, `session_close`,
 `session_credential_mismatch`) carry `session_ref`, a digest of the session
-id that also names the session in the store, and `session_open` the
-negotiated `protocol_version`. The raw `session_id` is still there, but is
-dropped from audit events in 0.4: key log processing on `session_ref`. With a
-shared store, session events carry the `worker` that logged them,
+id that also names the session in the store. On Streamable HTTP,
+`session_open` also carries the negotiated `protocol_version`; legacy SSE and
+stdio sessions are audited as open before their `initialize` arrives, so
+theirs carries none. The raw `session_id` is still there, but is dropped from
+audit events in 0.4: key log processing on `session_ref`. With a shared
+store, session events carry the `worker` that logged them,
 `bus_message_rejected` records a message between workers that failed its
 authentication (`reason: "mac"`) or names another identity
 (`reason: "identity"`), and `sse_relay_failed` an answer that could not reach
-the worker holding a legacy SSE stream (`reason: "too_large"` or
-`"owner_unreachable"`).
+the worker holding a legacy SSE stream (`reason: "too_large"`,
+`"unserializable"` or `"owner_unreachable"`); the first two still reach the
+stream, as a `-32603` error with an `error_id`.
 
 ## Connecting a client
 

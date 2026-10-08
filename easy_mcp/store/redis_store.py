@@ -69,8 +69,10 @@ _DEFAULT_TTL = 3600.0
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-# Replies that mean "the store cannot serve this now" rather than a bug.
-_UNAVAILABLE_REPLIES = ("OOM", "READONLY", "MASTERDOWN", "NOSCRIPT", "LOADING")
+# Error replies that mean "the store cannot serve this now" rather than a bug.
+# redis-py raises its own class for most (see _call), with the code removed
+# from the message; these are the codes it leaves in place.
+_UNAVAILABLE_REPLIES = ("MISCONF", "BUSY", "NOREPLICAS")
 
 # KEYS: rec, idx   ARGV: ref, ttl_ms, cap, kind, cid, fp, own, pr
 SESSION_CREATE = """
@@ -89,10 +91,17 @@ redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[1])
 return {1, expired}
 """
 
-# KEYS: rec, idx   ARGV: ref, ttl_ms ('0' = keep), ver ('' = keep), want_record ('1'/'0')
+# KEYS: rec, idx   ARGV: ref, ttl_ms ('0' = keep), ver ('' = keep), want_record ('1'/'0'),
+# kind, and optionally fp, pr.  Both kinds share the record key, so a session
+# of another kind is left untouched.  Given fp and pr, ttl_ms extends only a
+# session bound to them: a request with another credential will be refused.
 SESSION_TOUCH = """
-if redis.call('EXISTS', KEYS[1]) == 0 then return false end
+if redis.call('HGET', KEYS[1], 'kind') ~= ARGV[5] then return false end
 local ttl = tonumber(ARGV[2])
+if ttl > 0 and ARGV[6] and (redis.call('HGET', KEYS[1], 'fp') ~= ARGV[6]
+    or redis.call('HGET', KEYS[1], 'pr') ~= ARGV[7]) then
+  ttl = 0
+end
 if ttl > 0 then
   local t = redis.call('TIME')
   local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -526,8 +535,17 @@ class RedisStore(Store):
         except (exceptions.ConnectionError, exceptions.TimeoutError, TimeoutError, OSError) as exc:
             self._unavailable(exc)
             raise StoreUnavailableError() from None
+        except (
+            exceptions.OutOfMemoryError,  # OOM: full, under noeviction
+            exceptions.ReadOnlyError,  # READONLY: a replica, or a demoted primary
+            exceptions.ClusterDownError,  # MASTERDOWN, CLUSTERDOWN
+            exceptions.TryAgainError,  # TRYAGAIN
+            exceptions.NoScriptError,  # NOSCRIPT: scripts flushed meanwhile
+        ) as exc:
+            self._unavailable(exc)
+            raise StoreUnavailableError() from None
         except exceptions.ResponseError as exc:
-            if str(exc).startswith(_UNAVAILABLE_REPLIES):
+            if str(exc).split(" ", 1)[0] in _UNAVAILABLE_REPLIES:
                 self._unavailable(exc)
                 raise StoreUnavailableError() from None
             raise
@@ -573,13 +591,17 @@ class RedisStore(Store):
         return status == 1, expired
 
     async def acquire_session(
-        self, kind: SessionKind, ref: str, *, ttl: float | None
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        ttl: float | None,
+        binding: tuple[str | None, str | None] | None = None,
     ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
-        reply = await self._run(
-            "touch",
-            [self._session_key(ref), self._index_key(kind)],
-            [ref, _ms(ttl) if ttl is not None else 0, "", "1"],
-        )
+        args: list[Any] = [ref, _ms(ttl) if ttl is not None else 0, "", "1", kind]
+        if binding is not None:
+            args += [binding[0] or "", binding[1] or ""]
+        reply = await self._run("touch", [self._session_key(ref), self._index_key(kind)], args)
         if not reply:
             return None, []
         record = _record(ref, reply)
@@ -602,7 +624,7 @@ class RedisStore(Store):
         await self._run(
             "touch",
             [self._session_key(ref), self._index_key(kind)],
-            [ref, ttl_ms, protocol_version or "", "0"],
+            [ref, ttl_ms, protocol_version or "", "0", kind],
         )
 
     async def refresh_sessions(

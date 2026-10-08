@@ -1,13 +1,14 @@
 """RedisStore across real worker processes and a real Redis.
 
 Skipped unless ``EASY_MCP_LIVE_REDIS_URL`` is set to an admin-capable URL of
-a scratch database, for example::
+a scratch database on a scratch Redis, for example::
 
     docker run -d --name easy-mcp-redis -p 6379:6379 redis:7-alpine
     EASY_MCP_LIVE_REDIS_URL=redis://127.0.0.1:6379/15 pytest tests/test_live_redis.py -v
 
 The tests use that URL themselves to create an ACL user with exactly the
-least-privilege rules SECURITY.md gives, to read keys and to clean up.  The
+least-privilege rules SECURITY.md gives, to read keys, to clean up, and for
+a moment to set ``maxmemory`` so low that Redis refuses writes.  The
 servers connect as that user, so every flow here also proves those rules are
 enough.  Each test starts worker processes with
 ``python -m uvicorn live_redis_app:app`` (tests/live_redis_app.py) in a
@@ -424,6 +425,37 @@ def test_live_credential_binding_across_processes(fleet: Callable[..., Fleet]) -
     assert b.events("session_credential_mismatch")
 
 
+def test_live_refused_requests_do_not_keep_a_session_alive(fleet: Callable[..., Fleet]) -> None:
+    group = fleet(idle=2)
+    a, b = group.workers
+    open_session(b)  # B's first request connects it to Redis
+    session = open_session(a, key=KEY_A)
+    record = f"easy-mcp:1:{{{group.namespace}}}:s:{session_ref(session)}"
+    other_key = {**ACCEPT, "Authorization": f"Bearer {KEY_B}", "MCP-Session-Id": session}
+    bad_version = {**ACCEPT, "Authorization": f"Bearer {KEY_A}", "MCP-Session-Id": session}
+    bad_version["MCP-Protocol-Version"] = "1999-01-01"
+    connection = admin()
+    codes: list[int] = []
+    try:
+        with httpx.Client(base_url=b.base, timeout=10) as client:
+            left = connection.pttl(record)
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                # Another credential (403) and an unsupported version header (400).
+                for headers in (other_key, bad_version):
+                    refused = client.post("/mcp", json=rpc("ping", msg_id=2), headers=headers)
+                    codes.append(refused.status_code)
+                remaining = connection.pttl(record)
+                if remaining > 0:
+                    assert remaining <= left, (left, remaining)  # never extended
+                    left = remaining
+    finally:
+        connection.close()
+    assert codes[:2] == [403, 400] and codes[-2:] == [404, 404], codes
+    assert post(a, rpc("ping", msg_id=3), session=session).status_code == 404
+
+
 def test_live_call_caps_are_global(fleet: Callable[..., Fleet]) -> None:
     a, b = fleet().workers
     session = open_session(a)
@@ -520,6 +552,33 @@ def test_live_sse_close_ends_the_session_everywhere(
     closed_at = time.monotonic()
     assert wait_until(lambda: stream.post(b, rpc("ping", msg_id=2)).status_code == 404, 2.0)
     assert time.monotonic() - closed_at < 1.5
+
+
+def test_live_an_sse_id_sent_to_mcp_touches_nothing(
+    fleet: Callable[..., Fleet], streams: Callable[[Process], Stream]
+) -> None:
+    group = fleet(max_sessions=1)
+    a, b = group.workers
+    stream = streams(a)
+    prefix = f"easy-mcp:1:{{{group.namespace}}}"
+    record = f"{prefix}:s:{session_ref(stream.session_id)}"
+    # A legacy SSE session's id names no Streamable HTTP session, on any worker.
+    for worker in (a, b):
+        assert post(worker, rpc("ping", msg_id=1), session=stream.session_id).status_code == 404
+        assert delete(worker, stream.session_id).status_code == 404
+    connection = admin()
+    try:
+        # Neither its lease stretched to the idle timeout nor a slot taken
+        # in the Streamable HTTP index.
+        assert connection.zcard(f"{prefix}:i:http") == 0
+        assert 0 < connection.pttl(record) <= 60_000
+        stream.close()
+        assert wait_until(lambda: connection.exists(record) == 0)
+        assert connection.zcard(f"{prefix}:i:http") == 0
+    finally:
+        connection.close()
+    # The one Streamable HTTP slot is still free.
+    open_session(b)
 
 
 # --------------------------------------------------------------- lifecycle
@@ -651,6 +710,29 @@ def test_live_least_privilege_acl_is_enough(user_url: str) -> None:
             connection.execute_command("HSET", "elsewhere", "f", "v")
     finally:
         connection.close()
+
+
+def test_live_a_full_redis_fails_closed(fleet: Callable[..., Fleet]) -> None:
+    # redis-py raises its own class for an OOM reply, with the code removed
+    # from the message: still an outage, answered 503 rather than 500.
+    (worker,) = fleet(1).workers
+    connection = admin()
+    saved = {name: connection.config_get(name)[name] for name in ("maxmemory", "maxmemory-policy")}
+    try:
+        connection.config_set("maxmemory-policy", "noeviction")
+        connection.config_set("maxmemory", "1")
+        answers = [
+            post(worker, rpc("initialize", INIT, "init")),
+            stateless(worker, modern("tools/call", {"name": "scarce"})),
+        ]
+    finally:
+        for name, value in saved.items():
+            connection.config_set(name, value)
+        connection.close()
+    for answer in answers:
+        assert answer.status_code == 503 and answer.headers["retry-after"] == "1", answer.text
+        assert answer.json()["error"]["code"] == SERVER_BUSY
+        assert answer.json()["error"]["data"] == {"reason": "store_unavailable"}
 
 
 def test_live_unreachable_store_fails_closed(fleet: Callable[..., Fleet]) -> None:

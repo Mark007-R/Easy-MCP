@@ -935,6 +935,16 @@ class MCPServer:
         except ProtocolError as exc:
             audit("rate_limited", client_id=context.client_id, method=method)
             return None if is_notification else _protocol_error_response(msg_id, exc)
+        except Exception:
+            # A store that failed in a way it does not report as an outage:
+            # still not served, and answered rather than raised.
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("rate limit check failed error_id=%s", error_id, exc_info=True)
+            if is_notification:
+                return None
+            return _error_response(
+                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
 
         if is_notification and not method.startswith("notifications/"):
             # Only requests invoke methods.  A tools/call without an id would

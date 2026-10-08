@@ -242,14 +242,23 @@ class Store(abc.ABC):
 
     @abc.abstractmethod
     async def acquire_session(
-        self, kind: SessionKind, ref: str, *, ttl: float | None
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        ttl: float | None,
+        binding: tuple[str | None, str | None] | None = None,
     ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
         """Look a session up and hold it for one request.
 
         A held session does not expire.  A shared store cannot know what is
         held, so it extends the session's life by *ttl* instead, and a
         worker running a long request keeps extending it
-        (:meth:`refresh_sessions`).
+        (:meth:`refresh_sessions`).  *binding* is the ``(identity_fp,
+        principal)`` the request presents: when given, only a session bound
+        to it is extended, since a request with another credential is
+        refused and must not keep the session alive.  A session of another
+        kind is neither found nor changed.
 
         Returns:
             The record (``None``: unknown or expired), and the session if it

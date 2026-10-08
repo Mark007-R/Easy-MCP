@@ -48,6 +48,7 @@ import contextlib
 import json
 import math
 import secrets
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
@@ -55,7 +56,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from ..exceptions import PARSE_ERROR, RateLimitError, StoreUnavailableError
+from ..exceptions import (
+    INTERNAL_ERROR,
+    PARSE_ERROR,
+    SERVER_BUSY,
+    RateLimitError,
+    StoreUnavailableError,
+)
 from ..logging import audit
 from ..middleware import TransportInfo
 from ._http import BaseHTTPTransport, store_unavailable
@@ -67,6 +74,12 @@ if TYPE_CHECKING:
 
 KEEPALIVE_SECONDS = 15.0
 
+# How long shutdown lets the messages relayed here for a stream another
+# worker holds finish, as Streamable HTTP does the requests it serves; and
+# how long it then waits for those it stopped to answer on their stream.
+_SHUTDOWN_GRACE_SECONDS = 5.0
+_STOPPED_ANSWER_SECONDS = 2.0
+
 
 def _shutting_down() -> Response:
     """The answer to a stream or message arriving once shutdown has begun."""
@@ -75,6 +88,18 @@ def _shutting_down() -> Response:
         status_code=503,
         headers={"Retry-After": "1"},
     )
+
+
+def _stopped(message: Any) -> dict[str, Any] | None:
+    """The answer to a request shutdown stopped: retry shortly (``None``: no request)."""
+    if not isinstance(message, dict) or "id" not in message:
+        return None
+    error = {
+        "code": SERVER_BUSY,
+        "message": "Server is shutting down; retry shortly",
+        "data": {"reason": "shutdown"},
+    }
+    return {"jsonrpc": "2.0", "id": message["id"], "error": error}
 
 
 class SSETransport(BaseHTTPTransport):
@@ -150,24 +175,53 @@ class SSETransport(BaseHTTPTransport):
 
     async def close_streams(self) -> None:
         await self.close_all_sessions()
+        await self._stop_relays(await self._grace(self._relays(), _SHUTDOWN_GRACE_SECONDS))
         await self._manager.shutdown()
 
     async def close_all_sessions(self) -> None:
-        """Unblock every open SSE stream so its connection can close.
+        """Unblock every SSE stream this worker holds so its connection can close.
 
-        Calls still running have nobody left to answer; they are cancelled
-        now rather than when each stream winds down, so shutdown can wait
-        for their cancel callbacks.  From now on new streams and messages
-        are refused (``503``): uvicorn may still be accepting connections,
-        and a stream opened now would never be closed, so shutdown would
-        wait for it forever.
+        The calls still running for those streams have nobody left to
+        answer; they are cancelled now rather than when each stream winds
+        down, so shutdown can wait for their cancel callbacks.  Messages
+        relayed here for a stream another worker holds (a shared store) are
+        left running: their client still listens, so shutdown gives them a
+        grace and then answers them on that stream (:meth:`_stop_relays`).
+        From now on new streams and messages are refused (``503``): uvicorn
+        may still be accepting connections, and a stream opened now would
+        never be closed, so shutdown would wait for it forever.
         """
         self._closing = True
         for session in self._manager.local_sessions():
+            if not session.owned:
+                continue  # its stream is on another worker
             for task in list(session.tasks):
                 task.cancel()
             if session.stream is not None:
                 await session.stream.put(CLOSE_STREAM)
+
+    def _relays(self) -> set[asyncio.Task[Any]]:
+        """The messages being served here for streams other workers hold."""
+        return {
+            task
+            for session in self._manager.local_sessions()
+            if not session.owned
+            for task in session.tasks
+        }
+
+    async def _stop_relays(self, running: set[asyncio.Task[Any]]) -> None:
+        """Stop the relays still *running* once their grace is over.
+
+        Only their dispatch is cancelled: each then tells its stream to
+        retry shortly, which is waited for, briefly, before the store closes.
+        """
+        if not running:
+            return
+        for session in self._manager.local_sessions():
+            if not session.owned:
+                for task in list(session.dispatches):
+                    task.cancel()
+        await asyncio.wait(running, timeout=_STOPPED_ANSWER_SECONDS)
 
     # ------------------------------------------------------------- endpoints
 
@@ -363,15 +417,46 @@ class SSETransport(BaseHTTPTransport):
     ) -> None:
         """Dispatch one message here and send its answer to the worker holding the stream.
 
-        The session stays held until the answer is sent.
+        The session stays held until the answer is sent.  A request whose
+        dispatch shutdown stops is answered ``-32008`` (retry shortly), as
+        Streamable HTTP answers one: its client still listens on the stream.
+        A session's end, or a cancel from its client, leaves it unanswered.
         """
         version: str | None = None
+        # A task of its own, so shutdown can stop the dispatch alone.
+        work = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
+        session.dispatches.add(work)
         try:
-            response = await self._server.dispatch(message, context, transport=info)
+            try:
+                response = await work
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if (task is not None and task.cancelling()) or not self._closing or session.ended:
+                    raise  # this relay was cancelled, not just its dispatch
+                response = _stopped(message)
             version = _negotiated(message, response, context)
             if response is not None:
                 await self._manager.relay(session, response, protocol_version=version)
+        except Exception:
+            # Nothing may be lost in this background task: the client waits for an answer.
+            error_id = uuid.uuid4().hex[:12]
+            self._server._logger.error(
+                "could not relay an answer error_id=%s", error_id, exc_info=True
+            )
+            if isinstance(message, dict) and "id" in message:
+                failed = {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {
+                        "code": INTERNAL_ERROR,
+                        "message": f"Internal server error (error_id={error_id})",
+                    },
+                }
+                await self._manager.relay(session, failed, protocol_version=None)
         finally:
+            session.dispatches.discard(work)
+            if not work.done():
+                work.cancel()  # the call must not outlive its relay
             await self._manager.finish(session, protocol_version=version)
 
 

@@ -1,4 +1,4 @@
-"""The default store: state lives in this process, exactly as in 0.3.1."""
+"""The default store: state lives in this process, as in 0.3.1."""
 
 from __future__ import annotations
 
@@ -30,6 +30,9 @@ STATELESS_CLIENTS_MAX = 4096
 class _Session:
     record: SessionRecord
     last_seen: float
+    # Its own idle timeout, the one its endpoint opened it with: another
+    # endpoint pruning expired sessions must not apply its own.
+    ttl: float | None
     active: int = 1  # requests holding it; a new session is held by its opener
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -43,11 +46,13 @@ class _Client:
 class MemoryStore(Store):
     """The default store: sessions, call counts and rate limits stay in this process.
 
-    It behaves exactly as 0.3.1 did: a session expires once it has been idle
-    for its ttl with no request running, ``max_sessions`` counts Streamable
-    HTTP and legacy SSE sessions separately, and stateless clients' counts
-    are kept for the 4096 most recently seen clients.  Its rate limiter is
-    the server's own in-process one.
+    It behaves as 0.3.1 did: a session expires once it has been idle for its
+    ttl with no request running, and stateless clients' counts are kept for
+    the 4096 most recently seen clients.  ``max_sessions`` counts Streamable
+    HTTP and legacy SSE sessions separately; unlike 0.3.1, it counts those of
+    every endpoint serving the server together, when one server is served at
+    several (each endpoint still knows only its own sessions).  Its rate
+    limiter is the server's own in-process one.
 
     No method awaits anything, so each call completes in one step of the
     event loop: no other request can run in between.
@@ -77,7 +82,8 @@ class MemoryStore(Store):
     # -------------------------------------------------------------- sessions
 
     @staticmethod
-    def _expired(entry: _Session, ttl: float | None, now: float) -> bool:
+    def _expired(entry: _Session, now: float) -> bool:
+        ttl = entry.ttl
         return ttl is not None and entry.active == 0 and now - entry.last_seen > ttl
 
     @staticmethod
@@ -95,7 +101,7 @@ class MemoryStore(Store):
         now = self._clock()
         expired: list[ExpiredSession] = []
         for ref, entry in list(self._sessions.items()):
-            if entry.record.kind == record.kind and self._expired(entry, ttl, now):
+            if entry.record.kind == record.kind and self._expired(entry, now):
                 del self._sessions[ref]
                 expired.append(self._gone(entry))
         live = sum(1 for entry in self._sessions.values() if entry.record.kind == record.kind)
@@ -105,16 +111,24 @@ class MemoryStore(Store):
             raise ValueError("a session with this ref exists already")
         if record.t0 is None:
             record = dataclasses.replace(record, t0=int(time.time() * 1000))
-        self._sessions[record.ref] = _Session(record=record, last_seen=now)
+        self._sessions[record.ref] = _Session(record=record, last_seen=now, ttl=ttl)
         return True, expired
 
     async def acquire_session(
-        self, kind: SessionKind, ref: str, *, ttl: float | None
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        ttl: float | None,
+        binding: tuple[str | None, str | None] | None = None,
     ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
+        # A held session never expires here, so nothing is extended: a
+        # refused request's release (touch=False) leaves its idle time alone.
+        # It expires by the ttl it was opened with, as *ttl* always is.
         entry = self._entry(kind, ref)
         if entry is None:
             return None, []
-        if self._expired(entry, ttl, self._clock()):
+        if self._expired(entry, self._clock()):
             del self._sessions[ref]
             return None, [self._gone(entry)]
         entry.active += 1

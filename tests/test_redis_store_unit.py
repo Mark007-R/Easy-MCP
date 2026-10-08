@@ -9,21 +9,31 @@ from __future__ import annotations
 import asyncio
 import collections
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
 import pytest
-from conftest import LogCapture
+from conftest import LogCapture, headers_for, modern, rpc
 
 pytest.importorskip("redis")
 
 from redis import exceptions as redis_errors  # noqa: E402
+from redis._parsers.base import BaseParser  # noqa: E402
 
-from easy_mcp import MCPServer, RedisStore, StoreUnavailableError  # noqa: E402
-from easy_mcp.exceptions import RateLimitError  # noqa: E402
+from easy_mcp import (  # noqa: E402
+    MCPServer,
+    RedisStore,
+    StoreUnavailableError,
+    StreamableHTTPTransport,
+)
+from easy_mcp.exceptions import INTERNAL_ERROR, SERVER_BUSY, RateLimitError  # noqa: E402
 from easy_mcp.security.ratelimit import SlidingWindowRateLimiter  # noqa: E402
 from easy_mcp.store import Reservation, SessionRecord  # noqa: E402
 from easy_mcp.store.base import client_ref, session_ref  # noqa: E402
 from easy_mcp.store.redis_store import _SCRIPTS  # noqa: E402
+from easy_mcp.transport._sessions import ClientHandle  # noqa: E402
+from easy_mcp.transport.base import ClientContext  # noqa: E402
 
 _NAMES = {text: name for name, text in _SCRIPTS.items()}
 
@@ -157,6 +167,127 @@ def test_keys_are_versioned_namespaced_and_hash_tagged() -> None:
     assert "1.2.3.4" not in store._key("c", client_ref("ip:1.2.3.4"))
 
 
+def reply_error(line: str) -> Exception:
+    """The exception redis-py raises for the error reply *line*.
+
+    It strips the code from the replies it knows and raises a subclass:
+    ``OOM command not allowed ...`` arrives as ``OutOfMemoryError("command
+    not allowed ...")``.
+    """
+    error: Exception = BaseParser.parse_error(line)
+    return error
+
+
+# Replies that mean "not now" rather than a bug, as Redis 7 sends them: a
+# write refused inside a script carries the script's name.
+UNAVAILABLE_REPLIES = (
+    "OOM command not allowed when used memory > 'maxmemory'. script: "
+    + "0" * 40
+    + ", on @user_script:20.",
+    "READONLY You can't write against a read only replica. script: "
+    + "0" * 40
+    + ", on @user_script:21.",
+    "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.",
+    "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist "
+    "to disk. Commands that may modify the data set are disabled, because this instance is "
+    "configured to report errors during writes if RDB snapshotting fails.",
+    "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.",
+    "NOREPLICAS Not enough good replicas to write.",
+    "TRYAGAIN Multiple keys request during rehashing of slot",
+    "NOSCRIPT No matching script. Please use EVAL.",
+    "LOADING Redis is loading the dataset in memory",
+)
+
+
+async def test_error_replies_redis_py_raises_map_to_store_unavailable() -> None:
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    record = SessionRecord(session_ref("s"), "http", "ip:x", None)
+    try:
+        operations: list[Callable[[], Awaitable[Any]]] = [
+            lambda: store.create_session(record, cap=5, ttl=60),
+            lambda: store.acquire_session("http", record.ref, ttl=60),
+            lambda: store.release_session("http", record.ref, ttl=60),
+            lambda: store.reserve_session_call(record.ref, "t", 1),
+            lambda: store.reserve_client_call("ip:x", "t", 1, ttl=60),
+            lambda: store.publish("x"),
+            lambda: store.rate_limiter(SlidingWindowRateLimiter(3)).acheck("ip:x"),
+        ]
+        for line in UNAVAILABLE_REPLIES:
+            error = reply_error(line)
+            client.replies = {name: error for name in _SCRIPTS}
+            client.replies["publish"] = error
+            for operation in operations:
+                with pytest.raises(StoreUnavailableError):
+                    await operation()
+    finally:
+        await store.aclose()
+
+
+async def test_a_full_redis_is_answered_503_and_dispatch_never_raises() -> None:
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    server = MCPServer(port=0, rate_limit_per_minute=60, store=store)
+    full = reply_error("OOM command not allowed when used memory > 'maxmemory'.")
+    client.replies = {name: full for name in _SCRIPTS}
+    app = StreamableHTTPTransport(server).build_app()
+    accept = {"Accept": "application/json, text/event-stream"}
+    init = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
+    listed = modern("tools/list")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as http:
+            answers = [
+                await http.post("/mcp", json=rpc("initialize", init), headers=accept),
+                await http.post("/mcp", json=listed, headers=headers_for(listed)),
+            ]
+        for answer in answers:
+            assert answer.status_code == 503, answer.text
+            assert answer.headers["retry-after"] == "1"
+            assert answer.json()["error"]["code"] == SERVER_BUSY
+            assert answer.json()["error"]["data"] == {"reason": "store_unavailable"}
+        handle = ClientHandle(store, "ip:x", 60)
+        context = ClientContext(client_id="ip:x", session_id="s", store_handle=handle)
+        refused = await server.dispatch(rpc("ping", msg_id=7), context)
+        assert refused is not None and refused["id"] == 7
+        assert refused["error"]["code"] == SERVER_BUSY
+    finally:
+        await store.aclose()
+
+
+async def test_an_unexpected_store_reply_is_answered_not_raised(logs: LogCapture) -> None:
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    server = MCPServer(port=0, rate_limit_per_minute=60, store=store)
+    bug = reply_error("WRONGTYPE Operation against a key holding the wrong kind of value")
+    client.replies = {"rate": bug}
+    handle = ClientHandle(store, "ip:x", 60)
+    context = ClientContext(client_id="ip:x", session_id="s", store_handle=handle)
+    try:
+        refused = await server.dispatch(rpc("ping", msg_id=7), context)
+        assert refused is not None and refused["error"]["code"] == INTERNAL_ERROR
+        assert "error_id=" in refused["error"]["message"]
+        # A session request already answered stays answered.
+        plain = MCPServer(port=0, rate_limit_per_minute=None, store=RedisStore.from_client(client))
+        app = StreamableHTTPTransport(plain).build_app()
+        client.replies = {"create": [1, []], "touch": bug}
+        init = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as http:
+            opened = await http.post(
+                "/mcp",
+                json=rpc("initialize", init),
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+        assert opened.status_code == 200 and "mcp-session-id" in opened.headers
+        await plain.store.aclose()
+        assert "could not release a session in the store" in logs.text
+    finally:
+        await store.aclose()
+
+
 async def test_redis_errors_map_to_store_unavailable(logs: LogCapture) -> None:
     client = FakeClient()
     store = RedisStore.from_client(client, namespace="t")
@@ -166,9 +297,9 @@ async def test_redis_errors_map_to_store_unavailable(logs: LogCapture) -> None:
             redis_errors.ConnectionError("refused"),
             redis_errors.TimeoutError("slow"),
             redis_errors.BusyLoadingError("loading"),
-            redis_errors.ResponseError("OOM command not allowed when used memory > 'maxmemory'"),
-            redis_errors.ResponseError("READONLY You can't write against a read only replica."),
-            redis_errors.ResponseError("MASTERDOWN Link with MASTER is down"),
+            reply_error("OOM command not allowed when used memory > 'maxmemory'."),
+            reply_error("READONLY You can't write against a read only replica."),
+            reply_error("MASTERDOWN Link with MASTER is down"),
             redis_errors.AuthenticationError("WRONGPASS"),
             redis_errors.NoPermissionError("NOPERM"),
             TimeoutError(),
@@ -186,7 +317,7 @@ async def test_redis_errors_map_to_store_unavailable(logs: LogCapture) -> None:
             with pytest.raises(StoreUnavailableError):
                 await store.rate_limiter(SlidingWindowRateLimiter(3)).acheck("ip:x")
         # A reply that means a bug is not an outage.
-        client.replies["reserve"] = redis_errors.ResponseError("WRONGTYPE Operation against a key")
+        client.replies["reserve"] = reply_error("WRONGTYPE Operation against a key")
         with pytest.raises(redis_errors.ResponseError):
             await store.reserve_session_call(record.ref, "t", 1)
         # The warning is logged at most once per 10 s, naming the error only.
@@ -248,14 +379,14 @@ async def test_script_replies_are_parsed() -> None:
             owner="0123456789abcdef",
             t0=1791460000123,
         )
-        assert client.calls[-1][2] == [ref, 0, "", "1"]  # an SSE lease is its owner's to extend
+        assert client.calls[-1][2] == [ref, 0, "", "1", "sse"]  # its owner's to extend
         assert await store.acquire_session("http", ref, ttl=60) == (None, [])  # another kind
         client.replies["touch"] = None
         assert await store.acquire_session("sse", ref, ttl=None) == (None, [])
         client.replies["touch"] = {b"kind": b"http", b"cid": b"ip:y", b"fp": b"", b"t0": b"x"}
         found, _ = await store.acquire_session("http", ref, ttl=1.5)
         assert found == SessionRecord(ref, "http", "ip:y", None)
-        assert client.calls[-1][2] == [ref, 1500, "", "1"]
+        assert client.calls[-1][2] == [ref, 1500, "", "1", "http"]
 
         calls = len(client.calls)
         await store.release_session("sse", ref, ttl=None)  # nothing to change: no round trip
@@ -263,7 +394,7 @@ async def test_script_replies_are_parsed() -> None:
         assert len(client.calls) == calls
         client.replies["touch"] = 1
         await store.release_session("http", ref, ttl=60, protocol_version="2025-06-18")
-        assert client.calls[-1][2] == [ref, 60_000, "2025-06-18", "0"]
+        assert client.calls[-1][2] == [ref, 60_000, "2025-06-18", "0", "http"]
 
         client.replies["refresh"] = [1, 0, 1]
         refs = [ref, other, session_ref("u")]
@@ -305,6 +436,46 @@ async def test_script_replies_are_parsed() -> None:
             store._bus_channel(),
             store._worker_channel("fedcba9876543210"),
         ]
+    finally:
+        await store.aclose()
+
+
+async def test_a_touch_names_the_kind_it_may_touch() -> None:
+    # Both kinds share one record key: the script checks the kind before it
+    # extends anything, so an SSE id posted to /mcp neither stretches the
+    # SSE lease nor enters the Streamable HTTP index.
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    ref = session_ref("s")
+    try:
+        client.replies["touch"] = None
+        await store.acquire_session("http", ref, ttl=60)
+        assert client.calls[-1][1] == [store._session_key(ref), store._index_key("http")]
+        assert client.calls[-1][2] == [ref, 60_000, "", "1", "http"]
+        await store.acquire_session("sse", ref, ttl=None)
+        assert client.calls[-1][2] == [ref, 0, "", "1", "sse"]
+        client.replies["touch"] = 1
+        await store.release_session("http", ref, ttl=60)
+        assert client.calls[-1][2] == [ref, 60_000, "", "0", "http"]
+        await store.release_session("sse", ref, ttl=None, protocol_version="2025-11-25")
+        assert client.calls[-1][2] == [ref, 0, "2025-11-25", "0", "sse"]
+    finally:
+        await store.aclose()
+
+
+async def test_a_lookup_extends_only_a_session_bound_to_the_presented_credential() -> None:
+    # A request with another credential is refused (403): the script is
+    # told the binding, so such a request does not keep the session alive.
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    ref = session_ref("s")
+    try:
+        client.replies["touch"] = None
+        await store.acquire_session("http", ref, ttl=60, binding=("abcdef012345", None))
+        assert client.calls[-1][2] == [ref, 60_000, "", "1", "http", "abcdef012345", ""]
+        principal = "0123456789abcdef" * 2
+        await store.acquire_session("http", ref, ttl=60, binding=(None, principal))
+        assert client.calls[-1][2] == [ref, 60_000, "", "1", "http", "", principal]
     finally:
         await store.aclose()
 

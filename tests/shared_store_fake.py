@@ -173,7 +173,12 @@ class FakeSharedStore(Store):
         return True, [ExpiredSession(ref, None) for ref in expired]
 
     async def acquire_session(
-        self, kind: SessionKind, ref: str, *, ttl: float | None
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        ttl: float | None,
+        binding: tuple[str | None, str | None] | None = None,
     ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
         await self._op("acquire")
         hub = self.hub
@@ -182,10 +187,11 @@ class FakeSharedStore(Store):
             entry = hub._live(ref, now)
             if entry is None or entry.record.kind != kind:
                 return None, []
-            if ttl is not None:
+            record = entry.record
+            if ttl is not None and binding in (None, (record.identity_fp, record.principal)):
                 entry.expires = now + ttl
                 hub.index[kind][ref] = entry.expires
-            return entry.record, []
+            return record, []
 
     async def release_session(
         self,
@@ -201,7 +207,7 @@ class FakeSharedStore(Store):
         with hub.lock:
             now = hub.clock()
             entry = hub._live(ref, now)
-            if entry is None:
+            if entry is None or entry.record.kind != kind:
                 return
             if ttl is not None and touch:
                 entry.expires = now + ttl
