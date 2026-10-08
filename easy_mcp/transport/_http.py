@@ -165,20 +165,6 @@ def bearer_challenge(
     return value
 
 
-def token_principal(
-    identity: ClientIdentity | None,
-) -> tuple[str, str | None, str | None] | None:
-    """The whole principal of a token identity: issuer, subject and client.
-
-    ``None`` for an API key or anonymous caller.  A session compares it as
-    well as the fingerprint, so no principal can use another's session even
-    if their fingerprints matched.
-    """
-    if identity is None or identity.issuer is None:
-        return None
-    return (identity.issuer, identity.subject, identity.client_id)
-
-
 def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get("headers", ()):
         if key == name:
