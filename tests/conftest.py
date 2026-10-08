@@ -15,6 +15,9 @@ from easy_mcp import MCPServer
 from easy_mcp.security.auth import ClientIdentity
 from easy_mcp.transport.base import ClientContext
 
+# The stateless protocol revision the modern-era helpers below speak.
+STATELESS_VERSION = "2026-07-28"
+
 
 def make_context(
     identity: ClientIdentity | None = None,
@@ -39,6 +42,38 @@ def notification(method: str, params: Any | None = None) -> dict[str, Any]:
     if params is not None:
         message["params"] = params
     return message
+
+
+def meta(**overrides: Any) -> dict[str, Any]:
+    """The per-request ``_meta`` of a stateless request; ``None`` drops a key."""
+    fields: dict[str, Any] = {
+        "io.modelcontextprotocol/protocolVersion": STATELESS_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "tests", "version": "1.0"},
+    }
+    fields.update(overrides)
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def modern(
+    method: str, params: dict[str, Any] | None = None, msg_id: Any = 1, **meta_overrides: Any
+) -> dict[str, Any]:
+    """Build a stateless (2026-07-28) JSON-RPC request."""
+    return rpc(method, {**(params or {}), "_meta": meta(**meta_overrides)}, msg_id)
+
+
+def headers_for(message: dict[str, Any], **extra: str) -> dict[str, str]:
+    """The mirrored headers a conforming client sends with *message*."""
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": STATELESS_VERSION,
+        "Mcp-Method": message["method"],
+    }
+    name = message.get("params", {}).get("name")
+    if message["method"] == "tools/call" and name is not None:
+        headers["Mcp-Name"] = name
+    headers.update(extra)
+    return headers
 
 
 @pytest.fixture

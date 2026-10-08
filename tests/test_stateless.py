@@ -12,7 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
-from conftest import make_context, notification, rpc
+from conftest import headers_for, make_context, meta, modern, notification, rpc
 
 from easy_mcp import APIKeyAuth, MCPServer, StdioTransport
 from easy_mcp.exceptions import (
@@ -29,22 +29,6 @@ LiveServer = Callable[[Any], str]
 VERSION = "2026-07-28"
 KEY = "stateless-test-key-" + "k" * 13
 SERVER_INFO = "io.modelcontextprotocol/serverInfo"
-
-
-def meta(**overrides: Any) -> dict[str, Any]:
-    fields: dict[str, Any] = {
-        "io.modelcontextprotocol/protocolVersion": VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
-        "io.modelcontextprotocol/clientInfo": {"name": "tests", "version": "1.0"},
-    }
-    fields.update(overrides)
-    return {key: value for key, value in fields.items() if value is not None}
-
-
-def modern(
-    method: str, params: dict[str, Any] | None = None, msg_id: Any = 1, **meta_overrides: Any
-) -> dict[str, Any]:
-    return rpc(method, {**(params or {}), "_meta": meta(**meta_overrides)}, msg_id)
 
 
 def make_server(**kwargs: Any) -> MCPServer:
@@ -201,20 +185,6 @@ async def test_stdio_serves_both_eras_in_one_process() -> None:
 
 
 # -------------------------------------------------------------------- HTTP
-
-
-def headers_for(message: dict[str, Any], **extra: str) -> dict[str, str]:
-    """The mirrored headers a conforming client sends with *message*."""
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "MCP-Protocol-Version": VERSION,
-        "Mcp-Method": message["method"],
-    }
-    name = message.get("params", {}).get("name")
-    if message["method"] == "tools/call" and name is not None:
-        headers["Mcp-Name"] = name
-    headers.update(extra)
-    return headers
 
 
 def post(client: httpx.Client, message: dict[str, Any], **extra: str) -> httpx.Response:
