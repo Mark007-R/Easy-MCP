@@ -68,7 +68,7 @@ ACL_RULES = (
 
 
 def admin() -> Any:
-    return redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    return redis.Redis.from_url(REDIS_URL, decode_responses=True, protocol=2)
 
 
 @pytest.fixture(scope="module")
@@ -177,13 +177,17 @@ class Fleet:
     workers: list[Process]
 
     def marker(self, name: str, timeout: float = 5.0) -> str | None:
+        """Which worker left the marker *name*; ``None`` if none did in time."""
         path = self.markers / name
         deadline = time.monotonic() + timeout
-        while not path.exists():
+        while True:
+            # Read until written: the file exists a moment before its text.
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            if text:
+                return text
             if time.monotonic() > deadline:
                 return None
             time.sleep(0.02)
-        return path.read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -636,7 +640,8 @@ def test_live_forged_bus_messages_are_rejected(
 
 def test_live_least_privilege_acl_is_enough(user_url: str) -> None:
     # Every test above ran as this user; it can do nothing else.
-    connection = redis.Redis.from_url(user_url, decode_responses=True)
+    # RESP2, as the store speaks it: the rules grant no HELLO.
+    connection = redis.Redis.from_url(user_url, decode_responses=True, protocol=2)
     try:
         assert connection.ping()
         for command in (("KEYS", "*"), ("CONFIG", "GET", "*"), ("FLUSHDB",)):

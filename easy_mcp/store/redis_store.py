@@ -48,7 +48,11 @@ logger = logging.getLogger("easy_mcp.store")
 # The layout version in every key: a later incompatible layout uses 2.
 SCHEMA_VERSION = 1
 
-# Client defaults; query-string options in the URL take precedence.
+# Client defaults; query-string options in the URL take precedence.  RESP2,
+# which redis-py spoke by default before 8.0: its connection handshake is AUTH
+# and SELECT, which the documented least-privilege ACL allows, where RESP3's
+# would need HELLO too.
+PROTOCOL = 2
 POOL_SIZE = 64
 TIMEOUT_SECONDS = 2.0
 HEALTH_CHECK_SECONDS = 30
@@ -438,6 +442,7 @@ class RedisStore(Store):
             pool = aioredis.BlockingConnectionPool.from_url(
                 self._url,
                 decode_responses=True,
+                protocol=PROTOCOL,
                 max_connections=POOL_SIZE,
                 timeout=TIMEOUT_SECONDS,
                 socket_timeout=TIMEOUT_SECONDS,
