@@ -930,8 +930,9 @@ class _Chain(Generic[_OutcomeT]):
                 outcome = await self.layer(index + 1)
             except asyncio.CancelledError:
                 # If neither this task nor the request was cancelled, the
-                # tool awaited something cancelled elsewhere.  A middleware
-                # that passes that on is not to blame for it.
+                # inner chain raised it on its own (the server answers that
+                # as an internal error).  A middleware that passes that on
+                # is not to blame for it.
                 if _task_cancels() == task_before and request._cancels() == request_before:
                     stray[0] = True
                 raise
@@ -950,6 +951,11 @@ class _Chain(Generic[_OutcomeT]):
             pending.append(coroutine)
             return coroutine
 
+        # A layer swallowed a cancel if the request was cancelled, the inner
+        # chain did not take that cancel in itself, and it reached the task
+        # the layer runs in.  One still on its way there (an outer
+        # middleware's TaskGroup passes it on only when its own task next
+        # runs) was never this layer's to re-raise.
         baseline = request._cancels()
         own_baseline = _task_cancels()
         try:
@@ -962,8 +968,8 @@ class _Chain(Generic[_OutcomeT]):
             if request._cancels() > baseline or _task_cancels() > own_baseline or stray[0]:
                 # The request was cancelled, or the work this layer runs in
                 # was (left behind by an outer middleware, or bounded by its
-                # timeout), or the tool raised it on its own: answered as
-                # without middleware.
+                # timeout), or the inner chain raised it on its own: answered
+                # as without middleware.
                 raise
             # Nobody cancelled anything here: the middleware awaited something
             # cancelled elsewhere (a shared lookup, say).  A failure, not a
@@ -976,7 +982,7 @@ class _Chain(Generic[_OutcomeT]):
             return outcome if outcome is not None else await self._once()
         except Exception as exc:
             await _abandon(pending, runner)
-            if request._cancels() - absorbed[0] > baseline:
+            if request._cancels() - absorbed[0] > baseline and _task_cancels() > own_baseline:
                 # A cancellation arrived and was turned into another error.
                 _drop_traceback(exc)
                 policy.swallowed_cancel(info, middleware)
@@ -988,7 +994,7 @@ class _Chain(Generic[_OutcomeT]):
             _detach(pending, runner)
             raise
         unawaited = await _abandon(pending, runner)
-        if request._cancels() - absorbed[0] > baseline:
+        if request._cancels() - absorbed[0] > baseline and _task_cancels() > own_baseline:
             policy.swallowed_cancel(info, middleware)  # caught and not re-raised
             raise asyncio.CancelledError
         if produced and returned is produced[0]:

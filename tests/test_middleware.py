@@ -2464,6 +2464,82 @@ async def test_a_tool_that_swallows_its_cancel_answers_alike_with_middleware(
     assert "swallowed a cancellation" not in logs.text
 
 
+async def test_a_cancel_still_on_its_way_is_not_blamed_on_a_middleware_it_never_reached(
+    logs: LogCapture,
+) -> None:
+    # The outer middleware runs the call in a TaskGroup, the inner one awaits
+    # call_next() in a task of its own.  A cancel reaches the TaskGroup's own
+    # task at once, but its child only when that task next runs, and by then
+    # the inner middleware may have returned the tool's outcome.  It never
+    # received the cancel, so it did not swallow it.
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    # Whether the request had been cancelled when the inner middleware got
+    # its outcome back (and so returned it).
+    returned: list[bool] = []
+
+    async def grouped(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        async with asyncio.TaskGroup() as group:
+            task = group.create_task(call_next())
+        return task.result()
+
+    async def gathered(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        (outcome,) = await asyncio.gather(call_next())
+        returned.append(call.request._cancels() > 0)
+        return outcome
+
+    async def ensured(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+        outcome = await asyncio.ensure_future(call_next())
+        returned.append(call.request._cancels() > 0)
+        return outcome
+
+    late: set[tuple[str, str]] = set()  # the cases that met the cancel on its way
+    for inner in (gathered, ensured):
+        for how in ("client", "caller"):
+            for steps in range(16):
+                server = make_server()
+                gate.clear()
+                started.clear()
+                returned.clear()
+
+                @server.tool
+                async def gated() -> str:
+                    """Finishes when the test lets it."""
+                    started.set()
+                    await gate.wait()
+                    return "finished"
+
+                server.middleware(grouped)
+                server.tool_middleware(inner)
+                context = make_context()
+                call = asyncio.create_task(
+                    server.dispatch(rpc("tools/call", {"name": "gated"}, 1), context)
+                )
+                await asyncio.wait_for(started.wait(), 5)
+                gate.set()
+                for _ in range(steps):
+                    await asyncio.sleep(0)  # the tool finishes meanwhile
+                if how == "client":
+                    cancel = notification("notifications/cancelled", {"requestId": 1})
+                    await server.dispatch(cancel, context)
+                else:
+                    call.cancel()
+                await asyncio.wait({call}, timeout=5)
+                assert call.done()
+                cancelled = call.cancelled() if how == "caller" else call.result() is None
+                if not cancelled:  # the cancel came after the answer
+                    response = call.result()
+                    assert response["result"]["content"][0]["text"] == "finished"
+                if returned == [True]:
+                    # The cancel had reached the request, not yet the inner
+                    # middleware: it is still the answer.
+                    assert cancelled, (inner.__name__, how, steps)
+                    late.add((inner.__name__, how))
+    assert "swallowed a cancellation" not in logs.text
+    # Each case met the cancel on its way at some step.
+    assert late == {(i, h) for i in ("gathered", "ensured") for h in ("client", "caller")}
+
+
 async def check_ok() -> None:
     await asyncio.sleep(0)
 
@@ -2571,9 +2647,10 @@ async def test_a_cancellation_nobody_asked_for_is_a_middleware_failure(logs: Log
 async def test_a_stray_cancellation_from_the_tool_is_not_blamed_on_middleware(
     logs: LogCapture,
 ) -> None:
-    # The tool raises a CancelledError nobody asked for.  A middleware that
-    # passes it on did what it must, so the client gets what it would get
-    # without middleware, and the audit trail says the same.
+    # The tool raises a CancelledError nobody asked for.  Nothing cancelled
+    # the call, so the tool failed, as one raising any other error does: the
+    # client gets an isError result rather than no answer at all, and with
+    # middleware exactly what it gets without.
     async def passthrough(info: Any, call_next: Any) -> Any:
         return await call_next()
 
@@ -2589,6 +2666,11 @@ async def test_a_stray_cancellation_from_the_tool_is_not_blamed_on_middleware(
             await cancelled_future()
             return "unreachable"
 
+        @server.tool
+        def flaky_sync() -> str:
+            """Raises a CancelledError from its thread."""
+            raise asyncio.CancelledError
+
         if kind in ("request", "both"):
             server.middleware(passthrough)
         if kind in ("tool", "both"):
@@ -2598,20 +2680,28 @@ async def test_a_stray_cancellation_from_the_tool_is_not_blamed_on_middleware(
             server.tool_middleware(aside)
         return server
 
-    answered = []
-    for kind in ("none", "request", "tool", "both", "aside"):
-        first = len(logs.records)
-        response = await serving(kind).dispatch(
-            rpc("tools/call", {"name": "flaky"}, 7), make_context()
-        )
-        records = logs.records[first:]
-        events = [r.event for r in records if r.name == "easy_mcp.audit"]  # type: ignore[attr-defined]
-        errors = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
-        answered.append((kind, response, events, errors))
-    cancelled = [{"type": "tool_cancelled", "client_id": "ip:test", "request_id": 7}]
-    assert answered == [
-        (kind, None, cancelled, []) for kind in ("none", "request", "tool", "both", "aside")
-    ]
+    for name in ("flaky", "flaky_sync"):
+        for kind in ("none", "request", "tool", "both", "aside"):
+            first = len(logs.records)
+            response = await serving(kind).dispatch(
+                rpc("tools/call", {"name": name}, 7), make_context()
+            )
+            assert response is not None, (name, kind)
+            assert response["result"]["isError"] is True
+            text = response["result"]["content"][0]["text"]
+            found = re.fullmatch(r"Tool execution failed \(error_id=(\w+)\)", text)
+            assert found is not None, text
+            error_id = found.group(1)
+            records = logs.records[first:]
+            events = [
+                {key: value for key, value in r.event.items() if key != "duration_ms"}  # type: ignore[attr-defined]
+                for r in records
+                if r.name == "easy_mcp.audit"
+            ]
+            errors = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+            failed = {"tool": name, "client_id": "ip:test", "status": "error"}
+            assert events == [{"type": "tool_call", **failed, "error_id": error_id}], kind
+            assert errors == [f"tool {name!r} failed error_id={error_id}"], kind
 
     # A middleware that cancels the call_next() it started and raises that
     # cancel still fails the request: the CancelledError is its own doing.
@@ -2650,6 +2740,35 @@ async def test_a_stray_cancellation_from_the_tool_is_not_blamed_on_middleware(
     assert response is not None
     assert response["result"]["content"][0]["text"] == "Policy check timed out."
     assert len(logs.events("middleware_failed")) == failures
+
+
+async def test_a_request_that_raises_cancellation_on_its_own_is_answered(
+    logs: LogCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Serving the request raised CancelledError, but nothing cancelled it.
+    # Only a client's cancel goes unanswered; this is an internal error,
+    # with middleware or without, and no middleware is blamed for it.
+    def broken(context: ClientContext) -> Any:
+        raise asyncio.CancelledError
+
+    for layered in (False, True):
+        server = make_server()
+        if layered:
+            server.middleware(passthrough)
+        monkeypatch.setattr(server, "_handle_tools_list", broken)
+        first = len(logs.records)
+        response = await server.dispatch(rpc("tools/list", msg_id=4), make_context())
+        assert response is not None, layered
+        assert response["id"] == 4 and response["error"]["code"] == INTERNAL_ERROR
+        message = response["error"]["message"]
+        found = re.fullmatch(r"Internal server error \(error_id=(\w+)\)", message)
+        assert found is not None, message
+        records = logs.records[first:]
+        assert [r.getMessage() for r in records if r.levelno >= logging.ERROR] == [
+            "tools/list raised CancelledError although nothing cancelled it "
+            f"error_id={found.group(1)}"
+        ]
+        assert [r.getMessage() for r in records if r.name == "easy_mcp.audit"] == []
 
 
 async def test_initialize_is_never_cancelled() -> None:
@@ -2810,18 +2929,26 @@ async def test_current_tool_call() -> None:
     seen: list[Any] = []
     in_callback: list[Any] = []
     callback_ran = threading.Event()
+    # What request middleware sees once the call is over, and tool
+    # middleware once the tool has returned.
+    after_call: list[Any] = []
+    after_tool: list[bool] = []
 
     @server.middleware
     async def mark(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
         assert current_tool_call() is None  # not a tool call yet
         request.state["trace"] = "r"
-        return await call_next()
+        outcome = await call_next()
+        after_call.append(current_tool_call())
+        return outcome
 
     @server.tool_middleware
     async def fill(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
         assert current_tool_call() is call
         call.state["tenant"] = "acme"
-        return await call_next()
+        outcome = await call_next()
+        after_tool.append(current_tool_call() is call)
+        return outcome
 
     @server.tool
     def who() -> str:
@@ -2867,6 +2994,7 @@ async def test_current_tool_call() -> None:
         "client_id": "f" * 12,
     }
     assert seen[0].tool.name == "who"
+    assert after_tool == [True] and after_call == [None]  # set for the call, and only for it
     assert current_tool_call() is None
     await server.dispatch(rpc("tools/call", {"name": "late"}), make_context())
     assert await asyncio.to_thread(callback_ran.wait, 5)
@@ -3780,8 +3908,10 @@ async def test_http_cancel_during_shutdown_stops_the_call(monkeypatch: pytest.Mo
         )
         await asyncio.wait_for(started.wait(), 5)
         closing = asyncio.create_task(transport.close_streams())
+        deadline = time.monotonic() + 5
         while not transport._closing:
-            await asyncio.sleep(0)
+            assert time.monotonic() < deadline, "shutdown never began"
+            await asyncio.sleep(0.01)
         # The client cancels its call while shutdown waits for it: the cancel
         # takes effect at once, and the call gets no answer, as for any cancel.
         cancel = notification("notifications/cancelled", {"requestId": 2})
@@ -3792,23 +3922,53 @@ async def test_http_cancel_during_shutdown_stops_the_call(monkeypatch: pytest.Mo
     assert transport._sessions == {}
 
 
+async def test_a_forced_quit_ends_the_shutdown_grace_at_once() -> None:
+    from types import SimpleNamespace
+
+    from easy_mcp import StreamableHTTPTransport
+
+    server = make_server()
+    started, cancelled = with_slow_tool(server)
+    transport = StreamableHTTPTransport(server)
+    app = transport.build_app()  # its lifespan never runs here
+    # What server.run() serves with; a second Ctrl-C sets force_exit.
+    uvicorn_server = SimpleNamespace(force_exit=False)
+    transport._uvicorn = uvicorn_server
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        message = modern("tools/call", {"name": "slow"}, 3)
+        call = asyncio.create_task(client.post("/mcp", json=message, headers=headers_for(message)))
+        await asyncio.wait_for(started.wait(), 5)
+        closing = asyncio.create_task(transport.close_streams())
+        await asyncio.sleep(0.2)
+        assert not closing.done()  # waiting out the 5 s grace for the call
+        uvicorn_server.force_exit = True
+        await asyncio.wait_for(closing, 2)  # long before the 5 s grace is up
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert answer(await asyncio.wait_for(call, 1)) == shutting_down(3)
+
+
 def test_http_shutdown_refuses_legacy_sse_streams_opened_during_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from easy_mcp import StreamableHTTPTransport
     from easy_mcp.transport import streamable_http
 
-    monkeypatch.setattr(streamable_http, "_SHUTDOWN_GRACE_SECONDS", 1.0)
+    # Shutdown waits for the call, and the call for the legacy client to have
+    # its answer, however long that client takes to connect.
+    monkeypatch.setattr(streamable_http, "_SHUTDOWN_GRACE_SECONDS", 20.0)
     server = make_server()
 
     @server.tool
     async def slow() -> str:
-        """Takes longer than shutdown waits."""
+        """Runs until the test lets it finish."""
         started.set()
-        await asyncio.sleep(30)
-        return "too late"
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return "released"
 
-    started = threading.Event()
+    started, release = threading.Event(), threading.Event()
     base, serving = run_http(server)
     transport = server._transport
     assert isinstance(transport, StreamableHTTPTransport)
@@ -3846,16 +4006,22 @@ def test_http_shutdown_refuses_legacy_sse_streams_opened_during_it(
             assert time.monotonic() < deadline, "shutdown never began"
             time.sleep(0.01)
         legacy.start()
-        serving.join(3)  # the 1 s grace, and some
+        legacy.join(10)
+        assert not legacy.is_alive(), "a stream opened during shutdown was kept open"
+        release.set()  # only now may shutdown go on
+        serving.join(5)
         assert not serving.is_alive(), "shutdown waited for a stream opened during it"
     finally:
+        release.set()
         if serving.is_alive():
             transport._uvicorn.force_exit = True
             serving.join(5)
     legacy.join(5)
     caller.join(5)
     assert streams == [(503, "1")]
-    assert answers == [shutting_down(7)]
+    ((status, content_type, body),) = answers
+    assert (status, content_type) == (200, "application/json")
+    assert body["result"]["content"][0]["text"] == "released"
 
 
 def test_sse_refuses_new_streams_and_messages_once_shutdown_begins(
@@ -3882,6 +4048,101 @@ def test_sse_refuses_new_streams_and_messages_once_shutdown_begins(
         with client.stream("GET", "/sse") as stream:
             assert stream.status_code == 200
             assert next_data(stream.iter_lines()).startswith("/messages?session_id=")
+
+
+def asgi_scope(method: str, path: str, query: str = "", **headers: str) -> dict[str, Any]:
+    """The ASGI scope of an HTTP request, for driving an app message by message."""
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query.encode(),
+        "root_path": "",
+        "headers": [
+            (b"host", b"127.0.0.1"),
+            *((key.replace("_", "-").encode(), value.encode()) for key, value in headers.items()),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 80),
+    }
+
+
+async def test_sse_refuses_a_message_whose_stream_closed_while_its_body_was_read() -> None:
+    from easy_mcp import SSETransport
+
+    server = make_server()
+    entered = asyncio.Event()
+
+    @server.middleware
+    async def hold(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "tools/call":
+            entered.set()
+            await asyncio.sleep(30)  # no bound: only a cancel releases it
+        return await call_next()
+
+    transport = SSETransport(server)
+    app = transport.build_app()  # its lifespan never runs here
+
+    # The stream, open until the client leaves.
+    opened, leave = asyncio.Event(), asyncio.Event()
+    streamed = bytearray()
+
+    async def stream_receive() -> dict[str, Any]:
+        await leave.wait()
+        return {"type": "http.disconnect"}
+
+    async def stream_send(message: dict[str, Any]) -> None:
+        streamed.extend(message.get("body", b""))
+        if b"\n\n" in streamed:
+            opened.set()
+
+    stream = asyncio.create_task(app(asgi_scope("GET", "/sse"), stream_receive, stream_send))
+    await asyncio.wait_for(opened.wait(), 5)
+    endpoint = streamed.decode().split("data: ", 1)[1].split("\n", 1)[0]
+    path, query = endpoint.split("?", 1)
+    (session,) = transport._sessions.values()
+
+    # A message whose body arrives in two parts; the stream closes in between.
+    body = json.dumps(rpc("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}})).encode()
+    reading, rest = asyncio.Event(), asyncio.Event()
+    parts = [body[:10]]
+    statuses: list[int] = []
+
+    async def post_receive() -> dict[str, Any]:
+        if parts:
+            return {"type": "http.request", "body": parts.pop(), "more_body": True}
+        reading.set()
+        await rest.wait()
+        return {"type": "http.request", "body": body[10:], "more_body": False}
+
+    async def post_send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
+
+    scope = asgi_scope(
+        "POST", path, query, content_type="application/json", content_length=str(len(body))
+    )
+    post = asyncio.create_task(app(scope, post_receive, post_send))
+    try:
+        await asyncio.wait_for(reading.wait(), 5)
+        leave.set()
+        await asyncio.wait_for(stream, 5)
+        assert transport._sessions == {}
+        rest.set()
+        await asyncio.wait_for(post, 5)
+        await asyncio.sleep(0.05)  # time enough to start a call, had one been started
+        # Nothing would ever cancel a call on a session that is gone.
+        assert statuses == [404]
+        assert not entered.is_set()
+        assert session.tasks == set() and server._calls == set()
+    finally:
+        for task in (*session.tasks, *server._calls, post):
+            task.cancel()
+        await asyncio.wait({*session.tasks, *server._calls, post}, timeout=5)
 
 
 async def test_stdio_serves_both_eras_to_middleware() -> None:

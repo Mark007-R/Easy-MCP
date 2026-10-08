@@ -307,8 +307,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         is served from now on (the legacy endpoints included, or a stream
         opened meanwhile would hold shutdown up for good; a
         ``notifications/cancelled`` is still acted on), and the requests
-        still running get ``_SHUTDOWN_GRACE_SECONDS`` to finish, as on stdio;
-        then they are cancelled.  A request stopped or refused this way is
+        still running get ``_SHUTDOWN_GRACE_SECONDS`` to finish, as on stdio,
+        or less if uvicorn is told to quit at once (a second Ctrl-C); then
+        they are cancelled.  A request stopped or refused this way is
         answered ``503`` with ``-32008`` (retry shortly), and a handshake cut
         short opens no session.
         """
@@ -316,7 +317,16 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         if self._legacy is not None:
             await self._legacy.close_all_sessions()
         if self._dispatches:
-            _, running = await asyncio.wait(set(self._dispatches), timeout=_SHUTDOWN_GRACE_SECONDS)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _SHUTDOWN_GRACE_SECONDS
+            running = set(self._dispatches)
+            # A forced quit (a second Ctrl-C) ends the grace at once; uvicorn
+            # checks for one as often while it waits for connections.
+            while running and not self._forced_exit():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                _, running = await asyncio.wait(running, timeout=min(0.1, remaining))
             for task in running:
                 task.cancel()
         # Only now: a session's end cancels its requests as a client's cancel

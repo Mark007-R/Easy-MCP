@@ -159,6 +159,10 @@ class BaseHTTPTransport(Transport):
     async def close_streams(self) -> None:
         """End the long-lived streams that would hold up a graceful shutdown."""
 
+    def _forced_exit(self) -> bool:
+        """Whether uvicorn was told to quit without waiting (a second Ctrl-C)."""
+        return self._uvicorn is not None and bool(self._uvicorn.force_exit)
+
     def stop(self) -> None:
         """Ask the running uvicorn server to exit gracefully."""
         if self._uvicorn is not None:

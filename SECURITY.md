@@ -177,11 +177,12 @@ the client is untrusted, the credential in the environment is trusted.
   exit skips that wait entirely. `server.run()` closes those streams itself
   and refuses new ones with `503`; the requests they carry are cancelled as
   shutdown begins and get no answer. Over Streamable HTTP it gives running
-  `/mcp` requests 5 s to finish and then cancels them, answering each `503`
-  with `-32008`. A mounted `build_app()` gets no lifespan at all, so the
-  host app must call `wait_for_tool_threads` on shutdown. Threads a sync tool
-  starts itself are daemons as well, because they inherit the flag, and
-  nothing waits for them. Pass `daemon=False` for work that must finish.
+  `/mcp` requests 5 s to finish (a forced exit cuts that short) and then
+  cancels them, answering each `503` with `-32008`. A mounted `build_app()`
+  gets no lifespan at all, so the host app must call `wait_for_tool_threads`
+  on shutdown. Threads a sync tool starts itself are daemons as well, because
+  they inherit the flag, and nothing waits for them. Pass `daemon=False` for
+  work that must finish.
 - **A MongoDB cancel reaches only the primary, and only calls with a
   session.** `killSessions` is sent to the primary. With a `readPreference`
   that routes reads to a secondary, a cancelled read there keeps running until

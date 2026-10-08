@@ -377,14 +377,14 @@ yourself, `await server.wait_for_tool_threads(5)` before exiting does the
 same. `server.run()` closes open legacy SSE streams as shutdown begins,
 cancelling the requests they carry (those get no answer), and refuses new
 streams and messages with `503`. It gives the Streamable HTTP `/mcp` requests
-still running 5 s to finish and then cancels them, since uvicorn waits for
-every connection to close before it shuts the app down. A `/mcp` request
-cancelled this way, or sent once shutdown has begun, is answered `503` with
-`-32008` and `Retry-After: 1`, so the client can retry; a
-`notifications/cancelled` sent meanwhile still cancels its call. When you serve
-`server.build_app()` with your own uvicorn, pass `--timeout-graceful-shutdown`,
-or shutdown waits for SSE clients to leave and for running requests (one held
-in middleware included) to finish.
+still running 5 s to finish (a second Ctrl-C cuts that short) and then cancels
+them, since uvicorn waits for every connection to close before it shuts the
+app down. A `/mcp` request cancelled this way, or sent once shutdown has
+begun, is answered `503` with `-32008` and `Retry-After: 1`, so the client can
+retry; a `notifications/cancelled` sent meanwhile still cancels its call.
+When you serve `server.build_app()` with your own uvicorn, pass
+`--timeout-graceful-shutdown`, or shutdown waits for SSE clients to leave and
+for running requests (one held in middleware included) to finish.
 When you mount `server.build_app()` inside another Starlette or FastAPI app,
 its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
 the host app's shutdown.
@@ -469,9 +469,9 @@ A cancel reaches middleware as `CancelledError` wherever the call is. Re-raise
 it: a middleware that swallows one is overruled, and no response is sent. A
 `CancelledError` your middleware raises when nothing cancelled the request
 (from a shared task someone else cancelled, say) is a failure like any other.
-One the tool raised on its own reaches you from `call_next()`; re-raise it
-too, and the client gets what it would get without middleware. A tool's
-`timeout` covers the tool only, so bound your own awaits:
+So is one the tool raises when nothing cancelled the call: `call_next()`
+returns its `isError` outcome with an `error_id`, as for any tool error. A
+tool's `timeout` covers the tool only, so bound your own awaits:
 `async with asyncio.timeout(2): ...`. A middleware that waits forever holds
 its request until it is cancelled, and in a Streamable HTTP session a closed
 connection cancels nothing (SECURITY.md lists what does).

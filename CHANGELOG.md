@@ -42,10 +42,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   deleted session, a closed SSE stream, shutdown) reaches middleware as
   `CancelledError`. A middleware that swallows it is overruled and no response
   is sent. A `CancelledError` a middleware raises when nothing cancelled the
-  request is a failure like any other. One the tool raised on its own, passed
-  on from `call_next()`, is answered as it would be without middleware.
-  Notifications and `server/discover`
-  pass through middleware but cannot be refused.
+  request is a failure like any other, and so is one the tool raises (see
+  Fixed). Notifications and `server/discover` pass through middleware but
+  cannot be refused.
 
   Middleware runs on the event loop. Context variables it sets before
   `call_next()` reach the tool, sync tools included. A tool's `timeout` still
@@ -99,8 +98,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - Shutting down the Streamable HTTP transport with `server.run()` (Ctrl-C,
   `server.stop()`) gives the requests still running 5 s to finish, as stdio
   does, then cancels them and ends the sessions, before uvicorn waits for
-  connections to close. A request cancelled this way, or sent once shutdown
-  has begun, is answered `503` with `-32008` (`data.reason: "shutdown"`) and
+  connections to close. A second Ctrl-C (uvicorn's forced quit) ends that wait
+  at once. A request cancelled this way, or sent once shutdown has begun, is
+  answered `503` with `-32008` (`data.reason: "shutdown"`) and
   `Retry-After: 1`, and a handshake cut short opens no session. A
   `notifications/cancelled` sent meanwhile still cancels the call it names,
   which then gets no answer. The legacy SSE endpoints close their streams as
@@ -121,6 +121,18 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - A `tools/call` whose id was a JSON array or object answered `-32603` while
   its tool ran on in the background. Such an id is now served normally; it
   just cannot be cancelled.
+- A tool that raises `CancelledError` when nothing cancelled the call
+  (awaiting a shared future another waiter cancelled, say) has failed: the
+  client gets an `isError` result with an `error_id`, and the audit log a
+  `tool_call` with `status: "error"`. Before, the request got no response at
+  all (over HTTP a bare `202`, on stdio nothing, so the client waited
+  forever), was audited as `tool_cancelled`, and ran the tool's cancel
+  callbacks. Any other request that raises `CancelledError` on its own is
+  answered `-32603` with an `error_id`.
+- A legacy SSE message whose stream closed while its body was being read is
+  answered `404`, as a message for a closed session is. Before, it was
+  served with no stream to answer on and nothing to cancel it; only the tool
+  timeout ended it.
 
 ## [0.3.1] - 2026-09-30
 

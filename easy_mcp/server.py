@@ -56,6 +56,7 @@ from .middleware import (
     ToolPolicy,
     TransportInfo,
     _copy,
+    _task_cancels,
     _tool_call_scope,
     _type_name,
     check_middleware,
@@ -669,7 +670,8 @@ class MCPServer:
         shutdown), the cancellation is re-raised instead: the caller's
         cancel count tells the two apart, since asyncio cancels the task
         we await in both cases.  Middleware runs inside the task, so a
-        cancel reaches it wherever the request is.
+        cancel reaches it wherever the request is.  A ``CancelledError``
+        the request raised when nothing cancelled it is an internal error.
         """
         caller = asyncio.current_task()
         baseline = caller.cancelling() if caller is not None else 0
@@ -683,6 +685,27 @@ class MCPServer:
         try:
             return await task
         except asyncio.CancelledError:
+            ours = caller is not None and caller.cancelling() > baseline
+            # A cancelled caller that nobody awaits keeps its CancelledError,
+            # whose traceback holds this frame: were the frame to hold the
+            # caller too, the request would stay alive until the cyclic
+            # collector ran.
+            caller = None
+            if not ours and task.cancelled() and task.cancelling() == 0:
+                # Nobody cancelled the request (a client's cancel and a
+                # session's end cancel the task itself): something it awaited
+                # raised CancelledError on its own, a shared future another
+                # waiter cancelled, say.  A failure, which must be answered.
+                error_id = uuid.uuid4().hex[:12]
+                self._logger.error(
+                    "%s raised CancelledError although nothing cancelled it error_id=%s",
+                    request.method,
+                    error_id,
+                    exc_info=True,
+                )
+                return _error_response(
+                    msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+                )
             if not task.done() or task.cancelled():
                 if request.method == "tools/call":
                     audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
@@ -693,12 +716,6 @@ class MCPServer:
                         client_id=context.client_id,
                         request_id=msg_id,
                     )
-            ours = caller is not None and caller.cancelling() > baseline
-            # A cancelled caller that nobody awaits keeps its CancelledError,
-            # whose traceback holds this frame: were the frame to hold the
-            # caller too, the request would stay alive until the cyclic
-            # collector ran.
-            caller = None
             if ours:
                 task.cancel()  # the request must not outlive its caller
                 raise
@@ -1042,6 +1059,9 @@ class MCPServer:
 
         deadline: asyncio.Timeout | None = None
         awaitable: Any = None
+        # Every cancel of the call (the request's, its caller's, a
+        # middleware's timeout) is a cancel of the task this runs in.
+        cancels = _task_cancels()
         try:
             if definition.is_async:
                 # A task of its own, as asyncio.wait_for gave it on 3.11:
@@ -1084,7 +1104,12 @@ class MCPServer:
                 error_code=TOOL_TIMEOUT,
                 duration_ms=duration_ms,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            if _task_cancels() == cancels:
+                # Nothing cancelled the call: the tool raised CancelledError
+                # on its own (awaiting a shared future another waiter
+                # cancelled, say).  It failed, and the client is told so.
+                return self._tool_failed(name, context, exc, _duration_ms())
             _drop_unreported_error(awaitable)
             self._stop_tool(token, CANCELLED, name, context)
             raise

@@ -263,6 +263,10 @@ class SSETransport(BaseHTTPTransport):
             # Checked after the last await: its stream may have closed
             # already, and nothing would cancel the call.
             return _shutting_down()
+        if self._sessions.get(session_id) is not session:
+            # Its stream closed while the body was read: nothing would
+            # cancel the call (nor could a notifications/cancelled reach it).
+            return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
 
         # Dispatch in the background and answer 202 now: the JSON-RPC response
         # travels over the SSE stream, and holding this POST open would stall
