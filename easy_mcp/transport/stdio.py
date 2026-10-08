@@ -12,6 +12,10 @@ Security handled here (before anything reaches the dispatcher):
   Its credential is an optional API key taken from ``api_key=`` or the
   ``EASY_MCP_STDIO_API_KEY`` environment variable; an invalid key fails fast
   at startup rather than silently downgrading to anonymous access.
+* OAuth (``oauth=``) does not apply: the MCP spec has local servers take
+  their credentials from the environment.  A server with ``oauth=`` but no
+  API keys refuses to start when a key is set, so a pasted access token can
+  never quietly mean anonymous access.
 * Every input line is capped at ``max_request_bytes``; an oversized line is
   discarded (not buffered) and answered with a ``-32004`` error.
 * ``sys.stdout`` is redirected to stderr while serving, so a stray ``print``
@@ -104,11 +108,26 @@ class StdioTransport(Transport):
         """Serve on the current event loop until stdin closes or ``stop()``.
 
         Raises:
-            AuthenticationError: The configured ``api_key`` is invalid.
+            AuthenticationError: The configured ``api_key`` is invalid, or one
+                is set for a server with ``oauth`` and no API keys.
         """
+        server = self._server
+        if server.oauth is not None:
+            if self._api_key is not None and server.auth is None:
+                # Without API keys the key would be ignored: someone who put
+                # an access token here would silently get anonymous access.
+                audit("stdio_auth_failed")
+                raise AuthenticationError(
+                    f"{API_KEY_ENV_VAR} is set but the server has no API keys; "
+                    "oauth= applies to HTTP transports only"
+                )
+            server._logger.info(
+                "oauth= applies to HTTP transports; over stdio protected tools need "
+                f"auth= and {API_KEY_ENV_VAR}"
+            )
         # Fail fast: a bad key must not silently become anonymous access.
         try:
-            identity = self._server.authenticate_key(self._api_key)
+            identity = server.authenticate_key(self._api_key)
         except AuthenticationError:
             audit("stdio_auth_failed")
             raise
