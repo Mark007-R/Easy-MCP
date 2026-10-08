@@ -37,6 +37,7 @@ from ..exceptions import (
     InsufficientScopeError,
     InvalidTokenError,
     RateLimitError,
+    StoreUnavailableError,
     TokenRequiredError,
 )
 from ..logging import audit
@@ -104,6 +105,37 @@ def rpc_error(
         {"jsonrpc": "2.0", "id": None, "error": error},
         status_code=status,
         headers=headers,
+    )
+
+
+# How soon a client refused because the store is out of reach may retry.
+STORE_RETRY_SECONDS = 1
+
+
+def store_unavailable(msg_id: Any = None) -> JSONResponse:
+    """The answer to a request that needs the store while it cannot be reached.
+
+    ``503`` with ``Retry-After``, and a JSON-RPC body carrying ``-32008``
+    with ``data.reason = "store_unavailable"``.
+    """
+    exc = StoreUnavailableError()
+    body = {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": exc.code, "message": str(exc), "data": exc.data},
+    }
+    return JSONResponse(body, status_code=503, headers={"Retry-After": str(STORE_RETRY_SECONDS)})
+
+
+def is_store_unavailable(response: dict[str, Any]) -> bool:
+    """Whether a dispatched *response* refuses its request because the store is out of reach."""
+    error = response.get("error")
+    data = error.get("data") if isinstance(error, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == StoreUnavailableError.code
+        and isinstance(data, dict)
+        and data.get("reason") == "store_unavailable"
     )
 
 
@@ -497,4 +529,13 @@ class BaseHTTPTransport(Transport):
             # Still 200 when unavailable: every worker shares the cause, so
             # draining this one would not help; this says why tokens get 503.
             health["oauth"] = "ok" if oauth._ready() else "unavailable"
+        if self._server.store.shared:
+            # 503 when this worker cannot reach the store, so a load balancer
+            # takes it out: its requests would be refused anyway.
+            if await self._server._store_reachable():
+                health["store"] = "ok"
+            else:
+                health["store"] = "unreachable"
+                health["status"] = "unavailable"
+                return JSONResponse(health, status_code=503)
         return JSONResponse(health)

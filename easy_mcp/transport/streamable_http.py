@@ -41,7 +41,8 @@ Security handled here (before anything reaches the dispatcher):
   identity its own token grants.  A tool call the token lacks a scope for is
   answered ``403`` with an ``insufficient_scope`` challenge.
 * Session ids are 192-bit random tokens; idle sessions expire and live ones
-  are capped at ``max_sessions``.
+  are capped at ``max_sessions``.  Sessions are kept in the server's store
+  (:mod:`._sessions`): with a shared one, any worker serves any session.
 * ``Content-Type`` must be ``application/json`` (415), bodies are size-capped
   while streaming (413), and an unsupported ``MCP-Protocol-Version`` header
   is rejected (400).
@@ -55,9 +56,7 @@ import binascii
 import contextlib
 import json
 import secrets
-import time
-from collections import OrderedDict
-from dataclasses import dataclass, field
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
@@ -68,6 +67,7 @@ from starlette.routing import Route
 from ..exceptions import (
     FORBIDDEN,
     HEADER_MISMATCH,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     MISSING_REQUIRED_CLIENT_CAPABILITY,
@@ -77,6 +77,7 @@ from ..exceptions import (
     TOO_MANY_SESSIONS,
     UNSUPPORTED_PROTOCOL_VERSION,
     ProtocolError,
+    StoreUnavailableError,
 )
 from ..logging import audit
 from ..middleware import TransportInfo
@@ -88,7 +89,14 @@ from ..protocol import (
     is_modern_request,
 )
 from ..security.auth import ClientIdentity
-from ._http import BaseHTTPTransport, rpc_error, token_principal
+from ._http import (
+    STORE_RETRY_SECONDS,
+    BaseHTTPTransport,
+    is_store_unavailable,
+    rpc_error,
+    store_unavailable,
+)
+from ._sessions import ClientHandle, LocalSession, Rejection, SessionManager
 from .base import ClientContext
 from .sse import SSETransport
 
@@ -112,12 +120,6 @@ _STATELESS_ERROR_STATUS: dict[object, int] = {
     UNSUPPORTED_PROTOCOL_VERSION: 400,
 }
 
-# Stateless requests have no session to hang per-client accounting on
-# (max_calls_per_session), so it is kept per client id instead, for at most
-# this many recently seen clients.  Like a session, it lapses once the client
-# has been idle for session_idle_timeout.
-_STATELESS_CLIENTS_MAX = 4096
-
 # How often a running stateless request checks whether its client hung up.
 _DISCONNECT_POLL_SECONDS = 0.25
 
@@ -130,30 +132,6 @@ _TRANSPORT = "streamable-http"
 
 class _ShuttingDown(Exception):
     """Shutdown stopped a message being dispatched, or refused to start one."""
-
-
-@dataclass(slots=True)
-class _Session:
-    """One logical client session; no connection stays open between requests."""
-
-    id: str
-    context: ClientContext
-    identity_fp: str | None
-    last_seen: float
-    active: int = 0  # requests currently being dispatched
-    opened: bool = False  # whether its handshake succeeded
-    # Its messages being dispatched, registered before their dispatch starts.
-    dispatches: set[asyncio.Task[Any]] = field(default_factory=set)
-    # The token principal it is bound to, compared in full (token_principal).
-    principal: tuple[str, str | None, str | None] | None = None
-
-
-@dataclass(slots=True)
-class _StatelessClient:
-    """Per-client call counts for stateless requests; the stand-in for a session."""
-
-    tool_calls: dict[str, int]
-    last_seen: float
 
 
 def _media_type(value: str | None) -> str:
@@ -187,6 +165,14 @@ def _json_response(
 ) -> Response:
     body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
     return Response(body, status_code=status, media_type="application/json", headers=headers)
+
+
+def _answer(payload: dict[str, Any], status: int = 200) -> Response:
+    """A dispatched response; ``503`` with ``Retry-After`` when the store was out of reach."""
+    if is_store_unavailable(payload):
+        headers = {"Retry-After": str(STORE_RETRY_SECONDS)}
+        return _json_response(payload, headers=headers, status=503)
+    return _json_response(payload, status=status)
 
 
 def _rpc_error_body(msg_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
@@ -272,8 +258,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             ``/messages``) so clients that predate Streamable HTTP still connect.
         session_idle_timeout: Seconds without a request after which a session
             expires (its id then gets 404 and the client re-initializes);
-            ``None`` keeps sessions until the client deletes them.  Stateless
-            clients' per-client call counts lapse after the same idle time.
+            ``None`` keeps sessions until the client deletes them, which a
+            shared store refuses.  Stateless clients' per-client call counts
+            lapse after the same idle time.
+
+    Raises:
+        ValueError: An invalid *path* or *session_idle_timeout*, or
+            ``session_idle_timeout=None`` with a shared store: sessions in a
+            shared store must expire.
     """
 
     def __init__(
@@ -296,16 +288,27 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             raise ValueError(f"path {path!r} is under /.well-known/, which serves metadata")
         if session_idle_timeout is not None and session_idle_timeout <= 0:
             raise ValueError("session_idle_timeout must be positive or None")
+        if session_idle_timeout is None and server.store.shared:
+            raise ValueError(
+                "session_idle_timeout=None needs the in-memory store: sessions in a shared "
+                "store must expire"
+            )
         self._path = path
         self._idle_timeout = session_idle_timeout
         self._legacy = SSETransport(server) if legacy_sse else None
-        self._sessions: dict[str, _Session] = {}
-        self._stateless: OrderedDict[str, _StatelessClient] = OrderedDict()
+        self._manager = SessionManager(
+            server, "http", ttl=session_idle_timeout, transport=_TRANSPORT
+        )
         # Every message being dispatched, so shutdown can cancel it.
         self._dispatches: set[asyncio.Task[Any]] = set()
         self._closing = False
 
     _audit_transport = _TRANSPORT
+
+    @property
+    def _sessions(self) -> dict[str, LocalSession]:
+        """The sessions this worker holds state for, by id (all of them with MemoryStore)."""
+        return {local.session_id: local for local in self._manager.local_sessions()}
 
     def describe(self) -> str:
         legacy = " (+ legacy sse)" if self._legacy is not None else ""
@@ -334,7 +337,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         or less if uvicorn is told to quit at once (a second Ctrl-C); then
         they are cancelled.  A request stopped or refused this way is
         answered ``503`` with ``-32008`` (retry shortly), and a handshake cut
-        short opens no session.
+        short opens no session.  With a shared store the sessions live on:
+        other workers serve them.
         """
         self._closing = True
         if self._legacy is not None:
@@ -354,9 +358,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 task.cancel()
         # Only now: a session's end cancels its requests as a client's cancel
         # would, and they would go unanswered.
-        for session in list(self._sessions.values()):
-            if session.opened:  # a handshake still running ends with its dispatch
-                self._end_session(session, reason="shutdown")
+        await self._manager.shutdown()
+        if self._legacy is not None:
+            await self._legacy._manager.shutdown()
 
     def build_app(self) -> Starlette:
         """Build the ASGI application (also usable for tests or mounting)."""
@@ -442,31 +446,29 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         if message.get("method") == "initialize" and "id" in message:
             return await self._initialize(message, identity, request, info)
 
-        session = self._session_for(request, identity)
+        session = await self._session_for(request, identity)
         if isinstance(session, Response):
             return session
-        if "method" not in message and ("result" in message or "error" in message):
-            # A reply to a server-to-client request.  This server never sends
-            # those, so nothing is waiting for it.
-            return Response(status_code=202)
-
-        # This request's own identity: a refreshed or broader token takes
-        # effect at once, in the same session.
-        context = self._server._request_context(session.context, identity)
-        session.active += 1
         try:
-            # A disconnect cancels nothing in this era; ending the session
-            # (DELETE) and shutdown do.
-            response = await self._dispatch_until_disconnect(
-                message, context, request, info, disconnect=False, owner=session
-            )
-        except _ShuttingDown:
-            if "id" in message:
-                return _shutting_down(message["id"])
-            return Response(status_code=202)  # a notification gets no answer either way
+            if "method" not in message and ("result" in message or "error" in message):
+                # A reply to a server-to-client request.  This server never
+                # sends those, so nothing is waiting for it.
+                return Response(status_code=202)
+            # This request's own identity: a refreshed or broader token takes
+            # effect at once, in the same session.
+            context = self._manager.context(session, identity)
+            try:
+                # A disconnect cancels nothing in this era; ending the session
+                # (DELETE) and shutdown do.
+                response = await self._dispatch_until_disconnect(
+                    message, context, request, info, disconnect=False, owner=session
+                )
+            except _ShuttingDown:
+                if "id" in message:
+                    return _shutting_down(message["id"])
+                return Response(status_code=202)  # a notification gets no answer either way
         finally:
-            session.active -= 1
-            session.last_seen = time.monotonic()
+            await self._manager.finish(session)
         if response is None:
             # A notification, or a request cancelled via notifications/cancelled:
             # MCP sends a reply to neither.
@@ -474,7 +476,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         challenge = self._step_up_headers(response, identity, modern=False)
         if challenge is not None:
             return _json_response(response, headers=challenge, status=403)
-        return _json_response(response)
+        return _answer(response)
 
     async def _handle_stateless(
         self,
@@ -519,12 +521,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 )
 
         # A context of its own, so nothing in flight is shared with other
-        # requests; only the per-client call counts are.
+        # requests; only the per-client call counts are, kept in the store.
+        store = self._server.store
+        await store.touch_client(client_id, ttl=self._idle_timeout)
         context = ClientContext(
             client_id=client_id,
             session_id="stateless",
             identity=identity,
-            tool_calls=self._stateless_calls(client_id),
+            store_handle=ClientHandle(store, client_id, self._idle_timeout),
         )
         try:
             response = await self._dispatch_until_disconnect(message, context, request, info)
@@ -537,7 +541,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return _json_response(response, headers=challenge, status=403)
         error = response.get("error")
         code = error.get("code") if isinstance(error, dict) else None
-        return _json_response(response, status=_STATELESS_ERROR_STATUS.get(code, 200))
+        return _answer(response, status=_STATELESS_ERROR_STATUS.get(code, 200))
 
     async def _dispatch_until_disconnect(
         self,
@@ -547,7 +551,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         info: TransportInfo | None = None,
         *,
         disconnect: bool = True,
-        owner: _Session | None = None,
+        owner: LocalSession | None = None,
     ) -> dict[str, Any] | None:
         """Dispatch, cancelling the work if the client closes the connection.
 
@@ -569,7 +573,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 # rather than running on until shutdown cancels it.
                 params = message.get("params")
                 cancel = params if isinstance(params, dict) else {}
-                self._server._handle_notification("notifications/cancelled", cancel, context)
+                await self._server._handle_notification("notifications/cancelled", cancel, context)
                 return None
             raise _ShuttingDown  # nothing new is served
         task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
@@ -578,6 +582,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # Registered before the dispatch's first step, so a DELETE handled
             # before the request is in flight still stops it.
             owner.dispatches.add(task)
+            if owner.ended:
+                task.cancel()  # it ended while this request was on its way in
         try:
             while True:
                 timeout = _DISCONNECT_POLL_SECONDS if disconnect else None
@@ -614,32 +620,22 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return identity.fingerprint
         return f"ip:{request.client.host if request.client else 'unknown'}"
 
-    def _stateless_calls(self, client_id: str) -> dict[str, int]:
-        """The per-client call counts a stateless request is charged to."""
-        now = time.monotonic()
-        entry = self._stateless.get(client_id)
-        if entry is None or (
-            self._idle_timeout is not None and now - entry.last_seen > self._idle_timeout
-        ):
-            # New, or idle long enough that a session would have expired.
-            entry = _StatelessClient(tool_calls={}, last_seen=now)
-            self._stateless[client_id] = entry
-        entry.last_seen = now
-        self._stateless.move_to_end(client_id)
-        if len(self._stateless) > _STATELESS_CLIENTS_MAX:
-            self._stateless.popitem(last=False)
-        return entry.tool_calls
-
     async def _handle_delete(self, request: Request) -> Response:
         # A session era request: it carries its own credential too.
         modern = request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS
         resolved = await self._resolve_identity(request, modern=modern)
         if isinstance(resolved, Response):
             return resolved
-        session = self._session_for(request, resolved)
+        session = await self._session_for(request, resolved)
         if isinstance(session, Response):
             return session
-        self._end_session(session, reason="client_terminated")
+        try:
+            # Ended in the store first: every worker answers 404 from now on.
+            await self._manager.end(session, reason="client_terminated", strict=True)
+        except StoreUnavailableError:
+            return store_unavailable()
+        finally:
+            await self._manager.finish(session)
         return Response(status_code=204)
 
     # -------------------------------------------------------------- sessions
@@ -651,26 +647,34 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         request: Request,
         info: TransportInfo,
     ) -> Response:
-        self._expire_idle_sessions()
-        if len(self._sessions) >= self._server.max_sessions:
-            return rpc_error(503, TOO_MANY_SESSIONS, "too many concurrent sessions")
-
-        # 192-bit random token: the session id is a bearer capability, it
-        # must be unguessable.
-        session_id = secrets.token_urlsafe(24)
         client_host = request.client.host if request.client else "unknown"
         client_id = identity.fingerprint if identity else f"ip:{client_host}"
-        session = _Session(
-            id=session_id,
-            context=ClientContext(client_id=client_id, session_id=session_id, identity=identity),
-            identity_fp=identity.fingerprint if identity else None,
-            last_seen=time.monotonic(),
-            active=1,
-            principal=token_principal(identity),
-        )
-        # Hold the slot while the handshake runs, so concurrent handshakes
-        # cannot overshoot max_sessions.
-        self._sessions[session_id] = session
+        # The slot is held while the handshake runs (the store counts it), so
+        # concurrent handshakes cannot overshoot max_sessions.
+        session: LocalSession | None = None
+        for attempt in range(2):
+            # 192-bit random token: the session id is a bearer capability, it
+            # must be unguessable.
+            session_id = secrets.token_urlsafe(24)
+            try:
+                session = await self._manager.open(
+                    session_id, client_id=client_id, identity=identity
+                )
+                break
+            except StoreUnavailableError:
+                return store_unavailable(message["id"])
+            except ValueError:
+                if attempt:  # the store found the id taken twice: something is wrong
+                    error_id = uuid.uuid4().hex[:12]
+                    self._server._logger.error(
+                        "could not file a new session error_id=%s", error_id, exc_info=True
+                    )
+                    return rpc_error(
+                        500, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+                    )
+        if session is None:
+            return rpc_error(503, TOO_MANY_SESSIONS, "too many concurrent sessions")
+
         response: dict[str, Any] | None = None
         try:
             # A disconnect cancels nothing in this era, and nor can the
@@ -681,84 +685,51 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         except _ShuttingDown:
             return _shutting_down(message["id"])  # and no session, below
         finally:
-            session.active -= 1
-            session.last_seen = time.monotonic()
             if response is None or "error" in response:
                 # The handshake failed (e.g. rate limited): no session.
-                self._sessions.pop(session_id, None)
+                await self._manager.end(session, reason=None)
+                session.active -= 1
+            else:
+                await self._manager.finish(
+                    session, protocol_version=session.context.protocol_version
+                )
         if response is None:
             return Response(status_code=202)
         if "error" in response:
-            return _json_response(response)
-        session.opened = True
-        audit("session_open", session_id=session_id, client_id=client_id, transport=_TRANSPORT)
-        return _json_response(response, headers={SESSION_HEADER: session_id})
+            return _answer(response)
+        self._manager.opened(session)
+        return _json_response(response, headers={SESSION_HEADER: session.session_id})
 
-    def _session_for(
+    async def _session_for(
         self, request: Request, identity: ClientIdentity | None
-    ) -> _Session | Response:
-        """Resolve the request's session, or the error response rejecting it."""
-        session_id = request.headers.get(SESSION_HEADER)
-        if not session_id:
+    ) -> LocalSession | Response:
+        """Resolve the request's session, held until ``finish``, or the response rejecting it."""
+        resolved = await self._manager.resolve(
+            request.headers.get(SESSION_HEADER),
+            identity,
+            version_header=request.headers.get(PROTOCOL_VERSION_HEADER),
+        )
+        if not isinstance(resolved, Rejection):
+            return resolved
+        if resolved is Rejection.MISSING_HEADER:
             return rpc_error(
                 400,
                 INVALID_REQUEST,
                 f"Bad Request: missing {SESSION_HEADER} header; send initialize first",
             )
-        session = self._sessions.get(session_id)
-        if session is not None and self._expired(session, time.monotonic()):
-            self._end_session(session, reason="idle_timeout")
-            session = None
-        if session is None:
+        if resolved is Rejection.NOT_FOUND:
             return rpc_error(
                 404, INVALID_REQUEST, "Session not found; send a new initialize request"
             )
-        # The session must not be usable with a different (or missing)
-        # credential than it was opened with.
-        presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
-            audit(
-                "session_credential_mismatch",
-                session_id=session_id,
-                client_id=session.context.client_id,
-                transport=_TRANSPORT,
-            )
+        if resolved is Rejection.FORBIDDEN:
+            # The session must not be usable with a different (or missing)
+            # credential than it was opened with.
             return rpc_error(403, FORBIDDEN, "Forbidden: credential does not match session")
-        version = request.headers.get(PROTOCOL_VERSION_HEADER)
-        if version is not None and version not in SUPPORTED_PROTOCOL_VERSIONS:
+        if resolved is Rejection.BAD_VERSION:
             return rpc_error(
                 400,
                 INVALID_REQUEST,
                 f"Bad Request: unsupported {PROTOCOL_VERSION_HEADER} "
                 f"(supported: {', '.join(SUPPORTED_PROTOCOL_VERSIONS)})",
             )
-        session.last_seen = time.monotonic()
-        return session
-
-    def _expired(self, session: _Session, now: float) -> bool:
-        return (
-            self._idle_timeout is not None
-            and session.active == 0
-            and now - session.last_seen > self._idle_timeout
-        )
-
-    def _expire_idle_sessions(self) -> None:
-        now = time.monotonic()
-        for session in list(self._sessions.values()):
-            if self._expired(session, now):
-                self._end_session(session, reason="idle_timeout")
-
-    def _end_session(self, session: _Session, *, reason: str) -> None:
-        if self._sessions.pop(session.id, None) is None:
-            return
-        # Calls still running for this session have nobody left to answer,
-        # those whose dispatch has yet to put them in flight included.
-        for task in [*session.dispatches, *session.context.in_flight.values()]:
-            task.cancel()
-        audit(
-            "session_close",
-            session_id=session.id,
-            client_id=session.context.client_id,
-            transport=_TRANSPORT,
-            reason=reason,
-        )
+        return store_unavailable()

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     import asyncio
 
     from ..server import MCPServer
+    from ..store.base import StoreHandle
 
 
 @dataclass(slots=True)
@@ -27,8 +28,17 @@ class ClientContext:
 
     ``protocol_version`` is the version negotiated by ``initialize`` on this
     connection or session, ``None`` before it; stateless requests carry
-    their own.  New fields are only ever appended, with defaults, so
-    positional construction keeps working.
+    their own.
+
+    ``store_handle`` reaches the session's (or, for a stateless request,
+    the client's) state in the server's store: its ``max_calls_per_session``
+    counts, and the workers its calls may run on.  The HTTP transports set
+    it; ``None`` (stdio, a direct ``dispatch``) keeps everything in this
+    context, as in 0.3.1: ``tool_calls`` counts the calls, a cancel reaches
+    ``in_flight`` only, and the rate limit is the server's in-process one.
+
+    New fields are only ever appended, with defaults, so positional
+    construction keeps working.
     """
 
     client_id: str
@@ -37,6 +47,7 @@ class ClientContext:
     tool_calls: dict[str, int] = field(default_factory=dict)
     in_flight: dict[Any, asyncio.Task[Any]] = field(default_factory=dict)
     protocol_version: str | None = None
+    store_handle: StoreHandle | None = None
 
 
 class Transport(abc.ABC):
