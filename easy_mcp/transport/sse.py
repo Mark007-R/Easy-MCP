@@ -17,7 +17,9 @@ Security handled here (before anything reaches the dispatcher):
 * API keys are resolved from ``Authorization: Bearer`` / ``X-API-Key`` and
   invalid keys are rejected with 401.  With ``oauth=``, opening a stream and
   every POST need a valid credential (401 with a challenge otherwise), and a
-  stream is bound to the token's principal.  The stream itself is not cut
+  stream is bound to the token's principal.  As in 0.3.1, a POST's session
+  is looked up before its credential, so an unknown ``session_id`` gets 404
+  either way (session ids are unguessable).  The stream itself is not cut
   when its token expires: it only delivers, and every POST is checked.  A
   tool call the token lacks a scope for cannot change the ``202`` its POST
   already got, so it arrives on the stream as a ``-32001`` error with

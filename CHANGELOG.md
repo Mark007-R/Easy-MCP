@@ -72,9 +72,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   A request without a token gets `401` with a
   `WWW-Authenticate: Bearer resource_metadata="..."` challenge, so clients
   find the authorization server themselves. Once `oauth=` is set every
-  request needs a credential (`server/discover` and notifications included),
-  and every request is checked, sessions included, before any header check,
-  session lookup or method.
+  request needs a credential (`server/discover` and notifications included).
+  It is checked on every request, sessions included, after the `Origin`,
+  `Accept`, `Content-Type`, size and JSON checks and before the MCP header
+  checks, the Streamable HTTP session lookup or any method; legacy SSE still
+  answers an unknown `session_id` with `404` first.
 
   Tokens are verified locally as JWTs against the authorization server's
   published keys (new `[oauth]` extra, PyJWT 2.15+), or with token
@@ -87,14 +89,19 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   and when a token names an unknown key, at most once every 30 s; when the
   authorization server cannot be reached, the keys already fetched stay in
   use, and with none the answer is `503` with `-32008`
-  (`data.reason: "auth_server_unavailable"`) and `Retry-After: 5`.
+  (`data.reason: "auth_server_unavailable"`) and `Retry-After: 5`. With
+  introspection, a failed discovery or introspection request is not repeated
+  for 5 s: meanwhile tokens without a cached answer get that `503` at once,
+  and the failure is logged once.
 
   Token scopes map onto the existing per-tool `scopes`, which are
   alternatives: list the narrowest first. A signed-in caller sees every tool,
   and a call its token does not cover gets `403 insufficient_scope` naming
   the scope to ask for (`step_up=False` keeps such tools invisible instead).
   `required_scopes` are needed by every request. A token's `*` scope is never
-  a wildcard. The `401` and `403` bodies carry `-32001`, never `-32002`.
+  a wildcard. The `401` and `insufficient_scope` `403` bodies carry `-32001`,
+  never `-32002`; a handshake-era session used with another principal's
+  token still gets `403` with `-32002`, as in 0.3.1.
 
   `easy_mcp.current_identity()` gives a tool the verified caller (`subject`,
   `client_id`, `issuer`, `scopes`, `claims`); the token itself is never
@@ -111,13 +118,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - `/healthz` reports `"oauth": "ok"` or `"unavailable"` when OAuth is
   configured (still with status `200`).
 - `ClientIdentity` gains `subject`, `client_id`, `issuer`, `expires_at` and
-  `claims`, all empty for API keys. `ToolDefinition` gains `declared_scopes`,
+  `claims`, all empty for API keys. `claims` is a read-only mapping, and an
+  identity can still be copied, pickled and passed to
+  `dataclasses.asdict()`. `ToolDefinition` gains `declared_scopes`,
   the tool's scopes in the order given. `APIKeyAuth.match()` tries a key
   without raising, and `SlidingWindowRateLimiter.exceeded()` looks at a
   budget without spending it.
-- Failed token checks are rate-limited per client address, with the server's
-  `rate_limit_per_minute` as the budget: past it, presented credentials get
-  `429` without being checked.
+- Token checks are rate-limited per client address, with the server's
+  `rate_limit_per_minute` as the budget: every failed check spends a unit,
+  and every check still running holds one. Past it, presented credentials
+  get `429` without being checked, however many arrive at once.
 - Exceptions `TokenRequiredError`, `InvalidTokenError` (`-32001`, `401`),
   `InsufficientScopeError` (`-32001`, `403`) and `AuthServerUnavailableError`
   (`-32008`, `503`). No new error codes.
@@ -177,7 +187,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `offline_access` (they appear in `WWW-Authenticate` challenges); such a
   registration raises `ToolRegistrationError`. Without `oauth=` nothing
   changes.
-- The GitHub connector's `--allow-write` accepts OAuth as well as API keys.
+- The GitHub connector's `--allow-write` accepts OAuth as well as API keys on
+  the HTTP transports. With OAuth every signed-in client sees the write
+  tools, and a token without `github:write` is refused with
+  `403 insufficient_scope`. Over stdio, where OAuth does not apply, it still
+  needs `EASY_MCP_API_KEYS`.
 - `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`,
   where metadata is served.
 

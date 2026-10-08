@@ -56,6 +56,10 @@ class SlidingWindowRateLimiter:
             RateLimitError: If the client is over its budget; carries
                 ``retry_after_seconds``.
         """
+        self._record(client_id)
+
+    def _record(self, client_id: str) -> float:
+        """:meth:`check`, returning the time recorded so :meth:`_refund` can take it back."""
         now = self._clock()
         cutoff = now - self._window
         with self._lock:
@@ -68,6 +72,14 @@ class SlidingWindowRateLimiter:
                 retry_after = max(0.0, window[0] + self._window - now)
                 raise RateLimitError(retry_after)
             window.append(now)
+            return now
+
+    def _refund(self, client_id: str, recorded: float) -> None:
+        """Take back the request :meth:`_record` recorded at *recorded*, if still counted."""
+        with self._lock:
+            window = self._events.get(client_id)
+            if window is not None and recorded in window:
+                window.remove(recorded)
 
     def exceeded(self, client_id: str) -> bool:
         """Whether *client_id* has used up its budget, without spending any of it."""

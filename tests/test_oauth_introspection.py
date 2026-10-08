@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
+import math
+import pickle
 import sys
+import time
+import weakref
+from collections import Counter
 from collections.abc import Iterator
 from typing import Any
 from urllib.parse import quote_plus
@@ -188,6 +194,23 @@ async def test_exp_and_nbf_checked(endpoint: FakeIntrospection, clock: Clock) ->
     assert (await oauth.verify("forever")).expires_at is None
 
 
+async def test_non_finite_times_are_malformed(endpoint: FakeIntrospection, clock: Clock) -> None:
+    oauth = make(clock)
+    for index, fields in enumerate(({"exp": math.inf}, {"exp": math.nan}, {"nbf": math.nan})):
+        endpoint.answers[f"odd-{index}"] = active(**fields)
+        assert await reason(oauth, f"odd-{index}") == "malformed", fields
+
+
+async def test_identity_pickles(endpoint: FakeIntrospection, clock: Clock) -> None:
+    endpoint.answers[TOKEN] = active(ext={"tenant": "t1"})
+    identity = await make(clock).verify(TOKEN)
+    copied = pickle.loads(pickle.dumps(identity))
+    assert copied == identity
+    assert copied.claims["ext"]["tenant"] == "t1"
+    with pytest.raises(TypeError):
+        copied.claims["ext"]["tenant"] = "t2"
+
+
 async def test_request_shape(fake_as: Any, clock: Clock) -> None:
     oauth = make(clock, endpoint_url=None, issuer=fake_as.issuer)
     fake_as.set_introspection(TOKEN, active(iss=fake_as.issuer))
@@ -302,6 +325,136 @@ async def test_metadata_without_endpoint_is_503(
     finally:
         oauth.close()
     assert not oauth._ready()
+
+
+async def test_outage_window_bounds_introspection_calls(
+    endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
+) -> None:
+    oauth = make(clock)
+    endpoint.answers[TOKEN] = active()
+    await oauth.verify(TOKEN)  # cached before the outage
+    endpoint.error = _fetch.FetchError("the endpoint answered HTTP 500", status=500)
+    failed_at = clock.now
+    for index in range(20):
+        with pytest.raises(AuthServerUnavailableError) as caught:
+            await oauth.verify(f"random-token-{index}")
+        assert caught.value.stage == "introspection"
+        clock.now += 0.2  # 20 requests within 4 s
+    assert len(endpoint.calls) == 2  # the cached token's, then one failed attempt
+    assert len(logs.events("auth_unavailable")) == 1
+    assert logs.text.count("token introspection failed") == 1
+    # Cached answers keep working meanwhile.
+    assert (await oauth.verify(TOKEN)).subject == "user-1"
+    # 5 s on, one request tries again.
+    clock.now = failed_at + 5
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify("random-token-again")
+    assert len(endpoint.calls) == 3
+    # Wrong client credentials are told once per window too.
+    endpoint.error = _fetch.FetchError("the endpoint answered HTTP 401", status=401)
+    clock.now += 5
+    for index in range(5):
+        with pytest.raises(AuthServerUnavailableError):
+            await oauth.verify(f"another-token-{index}")
+    assert len(endpoint.calls) == 4
+    assert logs.text.count("introspection_credentials_rejected") == 1
+    endpoint.error = None
+    clock.now += 5
+    endpoint.answers["fresh"] = active()
+    assert (await oauth.verify("fresh")).subject == "user-1"
+
+
+async def test_outage_window_bounds_discovery(
+    monkeypatch: pytest.MonkeyPatch, endpoint: FakeIntrospection, clock: Clock, logs: LogCapture
+) -> None:
+    fetched: Counter[str] = Counter()
+
+    async def unreachable(
+        url: str, *, max_bytes: int, timeout: float, executor: Any
+    ) -> dict[str, Any]:
+        fetched[url] += 1
+        raise _fetch.FetchError(f"{url} answered HTTP 500", status=500)
+
+    monkeypatch.setattr(_fetch, "fetch_json", unreachable)
+    oauth = make(clock, endpoint_url=None)
+    for index in range(10):
+        with pytest.raises(AuthServerUnavailableError) as caught:
+            await oauth.verify(f"random-token-{index}")
+        assert caught.value.stage == "metadata"
+        clock.now += 0.4  # 10 requests within 4 s
+    assert sum(fetched.values()) == 2  # one discovery: RFC 8414, then OpenID Connect
+    assert len(logs.events("auth_unavailable")) == 1
+    assert endpoint.calls == []
+    clock.now = NOW + 5
+    with pytest.raises(AuthServerUnavailableError):
+        await oauth.verify("random-token-again")
+    assert sum(fetched.values()) == 4
+
+
+async def test_discovery_is_shared_and_outside_the_slots(
+    monkeypatch: pytest.MonkeyPatch, endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    fetched: Counter[str] = Counter()
+    metadata: dict[str, Any] = {}
+
+    async def slow(url: str, *, max_bytes: int, timeout: float, executor: Any) -> dict[str, Any]:
+        fetched[url] += 1
+        await asyncio.sleep(0.2)
+        if url in metadata:
+            return metadata[url]
+        raise _fetch.FetchError(f"{url} timed out")
+
+    monkeypatch.setattr(_fetch, "fetch_json", slow)
+    oauth = make(clock, endpoint_url=None)
+    tokens = [f"token-{index}" for index in range(24)]
+    started = time.monotonic()
+    results = await asyncio.gather(
+        *(oauth.verify(token) for token in tokens), return_exceptions=True
+    )
+    elapsed = time.monotonic() - started
+    assert all(isinstance(result, AuthServerUnavailableError) for result in results)
+    assert sum(fetched.values()) == 2  # one discovery for all 24 tokens
+    assert elapsed < 1.0  # about one discovery (0.4 s), not one per 8 tokens
+    # Once the metadata answers, one discovery serves every waiting token.
+    fetched.clear()
+    clock.now += 5
+    metadata[f"{ISSUER}/.well-known/oauth-authorization-server"] = {
+        "issuer": ISSUER,
+        "introspection_endpoint": ENDPOINT,
+    }
+    for token in tokens:
+        endpoint.answers[token] = active(sub=token)
+    identities = await asyncio.gather(*(oauth.verify(token) for token in tokens))
+    assert [identity.subject for identity in identities] == tokens
+    assert sum(fetched.values()) == 1
+
+
+def test_finished_event_loops_are_released(
+    monkeypatch: pytest.MonkeyPatch, endpoint: FakeIntrospection, clock: Clock
+) -> None:
+    async def metadata(
+        url: str, *, max_bytes: int, timeout: float, executor: Any
+    ) -> dict[str, Any]:
+        return {"issuer": ISSUER, "introspection_endpoint": ENDPOINT}
+
+    monkeypatch.setattr(_fetch, "fetch_json", metadata)
+    endpoint.delay = 0.01
+    oauth = make(clock, endpoint_url=None)
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    async def burst(round_: int) -> None:
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        tokens = [f"token-{round_}-{index}" for index in range(12)]
+        for token in tokens:
+            endpoint.answers[token] = active(sub=token)
+        await asyncio.gather(*(oauth.verify(token) for token in tokens))
+
+    for round_ in range(2):
+        asyncio.run(burst(round_))
+    assert endpoint.peak == 8  # callers waited for a slot
+    gc.collect()
+    assert [ref() for ref in loops] == [None, None]
+    assert len(oauth._loops) == 0
 
 
 async def test_concurrency_cap(endpoint: FakeIntrospection, clock: Clock) -> None:

@@ -396,10 +396,19 @@ Good to know:
   names a key the server has not seen, at most once every 30 s. If the
   authorization server cannot be reached, the keys already fetched stay in
   use; with none fetched yet, token requests get `503` and `Retry-After: 5`,
-  and `/healthz` reports `"oauth": "unavailable"`.
-- Failed token checks are limited per client address with the server's
-  `rate_limit_per_minute`: past it, presented credentials get `429` without
-  being checked. A request without any token is never throttled.
+  and `/healthz` reports `"oauth": "unavailable"`. With introspection, a
+  failed discovery or introspection request is not repeated for 5 s: tokens
+  without a cached answer get `503` at once meanwhile.
+- Token checks are limited per client address with the server's
+  `rate_limit_per_minute`: each failed check spends one unit and each check
+  still running holds one, so past it presented credentials get `429`
+  without being checked, however many arrive at once. A request without any
+  token is never throttled.
+- The MCP Python SDK client answers one `401` or `403` per request. A client
+  pinned to `2026-07-28` whose very first request calls a tool needing more
+  than `required_scopes` signs in on that request's `401` and then gets the
+  `403` back as an error; its next call steps up. A client that lists tools
+  (or discovers) first, as clients usually do, steps up on the first call.
 - Mounted inside another app, `build_app()` runs no lifespan of its own: run
   `async with server.lifespan(): ...` from the host app's, and serve
   `server.oauth.metadata_path` at the root of the host.
@@ -725,10 +734,15 @@ accept OAuth tokens when `EASY_MCP_OAUTH_RESOURCE` is set (see
 each module's `build_server(...)` returns a normal `MCPServer` for embedding.
 
 **GitHub** is read-only by default. `--allow-write` registers `create_issue`
-and `comment_on_issue`, which are gated by the `github:write` scope: only a
-client presenting a key (or, with OAuth, a token) that holds it can see or
-call them, and starting with `--allow-write` but neither keys nor OAuth is
-refused. The connector always calls GitHub with its own token, never the
+and `comment_on_issue`, which are gated by the `github:write` scope. A key
+without it neither sees nor calls them. With OAuth every signed-in client
+sees them, and a call from a token without `github:write` gets
+`403 insufficient_scope` naming it, so the client can ask the user for it
+(embedders who want them hidden pass
+`oauth=OAuthResourceServer.from_env(step_up=False)` to `build_server`).
+Starting with `--allow-write` but neither keys nor OAuth is refused, and so
+is `--transport stdio` without keys, since OAuth does not apply over stdio.
+The connector always calls GitHub with its own token, never the
 client's credential. The token is sent only to
 `GITHUB_API_URL` (default `https://api.github.com`) and never appears in logs
 or errors. Use a fine-grained token scoped to the repositories you need.

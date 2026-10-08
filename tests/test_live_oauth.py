@@ -309,6 +309,11 @@ async def test_live_sdk_client_steps_up(fake_as: FakeAuthorizationServer, mode: 
         async with httpx2.AsyncClient(auth=provider, timeout=30) as http_client:
             transport = streamable_http_client(f"{base}/mcp", http_client=http_client)
             async with Client(transport, mode=mode) as client:
+                # Sign in first, on a request that needs no tool scope: the
+                # SDK answers one 401 or 403 per request, so a pinned client
+                # whose first request is the scoped call would get its 403
+                # back instead of stepping up.
+                await client.list_tools()
                 # The first token holds mcp:access only: 403, then a second sign-in.
                 result = await client.call_tool("write_file", {"path": "a"})
                 assert result.content[0].text == "wrote a"

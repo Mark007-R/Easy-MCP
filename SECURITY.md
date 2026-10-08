@@ -36,7 +36,7 @@ Consequences:
 | Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
 | JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
 | Token passthrough | Tools and middleware never receive the token (`Authorization` is withheld from middleware); `current_identity()` exposes only verified fields; the GitHub connector uses its own credential |
-| Credential spraying against token verification | Failed token checks are rate-limited per client address (`rate_limit_per_minute`, then `429` without verification); key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight |
+| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight; once the authorization server fails, it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used) |
 | Refresh tokens, ID tokens and bound tokens used as access tokens | Introspected `token_type` must be an access token; `typ` other than `at+jwt`/`JWT` refused; `aud` must be this server; tokens with `cnf` (DPoP, mTLS) refused |
 | Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch |
 | Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
@@ -60,8 +60,14 @@ Consequences:
   credentials arrive in headers, sessions are capability tokens bound to the
   credential that opened them, browsers are held to the `Origin` allowlist,
   and every protection above applies. With `oauth=`, every request needs a
-  valid credential, checked before any header check, session lookup or
-  method; only the Protected Resource Metadata and `/healthz` are open.
+  valid credential, checked before the MCP header checks
+  (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), `initialize`, the
+  Streamable HTTP session lookup and any method. A few checks come first and
+  are answered without one: the `Origin` allowlist (`403`), `Accept`,
+  `Content-Type`, body size and JSON parsing (`406`, `415`, `413`, `400`),
+  `GET /mcp` (`405`) and, on legacy SSE, an unknown `session_id` on
+  `POST /messages` (`404`). Only the Protected Resource Metadata and
+  `/healthz` serve anything without a credential.
 - **stdio** — the client is the *parent process* that launched the server
   (a desktop app, a CLI agent, an agent runtime). There is no network
   surface, but the parent is still treated as an MCP client: schema
@@ -129,8 +135,9 @@ the client is untrusted, the credential in the environment is trusted.
   tools exist only with `--allow-write` and are hidden from every client whose
   API key lacks the `github:write` scope (with OAuth, a token lacking it is
   refused); starting with `--allow-write` and neither keys nor OAuth is
-  refused. The token is sent only to `GITHUB_API_URL` and never logged, and the
-  client's own credential never reaches GitHub.
+  refused, and so is starting it over stdio without keys, since OAuth does
+  not apply there. The token is sent only to `GITHUB_API_URL` and never
+  logged, and the client's own credential never reaches GitHub.
 - **Postgres** — statements run in `READ ONLY` transactions with
   `default_transaction_read_only=on` at session level, a statement timeout and
   a row cap, so `INSERT`/`UPDATE`/`DDL` fail at the database. That does not

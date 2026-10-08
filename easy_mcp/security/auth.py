@@ -25,7 +25,6 @@ import os
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import Any, Protocol, TypeGuard
 
 from ..exceptions import AuthenticationError, AuthorizationError
@@ -53,8 +52,33 @@ def is_scope_token(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and _SCOPE_TOKEN.fullmatch(value) is not None
 
 
+class _ReadOnlyMapping(Mapping[str, Any]):
+    """A read-only mapping that, unlike ``MappingProxyType``, survives
+    :func:`copy.deepcopy`, :mod:`pickle` and :func:`dataclasses.asdict`."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        self._data = dict(data)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._data!r})"
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (dict(self._data),))
+
+
 def _no_claims() -> Mapping[str, Any]:
-    return MappingProxyType({})
+    return _ReadOnlyMapping({})
 
 
 @dataclass(frozen=True, slots=True)

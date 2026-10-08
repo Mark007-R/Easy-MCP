@@ -49,7 +49,6 @@ from .exceptions import (
     AuthenticationError,
     InsufficientScopeError,
     ProtocolError,
-    RateLimitError,
     ServerBusyError,
     SessionLimitError,
     TokenRequiredError,
@@ -615,22 +614,31 @@ class MCPServer:
             oauth_client_id=identity.client_id,
         )
 
-    def _auth_throttle(self, key: str) -> float | None:
-        """Seconds until *key* may present a credential again; ``None`` if it may now.
+    def _reserve_auth_attempt(self, key: str) -> float | None:
+        """Hold one unit of *key*'s failed-authentication budget while a credential is checked.
 
         The failed-authentication budget of one client address is the
-        server's rate limit, kept under a key of its own.  Without rate
-        limiting there is no throttle.
+        server's rate limit, kept under a key of its own.  A failed check
+        keeps its unit; any other outcome gives it back
+        (:meth:`_release_auth_attempt`).  So checks still running count
+        against the budget too, and a burst of bad credentials sent at once
+        cannot all be verified.  Without rate limiting there is no throttle.
+
+        Returns:
+            The reservation, or ``None`` without rate limiting.
+
+        Raises:
+            RateLimitError: The budget is used up, by failures or by checks
+                in flight.
         """
         if self._limiter is None:
             return None
-        return self._limiter._retry_after(key)
+        return self._limiter._record(key)
 
-    def _charge_auth_failure(self, key: str) -> None:
-        """Spend one unit of *key*'s failed-authentication budget."""
-        if self._limiter is not None:
-            with contextlib.suppress(RateLimitError):  # full now: the next one is refused
-                self._limiter.check(key)
+    def _release_auth_attempt(self, key: str, reservation: float | None) -> None:
+        """Give back the unit :meth:`_reserve_auth_attempt` held for a check that did not fail."""
+        if self._limiter is not None and reservation is not None:
+            self._limiter._refund(key, reservation)
 
     def _steps_up(self, identity: ClientIdentity | None) -> bool:
         """Whether *identity* sees every tool and is challenged for a missing scope.

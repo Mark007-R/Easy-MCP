@@ -520,3 +520,35 @@ def test_github_allow_write_accepts_oauth(monkeypatch: pytest.MonkeyPatch) -> No
     )
     with pytest.raises(ValueError, match="auth or oauth"):
         github.build_server(client=FakeGitHub({}), enable_write=True)
+
+
+def test_github_allow_write_over_stdio_needs_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp import OAuthResourceServer
+
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("EASY_MCP_API_KEYS", raising=False)
+    served: list[str] = []
+    monkeypatch.setattr(MCPServer, "run", lambda self, transport="stdio": served.append(transport))
+    # OAuth does not apply over stdio, so no client could reach the write tools.
+    with pytest.raises(SystemExit) as stopped:
+        github.main(["--allow-write", "--transport", "stdio"])
+    assert stopped.value.code == 2
+    assert served == []
+    github.main(["--allow-write", "--transport", "http", "--port", "0"])
+    assert served == ["http"]
+    oauth = OAuthResourceServer.from_env()
+    with pytest.raises(ValueError, match="EASY_MCP_API_KEYS"):
+        github.build_server(
+            client=FakeGitHub({}), enable_write=True, oauth=oauth, transport="stdio"
+        )
+    # With keys as well, stdio clients are told to present a key.
+    keyed = github.build_server(
+        client=FakeGitHub({}),
+        enable_write=True,
+        oauth=oauth,
+        auth=APIKeyAuth({WRITE_KEY: "*"}),
+        transport="stdio",
+    )
+    assert keyed.instructions is not None
+    assert "Write tools need an API key holding" in keyed.instructions

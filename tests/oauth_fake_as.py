@@ -8,7 +8,8 @@ runs a minimal authorization-code flow: ``/authorize`` approves at once
 (PKCE S256 required, ``resource`` honoured) and ``/token`` issues signed JWTs.
 
 Everything is controlled from the test: ``rotate()``, ``set_keys()``,
-``fail(route, mode)``, ``set_introspection(token, answer)``, ``counters``.
+``fail(route, mode)``, ``delays``, ``set_introspection(token, answer)``,
+``counters``.
 Keys are generated in the test process; nothing leaves the machine.
 """
 
@@ -120,6 +121,7 @@ class FakeAuthorizationServer:
         self.audience = audience
         self.counters: Counter[str] = Counter()
         self.failures: dict[str, Any] = {}
+        self.delays: dict[str, float] = {}  # seconds a route waits before answering
         self.serve_rfc8414 = True
         self.serve_oidc = False
         self.metadata_issuer: str | None = None  # an override, to test mismatches
@@ -173,6 +175,8 @@ class FakeAuthorizationServer:
 
     async def _failure(self, route: str) -> Response | None:
         self.counters[route] += 1
+        if self.delays.get(route):
+            await asyncio.sleep(self.delays[route])
         mode = self.failures.get(route)
         if mode is None:
             return None

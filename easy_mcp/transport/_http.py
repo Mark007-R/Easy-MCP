@@ -36,6 +36,7 @@ from ..exceptions import (
     AuthServerUnavailableError,
     InsufficientScopeError,
     InvalidTokenError,
+    RateLimitError,
     TokenRequiredError,
 )
 from ..logging import audit
@@ -294,19 +295,24 @@ class BaseHTTPTransport(Transport):
         client_id = f"ip:{address}"
         throttle_key = f"authfail:{client_id}"
 
+        reservation: float | None = None
         if bearer is not None or api_key is not None:
-            retry_after = server._auth_throttle(throttle_key)
-            if retry_after is not None:
-                # Too many failed checks from this address: refuse without
-                # verifying, which bounds key fetches and introspection calls.
+            try:
+                # Held while the credential is checked, and kept if it fails.
+                reservation = server._reserve_auth_attempt(throttle_key)
+            except RateLimitError as exc:
+                # Too many failed (or running) checks from this address:
+                # refuse without verifying, which bounds signature checks,
+                # key fetches and introspection calls.
                 audit("auth_rate_limited", client_id=client_id, transport=self._audit_transport)
                 return rpc_error(
                     429,
                     RATE_LIMITED,
-                    f"Rate limit exceeded; retry in {retry_after:.1f}s",
-                    headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
-                    data={"retry_after_seconds": round(retry_after, 3)},
+                    str(exc),
+                    headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
+                    data=exc.data,
                 )
+        failed = False
         try:
             return await server.authenticate_request(bearer=bearer, api_key=api_key)
         except TokenRequiredError:
@@ -319,7 +325,7 @@ class BaseHTTPTransport(Transport):
                 headers={"WWW-Authenticate": challenge},
             )
         except InvalidTokenError as exc:
-            server._charge_auth_failure(throttle_key)
+            failed = True  # the reservation is this failure's charge
             fields = {"issuer": exc.issuer} if exc.issuer in oauth.authorization_servers else {}
             audit(
                 "auth_failed",
@@ -372,6 +378,9 @@ class BaseHTTPTransport(Transport):
                 metadata_url, scope=server._initial_scopes()
             )
             return response
+        finally:
+            if not failed:
+                server._release_auth_attempt(throttle_key, reservation)
 
     def _scope_challenge(
         self, needed: Iterable[str], granted: Iterable[str], modern: bool

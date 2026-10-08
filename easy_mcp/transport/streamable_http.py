@@ -32,8 +32,10 @@ Security handled here (before anything reaches the dispatcher):
   every request, and a session only answers the credential it was opened
   with (403 otherwise), so a leaked session id alone is useless.
 * With ``oauth=``, every request needs a credential and every access token
-  is verified on every request, sessions included, before the header checks,
-  the session lookup or dispatch: an unauthenticated caller learns nothing.
+  is verified on every request, sessions included: after the ``Accept``,
+  ``Content-Type``, size and JSON checks, and before the MCP header-mirror
+  checks, the session lookup or dispatch, so an unauthenticated caller
+  learns nothing about headers, sessions or methods.
   A session is bound to the token's principal rather than the token, so a
   refreshed or broader token keeps it, and each request runs with the
   identity its own token grants.  A tool call the token lacks a scope for is
@@ -420,8 +422,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         modern = request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
             isinstance(params, dict) and is_modern_request(message.get("method"), params)
         )
-        # Before the header checks, the handshake and the session lookup, so
-        # an unauthenticated caller learns nothing about any of them.
+        # Before the MCP header checks, the handshake and the session lookup,
+        # so an unauthenticated caller learns nothing about any of them.
         resolved = await self._resolve_identity(request, modern=modern)
         if isinstance(resolved, Response):
             return resolved

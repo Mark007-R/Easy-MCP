@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import dataclasses
+import gc
 import hashlib
 import hmac
 import json
+import math
+import pickle
 import threading
+import weakref
 from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +29,13 @@ import pytest
 from conftest import LogCapture
 from oauth_fake_as import SigningKey, b64url, craft, mint_token
 
-from easy_mcp import AuthServerUnavailableError, InvalidTokenError, OAuthResourceServer
+from easy_mcp import (
+    APIKeyAuth,
+    AuthServerUnavailableError,
+    ClientIdentity,
+    InvalidTokenError,
+    OAuthResourceServer,
+)
 from easy_mcp.security import _fetch
 
 ISSUER = "https://auth.example.com"
@@ -346,6 +358,23 @@ async def test_not_yet_valid(fetch: FakeFetch, clock: Clock, rsa: SigningKey) ->
         assert (await oauth.verify(within)).subject == "user-1"
     assert await reason(oauth, mint(rsa, clock, claims={"exp": "soon"})) == "malformed"
     assert await reason(oauth, mint(rsa, clock, claims={"nbf": True})) == "malformed"
+
+
+async def test_non_finite_times_are_malformed(
+    fetch: FakeFetch, clock: Clock, rsa: SigningKey
+) -> None:
+    # JSON's Infinity and NaN (and 1e999) decode to floats no comparison can
+    # place, and an integer this long to no float at all.
+    oauth = make(clock)
+    for claims in (
+        {"exp": math.inf},
+        {"exp": math.nan},
+        {"exp": 10**400},
+        {"nbf": math.nan},
+        {"nbf": -math.inf},
+        {"iat": math.nan},
+    ):
+        assert await reason(oauth, mint(rsa, clock, claims=claims)) == "malformed", claims
 
 
 async def test_missing_required_claims(fetch: FakeFetch, clock: Clock, rsa: SigningKey) -> None:
@@ -672,6 +701,23 @@ def test_verify_works_from_two_event_loops(fetch: FakeFetch, clock: Clock, rsa: 
     assert fetch.key_fetches == 2
 
 
+def test_finished_event_loops_are_released(fetch: FakeFetch, clock: Clock, rsa: SigningKey) -> None:
+    oauth = make(clock)
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    async def verify() -> None:
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        assert (await oauth.verify(mint(rsa, clock))).subject == "user-1"
+
+    for _ in range(3):
+        clock.now += 3601  # every loop refreshes the keys
+        asyncio.run(verify())
+    assert fetch.key_fetches == 3
+    gc.collect()
+    assert [ref() for ref in loops] == [None, None, None]
+    assert len(oauth._loops) == 0
+
+
 async def test_warm_up_never_raises_and_close_releases_threads(
     fetch: FakeFetch, clock: Clock, rsa: SigningKey, logs: LogCapture
 ) -> None:
@@ -684,8 +730,26 @@ async def test_warm_up_never_raises_and_close_releases_threads(
     clock.now += 6
     await oauth.warm_up()
     assert oauth._ready()
+    executor = oauth._executor
+    assert executor is not None
     oauth.close()
+    assert oauth._executor is None
+    assert executor._shutdown
     oauth.close()  # idempotent
+
+
+async def test_close_stops_the_fetch_threads(fake_as: Any) -> None:
+    oauth = OAuthResourceServer(RESOURCE, [fake_as.issuer])
+    await oauth.warm_up()  # real fetches, on the server's own threads
+    assert oauth._ready()
+    executor = oauth._executor
+    assert executor is not None
+    workers = list(executor._threads)
+    assert workers and all(worker.name.startswith("easy-mcp-oauth") for worker in workers)
+    oauth.close()
+    for worker in workers:
+        worker.join(5)
+    assert not any(worker.is_alive() for worker in workers)
 
 
 def test_identity_claims_are_read_only(fetch: FakeFetch, clock: Clock, rsa: SigningKey) -> None:
@@ -698,3 +762,24 @@ def test_identity_claims_are_read_only(fetch: FakeFetch, clock: Clock, rsa: Sign
         identity.claims["ext"]["tenant"] = "t2"
     assert token not in repr(identity)
     assert token not in json.dumps(dict(identity.claims), default=str)
+
+
+def test_identities_copy_pickle_and_asdict(fetch: FakeFetch, clock: Clock, rsa: SigningKey) -> None:
+    token = mint(rsa, clock, claims={"groups": ["a", "b"], "ext": {"tenant": "t1"}})
+    from_token = asyncio.run(make(clock).verify(token))
+    from_key = APIKeyAuth({"k" * 32: ["a"]}).authenticate("k" * 32)
+    assert from_key is not None
+    built = ClientIdentity("fingerprint1", frozenset({"x"}))
+    for identity in (from_token, from_key, built):
+        for copied in (copy.deepcopy(identity), pickle.loads(pickle.dumps(identity))):
+            assert copied == identity
+            assert dict(copied.claims) == dict(identity.claims)
+            with pytest.raises(TypeError):
+                copied.claims["sub"] = "someone-else"  # type: ignore[index]
+        assert dataclasses.asdict(identity)["fingerprint"] == identity.fingerprint
+        assert dataclasses.astuple(identity)[0] == identity.fingerprint
+    copied = pickle.loads(pickle.dumps(from_token))
+    assert copied.claims["ext"]["tenant"] == "t1"
+    with pytest.raises(TypeError):
+        copied.claims["ext"]["tenant"] = "t2"
+    assert dataclasses.asdict(from_token)["claims"]["groups"] == ("a", "b")

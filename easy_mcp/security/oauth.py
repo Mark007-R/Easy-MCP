@@ -28,27 +28,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from types import MappingProxyType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from ..exceptions import AuthServerUnavailableError, InvalidTokenError
 from ..logging import audit
 from . import _fetch
-from .auth import ClientIdentity, is_scope_token
+from .auth import ClientIdentity, _ReadOnlyMapping, is_scope_token
 
 logger = logging.getLogger("easy_mcp.security.oauth")
 
@@ -210,19 +212,27 @@ def _split_env(value: str | None) -> list[str]:
 
 
 def _freeze(value: Any) -> Any:
-    """A deep read-only copy of decoded JSON."""
+    """A deep read-only copy of decoded JSON (one that can still be pickled)."""
     if isinstance(value, dict):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+        return _ReadOnlyMapping({key: _freeze(item) for key, item in value.items()})
     if isinstance(value, list):
         return tuple(_freeze(item) for item in value)
     return value
 
 
 def _number(value: object) -> float | None:
-    """A JSON number as a float; ``None`` for anything else (booleans included)."""
+    """A finite JSON number as a float; ``None`` for anything else (booleans included).
+
+    JSON's ``Infinity`` and ``NaN`` (and ``1e999``) decode to floats that no
+    time comparison can place, so they are no numbers here.
+    """
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # an integer too large for a float
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _scopes_from(value: object) -> frozenset[str]:
@@ -421,17 +431,55 @@ class _IssuerState:
     attempted_at: float | None = None  # last key-set fetch, successful or not
     attempts: int = 0
     warned_at: float | None = None
+    # Introspection mode: after a failed discovery or introspection request,
+    # nothing is sent to the authorization server before this time.
+    unavailable_until: float = 0.0
+    unavailable_stage: str = "introspection"
 
 
 @dataclass(slots=True)
 class _LoopState:
-    """The asyncio objects of one event loop: they cannot be shared between loops."""
+    """The asyncio objects of one event loop: they cannot be shared between loops.
+
+    Each of them holds its loop, so none is kept once it is no longer in
+    use: finished tasks are dropped, and the introspection slots exist only
+    while introspections run.  A loop nothing runs on any more can then go.
+    """
 
     refreshes: dict[str, asyncio.Task[None]] = field(default_factory=dict)
-    introspection_slots: asyncio.Semaphore = field(
-        default_factory=lambda: asyncio.Semaphore(MAX_INTROSPECTIONS_IN_FLIGHT)
-    )
+    discoveries: dict[str, asyncio.Task[str]] = field(default_factory=dict)
     introspections: dict[str, asyncio.Future[ClientIdentity]] = field(default_factory=dict)
+    slots: asyncio.Semaphore | None = None
+    slot_users: int = 0
+
+    @contextlib.asynccontextmanager
+    async def introspection_slot(self) -> AsyncIterator[None]:
+        """Hold one of the ``MAX_INTROSPECTIONS_IN_FLIGHT`` slots."""
+        if self.slots is None:
+            self.slots = asyncio.Semaphore(MAX_INTROSPECTIONS_IN_FLIGHT)
+        slots = self.slots
+        self.slot_users += 1
+        try:
+            async with slots:
+                yield
+        finally:
+            self.slot_users -= 1
+            if self.slot_users == 0:
+                # Nobody holds or waits for a slot: a new semaphore serves
+                # the next caller, and this one no longer pins the loop.
+                self.slots = None
+
+
+def _forget_when_done(pending: dict[str, Any], key: str, future: asyncio.Future[Any]) -> None:
+    """Drop *future* from *pending* once it is done (a done task still holds its loop)."""
+
+    def forget(done: asyncio.Future[Any]) -> None:
+        if pending.get(key) is done:
+            del pending[key]
+        if not done.cancelled():
+            done.exception()  # retrieved, even if every waiter left
+
+    future.add_done_callback(forget)
 
 
 # ---------------------------------------------------------- public API
@@ -981,6 +1029,7 @@ class OAuthResourceServer:
                 # No await between the look and the start: requests arriving
                 # meanwhile join this fetch instead of starting their own.
                 task = refreshes[state.issuer] = asyncio.ensure_future(self._refresh_keys(state))
+                _forget_when_done(refreshes, state.issuer, task)
             # Shielded: the fetch serves every request waiting on it, so one
             # that is cancelled must not stop it.
             await asyncio.shield(task)
@@ -1101,21 +1150,72 @@ class OAuthResourceServer:
 
     # ------------------------------------------------------- introspection
 
+    def _check_available(self, state: _IssuerState) -> None:
+        """Refuse at once, without a request, while an outage window is open.
+
+        Raises:
+            AuthServerUnavailableError: The authorization server failed less
+                than ``UNAVAILABLE_RETRY_SECONDS`` ago.
+        """
+        with self._lock:
+            unavailable = self._clock() < state.unavailable_until
+            stage = state.unavailable_stage
+        if unavailable:
+            raise AuthServerUnavailableError(issuer=state.issuer, stage=stage)
+
+    def _open_outage(self, state: _IssuerState, stage: str) -> bool:
+        """Open (or extend) the outage window after a failed request to the issuer.
+
+        Returns whether it was closed until now: the failure is then logged
+        and audited, once per window rather than once per request.
+        """
+        now = self._clock()
+        with self._lock:
+            opened = now >= state.unavailable_until
+            state.unavailable_until = now + UNAVAILABLE_RETRY_SECONDS
+            state.unavailable_stage = stage
+        return opened
+
     async def _introspection_endpoint(self, state: _IssuerState) -> str:
+        """The configured or discovered introspection endpoint.
+
+        Discovery runs once at a time per issuer and loop, shared by every
+        token waiting for it, and after a failure not again for
+        ``UNAVAILABLE_RETRY_SECONDS``.
+
+        Raises:
+            AuthServerUnavailableError: No usable endpoint could be found.
+        """
         with self._lock:
             known = state.introspection_endpoint
         if known is not None:
             return known
+        self._check_available(state)
+        discoveries = self._loop_state().discoveries
+        task = discoveries.get(state.issuer)
+        if task is None or task.done():
+            task = discoveries[state.issuer] = asyncio.ensure_future(
+                self._discover_introspection_endpoint(state)
+            )
+            _forget_when_done(discoveries, state.issuer, task)
+        # Shielded: the discovery serves every token waiting on it.
+        return await asyncio.shield(task)
+
+    async def _discover_introspection_endpoint(self, state: _IssuerState) -> str:
         try:
             metadata = await self._discover(state.issuer)
         except _fetch.FetchError as exc:
-            logger.error("cannot find the introspection endpoint of %s: %s", state.issuer, exc)
-            audit("auth_unavailable", issuer=state.issuer, stage="metadata")
+            if self._open_outage(state, "metadata"):
+                logger.error("cannot find the introspection endpoint of %s: %s", state.issuer, exc)
+                audit("auth_unavailable", issuer=state.issuer, stage="metadata")
             raise AuthServerUnavailableError(issuer=state.issuer, stage="metadata") from None
         endpoint = metadata.get("introspection_endpoint")
         if not isinstance(endpoint, str) or not _fetch.allowed_url(endpoint):
-            logger.error("the metadata of %s has no usable introspection_endpoint", state.issuer)
-            audit("auth_unavailable", issuer=state.issuer, stage="metadata")
+            if self._open_outage(state, "metadata"):
+                logger.error(
+                    "the metadata of %s has no usable introspection_endpoint", state.issuer
+                )
+                audit("auth_unavailable", issuer=state.issuer, stage="metadata")
             raise AuthServerUnavailableError(issuer=state.issuer, stage="metadata")
         with self._lock:
             state.introspection_endpoint = endpoint
@@ -1154,14 +1254,7 @@ class OAuthResourceServer:
             # Concurrent lookups of one token share one request.
             pending = asyncio.ensure_future(self._introspect_once(token, digest, loop_state))
             loop_state.introspections[digest] = pending
-
-            def done(future: asyncio.Future[ClientIdentity]) -> None:
-                if loop_state.introspections.get(digest) is future:
-                    del loop_state.introspections[digest]
-                if not future.cancelled():
-                    future.exception()  # retrieved, even if every waiter left
-
-            pending.add_done_callback(done)
+            _forget_when_done(loop_state.introspections, digest, pending)
         # Shielded: a cancelled waiter must not stop the others' answer.
         return await asyncio.shield(pending)
 
@@ -1171,8 +1264,13 @@ class OAuthResourceServer:
         introspection = self._introspection
         assert introspection is not None
         state = self._states[self._issuers[0]]
-        async with loop_state.introspection_slots:
-            endpoint = await self._introspection_endpoint(state)
+        self._check_available(state)
+        # Before taking a slot: the slots bound introspection requests only,
+        # and one discovery serves every token.
+        endpoint = await self._introspection_endpoint(state)
+        async with loop_state.introspection_slot():
+            # An outage found while this waited for its slot: no request.
+            self._check_available(state)
             try:
                 answer = await _fetch.post_form_json(
                     endpoint,
@@ -1183,23 +1281,25 @@ class OAuthResourceServer:
                     executor=self._get_executor(),
                 )
             except _fetch.FetchError as exc:
-                if exc.status in (401, 403):
-                    logger.error(
-                        "introspection_credentials_rejected: %s refused this server's "
-                        "client credentials (HTTP %s); check the introspection client id "
-                        "and secret",
-                        endpoint,
-                        exc.status,
-                        extra={
-                            "event": {
-                                "type": "introspection_credentials_rejected",
-                                "issuer": state.issuer,
-                            }
-                        },
-                    )
-                else:
-                    logger.error("token introspection failed: %s", exc)
-                audit("auth_unavailable", issuer=state.issuer, stage="introspection")
+                # Logged and audited once per outage window, not per request.
+                if self._open_outage(state, "introspection"):
+                    if exc.status in (401, 403):
+                        logger.error(
+                            "introspection_credentials_rejected: %s refused this server's "
+                            "client credentials (HTTP %s); check the introspection client "
+                            "id and secret",
+                            endpoint,
+                            exc.status,
+                            extra={
+                                "event": {
+                                    "type": "introspection_credentials_rejected",
+                                    "issuer": state.issuer,
+                                }
+                            },
+                        )
+                    else:
+                        logger.error("token introspection failed: %s", exc)
+                    audit("auth_unavailable", issuer=state.issuer, stage="introspection")
                 raise AuthServerUnavailableError(
                     issuer=state.issuer, stage="introspection"
                 ) from None

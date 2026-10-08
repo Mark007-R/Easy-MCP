@@ -9,8 +9,11 @@ the test connects to.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -249,6 +252,46 @@ def test_invalid_and_expired_token_401(served: Any, fake_as: FakeAuthorizationSe
                 "code": AUTHENTICATION_REQUIRED,
                 "message": "Invalid access token",
             }
+
+
+def test_non_finite_expiry_is_401_not_500(served: Any, fake_as: FakeAuthorizationServer) -> None:
+    base, _ = served()
+    with httpx.Client(base_url=base, timeout=10) as client:
+        for exp in (math.inf, math.nan):
+            response = stateless(
+                client, modern("tools/list"), bearer(fake_as.mint(claims={"exp": exp}))
+            )
+            assert response.status_code == 401
+            assert 'error="invalid_token"' in challenge(response)
+
+
+def test_checks_that_come_before_the_credential(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    # What SECURITY.md lists as answered without a credential, and without a challenge.
+    server = make_server(fake_as)
+    server.max_request_bytes = 1024
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        message = modern("tools/list")
+        headers = headers_for(message, **{"Content-Type": "application/json"})
+        body = json.dumps(message)
+        responses = {
+            403: client.post(
+                "/mcp", content=body, headers={**headers, "Origin": "http://evil.example"}
+            ),
+            406: client.post("/mcp", content=body, headers={**headers, "Accept": "text/html"}),
+            415: client.post(
+                "/mcp", content=body, headers={**headers, "Content-Type": "text/plain"}
+            ),
+            413: client.post("/mcp", content=b" " * 1025, headers=headers),
+            400: client.post("/mcp", content=b"{not json", headers=headers),
+            405: client.get("/mcp"),
+            404: client.post("/messages", params={"session_id": "bogus"}, json=rpc("ping")),
+        }
+        for status, response in responses.items():
+            assert response.status_code == status, response.text
+            assert "www-authenticate" not in response.headers
 
 
 def test_auth_runs_before_header_mirror_checks(served: Any) -> None:
@@ -555,6 +598,31 @@ def test_failed_auth_throttle_429(
     assert [event["reason"] for event in logs.events("auth_failed")] == ["inactive"] * 3
 
 
+async def test_failed_auth_throttle_holds_for_concurrent_requests(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    # Checks still in flight count against the budget: a burst of bad tokens
+    # sent at once cannot all reach the introspection endpoint.
+    fake_as.delays["introspect"] = 0.3
+    introspection = Introspection(CLIENT_ID, CLIENT_SECRET, endpoint=f"{fake_as.issuer}/introspect")
+    server = make_server(fake_as, introspection=introspection, rate_limit_per_minute=3)
+    base = live_server(server)
+    message = modern("tools/list")
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    "/mcp",
+                    json=message,
+                    headers={**headers_for(message), **bearer(f"bad-token-{index}")},
+                )
+                for index in range(20)
+            )
+        )
+    assert fake_as.counters["introspect"] == 3
+    assert Counter(response.status_code for response in responses) == {401: 3, 429: 17}
+
+
 def test_auth_server_down_503(live_server: LiveServer, fake_as: FakeAuthorizationServer) -> None:
     fake_as.fail("jwks", 500)
     base = live_server(make_server(fake_as))
@@ -628,6 +696,8 @@ def test_no_token_or_secret_in_logs(
     opaque_base = live_server(make_server(fake_as, introspection=introspection))
     good = fake_as.mint()
     expired = fake_as.mint(claims={"exp": int(time.time()) - 120})
+    # Valid, but without the required mcp:access: refused at the door (403).
+    unscoped = fake_as.mint(claims={"scope": "files:read"})
     opaque = "opaque-token-abcdefghijklmnop"
     fake_as.set_introspection(
         opaque,
@@ -636,15 +706,20 @@ def test_no_token_or_secret_in_logs(
     with httpx.Client(base_url=jwt_base, timeout=10) as client:
         for token in (good, expired, good + "x"):
             stateless(client, modern_call("write_file", path="a"), bearer(token))
+        door = stateless(client, modern("tools/list"), bearer(unscoped))
+        assert door.status_code == 403
     with httpx.Client(base_url=opaque_base, timeout=10) as client:
         stateless(client, modern_call("status"), bearer(opaque))
         stateless(client, modern_call("status"), bearer(opaque + "-bad"))
     everything = logs.text + json.dumps(
         [getattr(record, "event", None) for record in logs.records], default=str
     )
-    for secret in (good, expired, opaque, CLIENT_SECRET):
+    for secret in (good, expired, unscoped, opaque, CLIENT_SECRET):
         assert secret not in everything
-    assert logs.events("auth_failed")  # the attempts were recorded, by fingerprint
+    failed = logs.events("auth_failed")  # the attempts were recorded, by fingerprint
+    assert {event["reason"] for event in failed} >= {"expired", "insufficient_scope"}
+    for event in failed:
+        assert len(event["token_fp"]) == 12
 
 
 def test_audit_events(served: Any, fake_as: FakeAuthorizationServer, logs: LogCapture) -> None:
