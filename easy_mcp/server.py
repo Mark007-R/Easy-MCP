@@ -537,6 +537,12 @@ class MCPServer:
         is_notification: bool,
     ) -> dict[str, Any] | None:
         # The call runs as its own task so notifications/cancelled can abort it.
+        # Whether our own caller is being cancelled is told apart from that by
+        # the caller's cancel count: when the caller is cancelled while it
+        # waits here, asyncio cancels the call's task too, so the task being
+        # cancelled says nothing about who asked.
+        caller = asyncio.current_task()
+        baseline = caller.cancelling() if caller is not None else 0
         task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
             self._execute_tool(params, context)
         )
@@ -547,13 +553,17 @@ class MCPServer:
         try:
             result = await task
         except asyncio.CancelledError:
-            if task.cancelled():
-                # Cancelled via notifications/cancelled: per MCP, the request's
-                # response is dropped.
+            if not task.done() or task.cancelled():
                 audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
-                return None
-            task.cancel()  # our own caller is being cancelled; don't orphan it
-            raise
+            if caller is not None and caller.cancelling() > baseline:
+                # Our own caller is being cancelled (a timeout around dispatch,
+                # a closed connection, shutdown): the cancellation is theirs,
+                # and the call must not outlive it.
+                task.cancel()
+                raise
+            # Cancelled via notifications/cancelled: per MCP, the request's
+            # response is dropped.
+            return None
         except ProtocolError as exc:
             return None if is_notification else _protocol_error_response(msg_id, exc)
         except Exception:
