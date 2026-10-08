@@ -242,3 +242,71 @@ def test_rate_limiter_forgets_idle_clients() -> None:
     now[0] = 61.0  # every recorded request has aged out of the window
     limiter.check("fresh")  # triggers the once-per-window sweep
     assert limiter.tracked_clients == 1
+
+
+def test_api_key_match_non_raising() -> None:
+    auth = APIKeyAuth({ADMIN_KEY: "*", MATH_KEY: ["math"]})
+    assert auth.match("not-a-key") is None
+    assert auth.match("") is None
+    matched = auth.match(MATH_KEY)
+    assert matched is not None and matched.scopes == frozenset({"math"})
+    assert matched == auth.authenticate(MATH_KEY)
+    with pytest.raises(AuthenticationError, match="Invalid API key"):
+        auth.authenticate("not-a-key")
+    assert auth.authenticate(None) is None
+
+
+def test_rate_limiter_exceeded_does_not_consume() -> None:
+    now = [0.0]
+    limiter = SlidingWindowRateLimiter(2, 60.0, clock=lambda: now[0])
+    assert not limiter.exceeded("a")
+    for _ in range(10):
+        assert not limiter.exceeded("a")  # looking spends nothing
+    limiter.check("a")
+    assert not limiter.exceeded("a")
+    limiter.check("a")
+    assert limiter.exceeded("a")
+    assert limiter._retry_after("a") == pytest.approx(60.0)
+    now[0] = 30.0
+    assert limiter._retry_after("a") == pytest.approx(30.0)
+    now[0] = 60.5
+    assert not limiter.exceeded("a")
+    limiter.check("a")  # the budget is back
+    assert limiter.tracked_clients == 1  # exceeded() made no entries
+    assert not limiter.exceeded("never-seen")
+    assert limiter.tracked_clients == 1
+
+
+def test_identity_claims_not_in_repr_or_hash() -> None:
+    from types import MappingProxyType
+
+    from easy_mcp import ClientIdentity
+
+    claims = MappingProxyType({"sub": "user-1", "email": "someone@example.com"})
+    identity = ClientIdentity(
+        fingerprint="f" * 12,
+        scopes=frozenset({"a"}),
+        subject="user-1",
+        client_id="client-1",
+        issuer="https://auth.example.com",
+        expires_at=1,
+        claims=claims,
+    )
+    assert "someone@example.com" not in repr(identity)
+    assert "claims" not in repr(identity)
+    same_but_other_claims = ClientIdentity(
+        fingerprint="f" * 12,
+        scopes=frozenset({"a"}),
+        subject="user-1",
+        client_id="client-1",
+        issuer="https://auth.example.com",
+        expires_at=1,
+    )
+    assert identity == same_but_other_claims
+    assert hash(identity) == hash(same_but_other_claims)
+    # API-key identities leave every new field empty and compare as before.
+    key = APIKeyAuth({ADMIN_KEY: "*"}).authenticate(ADMIN_KEY)
+    assert key is not None
+    assert (key.subject, key.client_id, key.issuer, key.expires_at) == (None, None, None, None)
+    assert dict(key.claims) == {}
+    assert key == ClientIdentity(fingerprint=fingerprint(ADMIN_KEY), scopes=frozenset({"*"}))

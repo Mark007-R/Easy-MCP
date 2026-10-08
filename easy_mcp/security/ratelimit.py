@@ -69,6 +69,25 @@ class SlidingWindowRateLimiter:
                 raise RateLimitError(retry_after)
             window.append(now)
 
+    def exceeded(self, client_id: str) -> bool:
+        """Whether *client_id* has used up its budget, without spending any of it."""
+        return self._retry_after(client_id) is not None
+
+    def _retry_after(self, client_id: str) -> float | None:
+        """Seconds until *client_id* may make a request again; ``None`` if it may now.
+
+        Looks without recording a request, like :meth:`exceeded`.
+        """
+        now = self._clock()
+        with self._lock:
+            window = self._events.get(client_id)
+            if window is None:
+                return None
+            live = [stamp for stamp in window if stamp > now - self._window]
+            if len(live) < self._max:
+                return None
+            return max(0.0, live[0] + self._window - now)
+
     def _sweep(self, cutoff: float, now: float) -> None:
         """Drop clients with no request inside the window (lock held)."""
         idle = [

@@ -191,3 +191,21 @@ def test_invalid_timeout_rejected(server: MCPServer) -> None:
         def fn() -> str:
             """X."""
             return "x"
+
+
+def test_declared_scopes_keep_order_and_dedupe(server: MCPServer) -> None:
+    @server.tool(scopes=("b", "a", "b"))
+    def scoped() -> str:
+        """Scoped."""
+        return "x"
+
+    (definition,) = server.tools
+    assert definition.declared_scopes == ("b", "a")
+    assert definition.scopes == frozenset({"a", "b"})
+    assert definition.requires_auth is True
+
+    # A one-shot iterator is read once, for both.
+    once = server.register_tool(lambda: "y", name="once", scopes=iter(["z", "y"]))
+    assert once.declared_scopes == ("z", "y") and once.scopes == frozenset({"y", "z"})
+    plain = server.register_tool(lambda: "p", name="plain")
+    assert plain.declared_scopes == () and plain.scopes == frozenset()
