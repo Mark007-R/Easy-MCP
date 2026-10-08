@@ -50,7 +50,7 @@ from .security.auth import APIKeyAuth, ClientIdentity, current_identity
 from .security.oauth import Introspection, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
 from .server import PROTOCOL_VERSION, MCPServer
-from .store import MemoryStore, Store
+from .store import MemoryStore, RedisStore, Store
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -75,6 +75,7 @@ __all__ = [
     "PayloadTooLargeError",
     "ProtocolError",
     "RateLimitError",
+    "RedisStore",
     "RequestInfo",
     "RequestOutcome",
     "SSETransport",
