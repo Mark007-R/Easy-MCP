@@ -56,6 +56,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Rich schemas | A Pydantic model (optional) | The model's own schema and validation, for parameters and results |
 | Auth | `auth=APIKeyAuth({...})` | Constant-time key checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
+| Policy & telemetry | `@server.middleware`, `@server.tool_middleware` | Hooks around every request and tool call, after the built-in checks; refuse with an exception |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
 | Crashes | Nothing | One failing tool never takes down the server |
 | Launching | Nothing | `easy-mcp run my_tools:server` serves a module on any transport |
@@ -222,6 +223,8 @@ Clients that open with `initialize` get the handshake era instead:
 `MCP-Session-Id` header the client echoes on later requests identifies the
 session. `DELETE /mcp` ends a session, and sessions idle for an hour expire.
 The era is chosen per request, so old and new clients can share one server.
+Over stdio, and in the handshake era over HTTP, `notifications/cancelled`
+cancels any request still in flight except `initialize`.
 
 ```python
 from easy_mcp import StreamableHTTPTransport
@@ -385,6 +388,107 @@ too. It stops, mid-way, when the process exits, and the shutdown wait does
 not cover it. Work that must outlive its call needs `daemon=False`, or a
 `ThreadPoolExecutor`, which the interpreter waits for at exit.
 
+### Middleware: custom checks, tracing, metrics
+
+Two decorators run your own async code around the server's work.
+`@server.middleware` wraps every request; `@server.tool_middleware` wraps a
+tool's execution. Each receives what is being served and `call_next`, and
+returns what `call_next()` returned:
+
+```python
+import asyncio
+import time
+
+from easy_mcp import RequestInfo, RequestOutcome, ToolCall, ToolError, ToolOutcome
+from easy_mcp.middleware import RequestNext, ToolNext
+
+@server.middleware                       # around every request the server implements
+async def timing(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+    started = time.perf_counter()
+    try:
+        outcome = await call_next()
+    except asyncio.CancelledError:
+        record(request.method, "cancelled", time.perf_counter() - started)
+        raise                            # always re-raise a cancellation
+    record(request.method, outcome.error_type or "ok", time.perf_counter() - started)
+    return outcome                       # return exactly what call_next() returned
+
+@server.tool_middleware                  # around one tool's execution
+async def tenant_guard(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
+    tenant = call.arguments.get("tenant")
+    allowed = call.identity is not None and f"tenant:{tenant}" in call.identity.scopes
+    if tenant is not None and not allowed:
+        raise ToolError(f"This key cannot read tenant {tenant!r}.")  # the tool never runs
+    return await call_next()
+```
+
+Middleware runs after the built-in checks and cannot skip them: a request has
+already passed the `Origin` check, authentication and the rate limit, and a
+tool call has already passed visibility, scopes, `max_calls_per_session` and
+argument validation. So `call.arguments` are validated, and `call.tool` is a
+tool this caller may use. Requests for methods the server does not implement
+never reach middleware.
+
+To refuse, raise before `call_next()`. A `ProtocolError` such as
+`AuthenticationError` or `RateLimitError` becomes that JSON-RPC error. A
+`ToolError` becomes an `isError` result whose message the model can read (on
+methods other than `tools/call` there is no result to carry it, so it becomes
+`-32603` with your message). The tool does not run and the call does not
+count against `max_calls_per_session`. Raising after `call_next()` replaces
+the answer, but the tool has already run; the audit log records
+`tool_result_withheld`.
+
+Middleware observes; it does not rewrite. `params`, `meta` and `arguments` are
+read-only, and the outcome `call_next()` returns describes what the client
+will get (`outcome.error_type`, `outcome.status`, `outcome.message`) without
+letting you change it. Timeouts and a busy server arrive as outcomes too, so
+`call_next()` raises nothing but a cancellation. Return exactly that object. A
+middleware that returns anything else, or raises an unexpected exception,
+fails the request with `-32603` and an `error_id`; the tool does not run.
+`call_next()` may be called once.
+
+The first middleware registered is the outermost. Request middleware always
+encloses tool middleware. (Some web frameworks do the opposite and make the
+last one added the outermost.)
+
+A cancel reaches middleware as `CancelledError` wherever the call is. Re-raise
+it: a middleware that swallows one is overruled, and no response is sent. A
+tool's `timeout` covers the tool only, so bound your own awaits:
+`async with asyncio.timeout(2): ...`.
+
+Middleware runs on the event loop, never in a sync tool's thread, so it must
+not block: run blocking work with `await asyncio.to_thread(...)`. Context
+variables you set before `call_next()` are visible inside the tool, sync tools
+included. `current_tool_call()` gives a tool the caller's identity, the
+request's `meta` and the `state` dict middleware can fill:
+
+```python
+from easy_mcp import current_tool_call
+
+@server.tool
+def report(tenant: str) -> dict[str, int]:
+    call = current_tool_call()           # None when the function is called directly
+    owner = call.identity.fingerprint if call and call.identity else "anonymous"
+    ...
+```
+
+Notifications and `server/discover` pass through middleware for observation
+only: they cannot be refused, so a cancel always works and clients can always
+tell which protocol version the server speaks.
+
+`request.meta` carries the request's `_meta`, including the W3C Trace Context
+keys (`traceparent`, `tracestate`, `baggage`) clients use to link a call to
+their trace. `request.transport.headers` holds the HTTP request's headers
+without credentials (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+`Cookie`, `MCP-Session-Id`). A header is only as trustworthy as the proxy
+that sets it, and `clientInfo` is whatever the client says it is: never
+authorize on it. Arguments, `_meta` and results may hold personal data or
+secrets, so review what a middleware sends to logs or a tracing backend.
+
+With request middleware registered, a stateless `tools/list` is marked
+`cacheScope: "private"`, since your code may now answer it differently per
+caller.
+
 ### Error handling
 
 | Situation | What the client sees |
@@ -398,6 +502,9 @@ not cover it. Work that must outlive its call needs `daemon=False`, or a
 | Every sync-tool worker busy (`max_sync_workers`) | `-32008`; retry shortly |
 | Stateless request names a version the server does not speak | `-32022` with `supported` and `requested` |
 | HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
+| Middleware refuses with a `ProtocolError` | its code (e.g. `-32001`, `-32003`) |
+| Middleware raises `ToolError` | `isError: true` with your message verbatim (`-32603` with the message outside `tools/call`) |
+| Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The
 `error_id` in production responses matches the server-side log entry that
@@ -420,6 +527,13 @@ Cancellation leaves a trail as well: `tool_cancelled` when a client cancels,
 in the log under its `error_id`), and `tool_finished_after_cancel` when a sync
 tool finished after its call was cancelled or timed out. That last one is
 worth watching for tools that write.
+
+Middleware adds its own: `request_denied` and `tool_denied` (which names the
+`middleware` that refused) when a middleware refuses before the tool runs,
+`tool_result_withheld` when it replaces the answer of a tool that did run,
+`middleware_failed` (with its `error_id` and `stage`) when one fails or breaks
+its contract, and `request_cancelled` when a request other than `tools/call`
+is cancelled. None of them carries arguments, results, `_meta` or headers.
 
 ## Connecting a client
 
@@ -561,6 +675,7 @@ user with only the `read` role.
 easy_mcp/
 ├── server.py        MCPServer: registration, dispatch, execution, lifecycle
 ├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
+├── middleware.py    request and tool middleware, current_tool_call()
 ├── decorators.py    @tool machinery, ToolDefinition, thread-safe registry
 ├── schema.py        type hints → JSON Schema; docstring parsing; validation
 ├── security/
@@ -589,7 +704,9 @@ The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
 so Streamable HTTP, SSE, and stdio all get the same checks, and a future
-WebSocket transport cannot silently bypass one.
+WebSocket transport cannot silently bypass one. A custom transport should pass
+`transport=TransportInfo(name=..., headers=...)` to `dispatch`, so middleware
+knows how a message arrived.
 
 **Determinism:** tool listings are sorted, JSON output uses sorted keys, and
 identical inputs produce byte-identical responses — useful for reproducible

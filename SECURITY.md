@@ -45,6 +45,7 @@ Consequences:
 | Crash amplification | Exceptions in one tool call are contained; the server keeps serving |
 | Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
 | Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
+| Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`, tool not run) |
 
 ## Transport trust boundaries
 
@@ -60,6 +61,37 @@ Consequences:
   parent presents a valid key via `EASY_MCP_STDIO_API_KEY`. Anything the
   parent can pass as environment it can also read, so a stdio key is a
   scoping mechanism, not a secret from the host itself.
+
+## Middleware
+
+`@server.middleware` and `@server.tool_middleware` run your code around every
+request and tool call. The same trust model applies to them as to tools:
+
+- **Middleware is trusted code**, like tools. It runs in the server process,
+  on the event loop.
+- **What it sees:** validated tool arguments, the request's `_meta`, the
+  caller's key fingerprint and scopes, and the HTTP request's headers with
+  credentials removed (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
+  `Cookie`, `MCP-Session-Id`). Credentials are withheld so that a middleware
+  cannot forward them; the MCP authorization spec forbids passing a client's
+  token through to another service.
+- **What it cannot do:** skip or reorder a built-in check, grant access, change
+  the caller's identity or the arguments a tool receives, or rewrite a result.
+  It can only refuse. A middleware that fails or breaks its contract fails the
+  request closed with `-32603`, and the tool does not run.
+- **Treat headers, `_meta` and request ids as client-controlled.** Trust a
+  header only if your proxy strips and re-sets it. Never authorize on
+  `clientInfo`, which the client reports about itself.
+- **Arguments, `_meta` and tool results can contain personal data or
+  secrets.** Review what a middleware exports to logs or tracing backends.
+  The audit events middleware adds carry none of them.
+- **Session ids are capabilities for anonymous sessions.** Avoid exporting
+  `request.session_id` in plain form.
+- **Bound remote calls inside middleware with a timeout.** The tool timeout
+  does not cover middleware, and a middleware that waits forever holds its
+  request until the client cancels it or disconnects.
+- **Never block the event loop.** A blocking middleware stalls every client;
+  use `await asyncio.to_thread(...)` for blocking work.
 
 ## Ready-made connectors
 
@@ -148,6 +180,14 @@ the client is untrusted, the credential in the environment is trusted.
   process.
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
   values; OAuth2 support is on the roadmap.
+- **Middleware is not covered by tool timeouts.** A tool's `timeout` bounds the
+  tool function only; a middleware must bound its own awaits.
+- **Some messages never reach middleware.** Requests the transport rejects,
+  malformed messages and rate-limited messages are answered before any
+  middleware runs. They are in the audit log.
+- **A refusal after the tool ran cannot undo it.** A middleware that raises
+  after `call_next()` replaces the answer, but the tool's side effects stand;
+  this is audited as `tool_result_withheld`.
 
 ## Running untrusted or semi-trusted workloads
 
@@ -173,6 +213,7 @@ easy_mcp for sandboxing:
 - [ ] Audit logs (`easy_mcp.audit`) shipped to your log store and reviewed.
 - [ ] Scoped keys per client application; no shared "god" key.
 - [ ] Tools validate/sanitize their own argument *content* (paths, SQL, shell).
+- [ ] Middleware that calls other services bounds each call with a timeout and exports no arguments, results or credentials without review.
 
 ## Reporting a vulnerability
 
