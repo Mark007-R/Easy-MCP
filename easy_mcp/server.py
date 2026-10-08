@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import functools
 import json
 import logging
 import threading
@@ -19,7 +20,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,9 +42,29 @@ from .exceptions import (
     ValidationError,
 )
 from .logging import audit, configure_logging
+from .middleware import (
+    ObservePolicy,
+    RequestInfo,
+    RequestMiddleware,
+    RequestMiddlewareT,
+    RequestOutcome,
+    RequestPolicy,
+    ToolCall,
+    ToolMiddleware,
+    ToolMiddlewareT,
+    ToolOutcome,
+    ToolPolicy,
+    TransportInfo,
+    _tool_call_scope,
+    _type_name,
+    check_middleware,
+    describe,
+    run_chain,
+)
 from .protocol import (
     DISCOVER_METHOD,
     LATEST_PROTOCOL_VERSION,
+    META_PROTOCOL_VERSION,
     META_SERVER_INFO,
     SUPPORTED_PROTOCOL_VERSIONS,
     check_request_meta,
@@ -292,11 +313,16 @@ class MCPServer:
         self._sync_slots = (
             threading.BoundedSemaphore(max_sync_workers) if max_sync_workers is not None else None
         )
-        # Sync tool and cancel-callback threads still running, and the tool
-        # call tasks in flight (touched only on the event loop).
+        # Sync tool and cancel-callback threads still running, and the request
+        # tasks in flight (touched only on the event loop).
         self._threads: set[threading.Thread] = set()
         self._threads_lock = threading.Lock()
         self._calls: set[asyncio.Task[Any]] = set()
+        # Replaced, never mutated, under the lock: a request uses the tuples
+        # as they stood when it arrived.
+        self._request_middleware: tuple[RequestMiddleware, ...] = ()
+        self._tool_middleware: tuple[ToolMiddleware, ...] = ()
+        self._middleware_lock = threading.Lock()
         self.max_sessions = max_sessions
         self.allowed_origins = (
             normalize_origins(allowed_origins) if allowed_origins is not None else None
@@ -369,6 +395,75 @@ class MCPServer:
         self._logger.debug("unregistered tool %r", name)
         return removed
 
+    def middleware(self, fn: RequestMiddlewareT, /) -> RequestMiddlewareT:
+        """Register request middleware: your async code around every request.
+
+        Used as a bare decorator (``@server.middleware``) or called directly;
+        *fn* is returned unchanged.  It is called as
+        ``await fn(request, call_next)`` with a
+        :class:`~easy_mcp.RequestInfo`, and must return what
+        ``await call_next()`` returned (a :class:`~easy_mcp.RequestOutcome`)::
+
+            @server.middleware
+            async def via_gateway(request, call_next):
+                if request.transport.headers.get("x-verified-by") != "gateway":
+                    raise AuthenticationError("Requests must come through the gateway")
+                return await call_next()
+
+        It runs after the transport's checks, the rate limit and protocol
+        validation, which it cannot skip.  Raising a ``ProtocolError`` refuses
+        the request with that error; on ``tools/call`` a ``ToolError`` gives an
+        ``isError`` result.  Notifications and ``server/discover`` pass
+        through it but cannot be refused.  The first middleware registered is
+        the outermost, and request middleware encloses tool middleware.  See
+        :mod:`easy_mcp.middleware` for the whole contract.
+
+        Raises:
+            TypeError: *fn* is not async or cannot take ``(request, call_next)``.
+            ValueError: *fn* is registered already.
+        """
+        check_middleware(fn, "request middleware")
+        with self._middleware_lock:
+            if any(existing is fn for existing in self._request_middleware):
+                raise ValueError(f"request middleware {describe(fn)} is registered already")
+            self._request_middleware = (*self._request_middleware, fn)
+        self._logger.debug("registered request middleware %s", describe(fn))
+        return fn
+
+    def tool_middleware(self, fn: ToolMiddlewareT, /) -> ToolMiddlewareT:
+        """Register tool middleware: your async code around every tool's execution.
+
+        Used as a bare decorator (``@server.tool_middleware``) or called
+        directly; *fn* is returned unchanged.  It is called as
+        ``await fn(call, call_next)`` with a :class:`~easy_mcp.ToolCall`, and
+        must return what ``await call_next()`` returned (a
+        :class:`~easy_mcp.ToolOutcome`)::
+
+            @server.tool_middleware
+            async def quota(call, call_next):
+                if await over_budget(call.client_id):
+                    raise RateLimitError(retry_after_seconds=60)
+                return await call_next()
+
+        It runs after visibility, scopes, ``max_calls_per_session`` and
+        argument validation, so ``call.arguments`` are validated and
+        ``call.tool`` is a tool this caller may use.  Raising before
+        ``call_next()`` refuses the call: the tool does not run and the call
+        is not counted.  The tool's ``timeout`` covers the tool only, so
+        bound your own awaits.
+
+        Raises:
+            TypeError: *fn* is not async or cannot take ``(call, call_next)``.
+            ValueError: *fn* is registered already.
+        """
+        check_middleware(fn, "tool middleware")
+        with self._middleware_lock:
+            if any(existing is fn for existing in self._tool_middleware):
+                raise ValueError(f"tool middleware {describe(fn)} is registered already")
+            self._tool_middleware = (*self._tool_middleware, fn)
+        self._logger.debug("registered tool middleware %s", describe(fn))
+        return fn
+
     @property
     def tools(self) -> list[ToolDefinition]:
         """All registered tools, sorted by name."""
@@ -404,13 +499,27 @@ class MCPServer:
 
     # --------------------------------------------------------------- dispatch
 
-    async def dispatch(self, message: Any, context: ClientContext) -> dict[str, Any] | None:
+    async def dispatch(
+        self,
+        message: Any,
+        context: ClientContext,
+        *,
+        transport: TransportInfo | None = None,
+    ) -> dict[str, Any] | None:
         """Handle one JSON-RPC message; returns the response or ``None``.
 
         This is the single entry point every transport funnels through, and
         the place rate limiting and method routing are enforced.  It never
         raises: malformed input and internal failures both come back as
-        JSON-RPC error responses (sanitized outside debug mode).
+        JSON-RPC error responses (sanitized outside debug mode).  Only a
+        cancellation of the caller itself is re-raised.
+
+        Args:
+            message: One decoded JSON-RPC message.
+            context: The connection's or session's state.
+            transport: How the message arrived, for middleware.  A custom
+                transport should pass one; without it, middleware sees a
+                transport named ``"custom"``.
         """
         if not isinstance(message, dict):
             return _error_response(None, INVALID_REQUEST, "Invalid request: expected a JSON object")
@@ -461,18 +570,24 @@ class MCPServer:
                 # A notification has no id; a request naming one of these
                 # methods is asking for a method that does not exist.
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+            # Methods the server does not serve never reach middleware, so
+            # RequestInfo.method only ever holds one of the table's names.
             spec = self._method(method, modern=modern, notification=notification_method)
-            if notification_method:
-                # Unknown notifications are ignored, per JSON-RPC.
-                if spec is not None:
-                    self._handle_notification(method, params, context)
-                return None
             if spec is None:
+                if notification_method:
+                    return None  # unknown notifications are ignored, per JSON-RPC
                 return _error_response(msg_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+            request = self._request_info(
+                method, msg_id, is_notification, modern, params, context, transport
+            )
+            if spec.notification:
+                notify = functools.partial(self._handle_notification_outcome, request, context)
+                await self._observe(request, notify)
+                return None
             if spec.cancellable:
-                response = await self._serve_cancellable(method, params, context, msg_id, modern)
+                response = await self._serve_cancellable(request, context)
             else:
-                response = await self._serve(method, params, context, msg_id, modern)
+                response = await self._serve(request, context)
         except ProtocolError as exc:
             response = None if is_notification else _protocol_error_response(msg_id, exc)
         except Exception:
@@ -503,13 +618,46 @@ class MCPServer:
             return None
         return spec
 
-    async def _serve_cancellable(
+    def _request_info(
         self,
         method: str,
+        msg_id: Any,
+        is_notification: bool,
+        modern: bool,
         params: dict[str, Any],
         context: ClientContext,
-        msg_id: Any,
-        modern: bool,
+        transport: TransportInfo | None,
+    ) -> RequestInfo:
+        if modern:
+            # check_request_meta has made sure it is there.
+            version: str | None = params["_meta"][META_PROTOCOL_VERSION]
+        elif method == "initialize":
+            version = negotiate_protocol_version(params.get("protocolVersion"))
+        else:
+            version = context.protocol_version
+        tool: ToolDefinition | None = None
+        if method == "tools/call":
+            name = params.get("name")
+            if isinstance(name, str):
+                tool = self._registry.get(name)
+        return RequestInfo._create(
+            method=method,
+            request_id=msg_id,
+            is_notification=is_notification,
+            stateless=modern,
+            protocol_version=version,
+            client_id=context.client_id,
+            session_id=None if modern else context.session_id,
+            identity=context.identity,
+            transport=transport,
+            tool=tool,
+            params=params,
+            request_layers=self._request_middleware,
+            tool_layers=self._tool_middleware,
+        )
+
+    async def _serve_cancellable(
+        self, request: RequestInfo, context: ClientContext
     ) -> dict[str, Any] | None:
         """Serve a request as a task of its own, so notifications/cancelled can stop it.
 
@@ -518,15 +666,15 @@ class MCPServer:
         timeout around ``dispatch``, a closed stateless connection,
         shutdown), the cancellation is re-raised instead: the caller's
         cancel count tells the two apart, since asyncio cancels the task
-        we await in both cases.
+        we await in both cases.  Middleware runs inside the task, so a
+        cancel reaches it wherever the request is.
         """
         caller = asyncio.current_task()
         baseline = caller.cancelling() if caller is not None else 0
-        task: asyncio.Task[dict[str, Any] | None] = asyncio.create_task(
-            self._serve(method, params, context, msg_id, modern)
-        )
+        task: asyncio.Task[dict[str, Any]] = asyncio.create_task(self._serve(request, context))
         self._calls.add(task)
         task.add_done_callback(self._calls.discard)
+        msg_id = request.request_id
         registered = msg_id is not None and isinstance(msg_id, Hashable)
         if registered:
             context.in_flight[msg_id] = task
@@ -534,12 +682,12 @@ class MCPServer:
             return await task
         except asyncio.CancelledError:
             if not task.done() or task.cancelled():
-                if method == "tools/call":
+                if request.method == "tools/call":
                     audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
                 else:
                     audit(
                         "request_cancelled",
-                        method=method,
+                        method=request.method,
                         client_id=context.client_id,
                         request_id=msg_id,
                     )
@@ -557,21 +705,53 @@ class MCPServer:
             if registered and context.in_flight.get(msg_id) is task:
                 del context.in_flight[msg_id]
 
-    async def _serve(
-        self,
-        method: str,
-        params: dict[str, Any],
-        context: ClientContext,
-        msg_id: Any,
-        modern: bool,
-    ) -> dict[str, Any] | None:
+    async def _serve(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Run the request middleware around the request; returns the response."""
+        route = functools.partial(self._route, request, context)
+        layers = request._request_layers
+        if _METHODS[request.method].observe_only:
+            outcome = await self._observe(request, route)
+        elif layers:
+            policy = RequestPolicy(self._logger, self.debug)
+            outcome = await run_chain(layers, request, route, policy)
+        else:
+            outcome = await route()
+        if outcome.error_code is not None:
+            return _error_response(
+                request.request_id, outcome.error_code, outcome.message or "", outcome._data
+            )
+        result = outcome._result
+        if request.stateless:
+            result = self._modern_result(result)
+        return _result_response(request.request_id, result)
+
+    async def _observe(
+        self, request: RequestInfo, handle: Callable[[], Awaitable[RequestOutcome]]
+    ) -> RequestOutcome:
+        """Run the request middleware around a message it may watch but not refuse.
+
+        Whatever a middleware raises or returns, *handle* runs (once), and
+        its outcome is what the client gets: a ``notifications/cancelled``
+        always cancels, and ``server/discover`` always answers.
+        """
+        layers = request._request_layers
+        if not layers:
+            return await handle()
+        return await run_chain(layers, request, handle, ObservePolicy(self._logger, self.debug))
+
+    async def _route(self, request: RequestInfo, context: ClientContext) -> RequestOutcome:
+        """Serve the request itself, inside the request middleware.
+
+        Never raises but ``CancelledError``: errors become outcomes.
+        """
+        method = request.method
         try:
             if method == "tools/call":
-                result: Any = await self._execute_tool(params, context)
-            elif modern:
-                result = self._dispatch_modern(method, context)
+                return RequestOutcome._of_tool(await self._execute_tool(request, context))
+            if request.stateless:
+                result: Any = self._dispatch_modern(method, context)
             elif method == "initialize":
-                result = self._handle_initialize(params, context)
+                result = self._handle_initialize(request._params, context)
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -579,10 +759,15 @@ class MCPServer:
             else:  # the method table and this routing disagree
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
         except ProtocolError as exc:
-            return _protocol_error_response(msg_id, exc)
-        if modern:
-            result = self._modern_result(result)
-        return _result_response(msg_id, result)
+            return RequestOutcome._create(error_code=exc.code, message=str(exc), data=exc.data)
+        except Exception:
+            # Sanitize: clients get an opaque error_id; the log gets the trace.
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            return RequestOutcome._create(
+                error_code=INTERNAL_ERROR, message=f"Internal server error (error_id={error_id})"
+            )
+        return RequestOutcome._create(result=result)
 
     def _finalize_error(self, response: dict[str, Any], modern: bool) -> dict[str, Any]:
         """The last check on every error response ``dispatch`` returns.
@@ -644,7 +829,7 @@ class MCPServer:
                 "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
                 "capabilities": self._capabilities(),
                 "ttlMs": DISCOVER_TTL_MS,
-                "cacheScope": "public",
+                "cacheScope": self._cache_scope(method),
             }
             if self.instructions:
                 result["instructions"] = self.instructions
@@ -652,12 +837,25 @@ class MCPServer:
         if method == "tools/list":
             result = self._handle_tools_list(context)
             result["ttlMs"] = TOOLS_LIST_TTL_MS
-            # With auth configured the list depends on who asks (protected
-            # tools are hidden from callers who cannot use them), so a shared
-            # cache must not hand one caller's list to another.
-            result["cacheScope"] = "private" if self.auth is not None else "public"
+            result["cacheScope"] = self._cache_scope(method)
             return result
         raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
+
+    def _cache_scope(self, method: str) -> str:
+        """The ``cacheScope`` of a stateless result.
+
+        ``"public"`` only when an anonymous request would get the same bytes.
+        ``server/discover`` is the same for everyone.  A list is not once auth
+        is configured (protected tools are hidden from callers who cannot use
+        them) or request middleware is registered (it may answer each caller
+        differently), and a shared cache must not hand one caller's list to
+        another.
+        """
+        if method == DISCOVER_METHOD:
+            return "public"
+        if self.auth is not None or self._request_middleware:
+            return "private"
+        return "public"
 
     def _modern_result(self, result: dict[str, Any]) -> dict[str, Any]:
         """Stamp a stateless result with its ``resultType`` and our identity."""
@@ -687,13 +885,27 @@ class MCPServer:
             if task is not None:
                 task.cancel()
 
-    async def _execute_tool(
-        self, params: dict[str, Any], context: ClientContext
-    ) -> dict[str, Any]:
+    async def _handle_notification_outcome(
+        self, request: RequestInfo, context: ClientContext
+    ) -> RequestOutcome:
+        self._handle_notification(request.method, request._params, context)
+        return RequestOutcome._create()
+
+    async def _execute_tool(self, request: RequestInfo, context: ClientContext) -> ToolOutcome:
+        """Check a tools/call, then run the tool middleware chain around the tool.
+
+        Raises:
+            ProtocolError: The call is refused before any middleware sees it:
+                an unknown or hidden tool, a missing scope, the session cap,
+                invalid arguments.
+        """
+        params = request._params
         name = params.get("name")
         if not isinstance(name, str):
             raise ProtocolError("tools/call requires a string 'name'", code=INVALID_PARAMS)
-        definition = self._registry.get(name)
+        # The definition the request named when it arrived is the one that
+        # runs, whatever the registry holds by now.
+        definition = request.tool
         # Report protected tools as unknown to unauthorized callers, so their
         # existence is not enumerable.
         if definition is None or not visible(context.identity, definition):
@@ -715,8 +927,10 @@ class MCPServer:
                 arguments = {}
             if not isinstance(arguments, dict):
                 raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
-            arguments = validate_arguments(arguments, definition.arguments_schema)
-            arguments = build_param_models(definition.param_models, arguments)
+            # Middleware reads the plain JSON form; the tool gets its own
+            # models, built from it.
+            plain = validate_arguments(arguments, definition.arguments_schema)
+            built = build_param_models(definition.param_models, plain)
         except ProtocolError as exc:
             audit(
                 "tool_denied",
@@ -726,38 +940,76 @@ class MCPServer:
             )
             raise
 
+        # No await since the cap check, so concurrent calls cannot overshoot
+        # it while a middleware awaits; the finally below refunds a call
+        # whose tool never started.
         context.tool_calls[name] = call_count + 1
+        # The tool (and, for a sync tool, its thread) finds this through
+        # current_cancel_token(); a cancel or timeout triggers it.
+        token = CancelToken()
+        token._on_error = self._callback_failed(name, context)
         timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        call = ToolCall._create(request, definition, plain, token, timeout)
+        try:
+            # Set here rather than around the tool alone, so tool middleware
+            # sees the token and the call too, and context variables it sets
+            # reach the tool (a sync tool's thread gets a copy of this context).
+            with cancel_scope(token), _tool_call_scope(call):
+                run = functools.partial(self._run_tool, call, built, context)
+                layers = request._tool_layers
+                if not layers:
+                    return await run()
+                return await run_chain(layers, call, run, ToolPolicy(self._logger, self.debug))
+        except asyncio.CancelledError:
+            # Wherever the call was, in a middleware or in the tool.  Only the
+            # first trigger counts, so a tool stopped already keeps its reason.
+            self._stop_tool(token, CANCELLED, name, context)
+            raise
+        finally:
+            if not call._started:
+                # Refused, busy, a middleware failure or an early cancel: it
+                # never ran, so it does not count against the session cap.
+                context.tool_calls[name] -= 1
+
+    async def _run_tool(
+        self, call: ToolCall, arguments: dict[str, Any], context: ClientContext
+    ) -> ToolOutcome:
+        """Run the tool itself: the innermost step of the tool middleware chain.
+
+        Every answer is an outcome, timeouts and a busy server included; only
+        a cancellation is raised.
+        """
+        definition = call.tool
+        name = definition.name
+        token = call.cancel_token
+        timeout = call.timeout
         started = time.perf_counter()
 
         def _duration_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
 
-        # The tool (and, for a sync tool, its thread) finds this through
-        # current_cancel_token(); a cancel or timeout below triggers it.
-        token = CancelToken()
-        token._on_error = self._callback_failed(name, context)
         deadline: asyncio.Timeout | None = None
         awaitable: Any = None
         try:
-            with cancel_scope(token):
-                if definition.is_async:
-                    # A task of its own, as asyncio.wait_for gave it on 3.11:
-                    # a cancel request the tool leaves on its task (an old
-                    # async-timeout, say) must not turn this call's timeout
-                    # into a cancellation that answers nobody.
-                    awaitable = asyncio.ensure_future(definition.fn(**arguments))
-                else:
-                    # Sync tools run in a worker thread so they cannot block
-                    # the event loop.  Python cannot kill that thread, so a
-                    # cancel or timeout reaches the tool through the token.
-                    awaitable = self._start_sync_tool(definition, arguments, token, context)
-                async with asyncio.timeout(timeout) as deadline:
-                    result = await awaitable
-        except ServerBusyError:
-            context.tool_calls[name] -= 1  # it never ran
+            if definition.is_async:
+                # A task of its own, as asyncio.wait_for gave it on 3.11:
+                # a cancel request the tool leaves on its task (an old
+                # async-timeout, say) must not turn this call's timeout
+                # into a cancellation that answers nobody.
+                awaitable = asyncio.ensure_future(definition.fn(**arguments))
+            else:
+                # Sync tools run in a worker thread so they cannot block
+                # the event loop.  Python cannot kill that thread, so a
+                # cancel or timeout reaches the tool through the token.
+                awaitable = self._start_sync_tool(definition, arguments, token, context)
+            call._started = True
+            async with asyncio.timeout(timeout) as deadline:
+                result = await awaitable
+        except ServerBusyError as exc:
             audit("tool_call", tool=name, client_id=context.client_id, status="busy")
-            raise
+            return ToolOutcome._create(
+                "busy", message=str(exc), started=call._started, error_code=exc.code
+            )
         except TimeoutError as exc:
             if deadline is None or not deadline.expired():
                 # The tool raised it (a socket read timing out, say): a tool
@@ -765,16 +1017,21 @@ class MCPServer:
                 return self._tool_failed(name, context, exc, _duration_ms())
             _drop_unreported_error(awaitable)
             self._stop_tool(token, TIMEOUT, name, context)
+            duration_ms = _duration_ms()
             audit(
                 "tool_call",
                 tool=name,
                 client_id=context.client_id,
-                duration_ms=_duration_ms(),
+                duration_ms=duration_ms,
                 status="timeout",
             )
-            raise ProtocolError(
-                f"Tool '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
-            ) from None
+            return ToolOutcome._create(
+                "timeout",
+                message=f"Tool '{name}' timed out after {timeout:g}s",
+                started=True,
+                error_code=TOOL_TIMEOUT,
+                duration_ms=duration_ms,
+            )
         except asyncio.CancelledError:
             _drop_unreported_error(awaitable)
             self._stop_tool(token, CANCELLED, name, context)
@@ -782,14 +1039,22 @@ class MCPServer:
         except ToolError as exc:
             # Intentional, safe-to-show tool error raised by the tool author.
             try:
+                duration_ms = _duration_ms()
                 audit(
                     "tool_call",
                     tool=name,
                     client_id=context.client_id,
-                    duration_ms=_duration_ms(),
+                    duration_ms=duration_ms,
                     status="tool_error",
                 )
-                return _tool_failure(str(exc))
+                return ToolOutcome._create(
+                    "tool_error",
+                    message=str(exc),
+                    started=True,
+                    is_error=True,
+                    exception_type=_type_name(exc),
+                    duration_ms=duration_ms,
+                )
             finally:
                 exc.__traceback__ = None  # see _tool_failed
         except Exception as exc:
@@ -805,19 +1070,26 @@ class MCPServer:
                 error_id,
                 "; ".join(exc.errors),
             )
+            duration_ms = _duration_ms()
             audit(
                 "tool_call",
                 tool=name,
                 client_id=context.client_id,
-                duration_ms=_duration_ms(),
+                duration_ms=duration_ms,
                 status="output_schema_error",
                 error_id=error_id,
             )
             # The mismatch describes the server's own data, so it stays in the
             # log unless the operator asked for detail.
             detail = f": {'; '.join(exc.errors)}" if self.debug else ""
-            return _tool_failure(
-                f"Tool result did not match its output schema (error_id={error_id}){detail}"
+            message = f"Tool result did not match its output schema (error_id={error_id}){detail}"
+            return ToolOutcome._create(
+                "output_schema_error",
+                message=message,
+                started=True,
+                is_error=True,
+                error_id=error_id,
+                duration_ms=duration_ms,
             )
 
         payload: dict[str, Any] = {
@@ -827,19 +1099,22 @@ class MCPServer:
         if structured is not None:
             payload["structuredContent"] = structured
 
+        duration_ms = _duration_ms()
         audit(
             "tool_call",
             tool=name,
             client_id=context.client_id,
-            duration_ms=_duration_ms(),
+            duration_ms=duration_ms,
             status="ok",
         )
-        return payload
+        return ToolOutcome._create(
+            "ok", message=text, started=True, payload=payload, duration_ms=duration_ms
+        )
 
     def _tool_failed(
         self, name: str, context: ClientContext, exc: BaseException, duration_ms: float
-    ) -> dict[str, Any]:
-        """The CallToolResult for a tool that raised; logs and audits it."""
+    ) -> ToolOutcome:
+        """The outcome for a tool that raised; logs and audits it."""
         error_id = uuid.uuid4().hex[:12]
         try:
             self._logger.error("tool %r failed error_id=%s", name, error_id, exc_info=exc)
@@ -854,9 +1129,19 @@ class MCPServer:
             if self.debug:
                 trace = "".join(traceback.format_exception(exc))
                 detail = f"{type(exc).__name__}: {exc}\n{trace}"
-                return _tool_failure(f"Tool execution failed (error_id={error_id}): {detail}")
-            # Production: opaque message only — no exception text, no trace.
-            return _tool_failure(f"Tool execution failed (error_id={error_id})")
+                message = f"Tool execution failed (error_id={error_id}): {detail}"
+            else:
+                # Production: opaque message only — no exception text, no trace.
+                message = f"Tool execution failed (error_id={error_id})"
+            return ToolOutcome._create(
+                "error",
+                message=message,
+                started=True,
+                is_error=True,
+                error_id=error_id,
+                exception_type=_type_name(exc),
+                duration_ms=duration_ms,
+            )
         finally:
             # The traceback holds this call's frames, which hold the future
             # that holds the exception: without this, every frame of the
@@ -1084,6 +1369,8 @@ class MCPServer:
                     "type": "startup",
                     "transport": self._transport.describe(),
                     "tools": [definition.name for definition in self.tools],
+                    "middleware": [describe(fn) for fn in self._request_middleware],
+                    "tool_middleware": [describe(fn) for fn in self._tool_middleware],
                     "auth": self.auth is not None,
                     "rate_limit": self._limiter is not None,
                     "debug": self.debug,
