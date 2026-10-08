@@ -4,6 +4,136 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- Middleware. `@server.middleware` wraps every request the server implements
+  and `@server.tool_middleware` wraps a tool's execution, each as an async
+  function taking what is being served and `call_next`. Middleware runs after
+  the built-in checks, which it cannot skip: the transport's checks, the rate
+  limit and protocol validation, and for tool middleware also visibility,
+  scopes, `max_calls_per_session` and argument validation. The first
+  middleware registered is the outermost, and request middleware encloses tool
+  middleware.
+
+  Middleware refuses by raising before `call_next()`: a `ProtocolError`
+  becomes that JSON-RPC error, and a `ToolError` an `isError` result on
+  `tools/call` (on other methods, `-32603` with its message). A refused call
+  does not run and does not count against `max_calls_per_session`. Raising
+  after `call_next()` replaces the answer; the tool has already run, and the
+  audit log records `tool_result_withheld`.
+
+  Middleware observes and does not rewrite. `RequestInfo.params`, `.meta` and
+  `ToolCall.arguments` are read-only, and `call_next()` returns a
+  `RequestOutcome` or `ToolOutcome` describing what the client will get,
+  timeouts and busy answers included. A middleware must return that object.
+  One that returns anything else, or raises an unexpected exception, fails the
+  request with `-32603` and an `error_id`. If it failed before `call_next()`,
+  the tool does not run; if after, the tool has run and the audit log records
+  `tool_result_withheld`. An error code from the range MCP reserves without
+  defining (`-32023` to `-32099`) is treated the same way. `call_next()` may be
+  awaited in a task of the middleware's own, but that work does not outlive
+  the middleware: whatever is left of it when the middleware returns or
+  raises is cancelled, and `call_next()` raises `RuntimeError` once the
+  middleware has returned.
+
+  A cancel (`notifications/cancelled`, a closed stateless connection, a
+  deleted session, a closed SSE stream, shutdown) reaches middleware as
+  `CancelledError`. A middleware that swallows it is overruled and no response
+  is sent. A `CancelledError` a middleware raises when nothing cancelled the
+  request is a failure like any other, and so is one the tool raises (see
+  Fixed). Notifications and `server/discover` pass through middleware but
+  cannot be refused.
+
+  Middleware runs on the event loop. Context variables it sets before
+  `call_next()` reach the tool, sync tools included. A tool's `timeout` still
+  covers the tool only.
+
+- `current_tool_call()` returns the running `ToolCall` inside tools and tool
+  middleware: the caller's identity, the request's `_meta`, and a `state` dict
+  middleware can fill.
+- `TransportInfo`: how a message arrived (transport name, client address and
+  port, HTTP version, and headers without `Authorization`,
+  `Proxy-Authorization`, `X-API-Key`, `Cookie` or `MCP-Session-Id`).
+  `MCPServer.dispatch()` takes it as the optional keyword `transport=`, and
+  every built-in transport passes one. Custom transports should too; without
+  it, middleware sees the name `"custom"`.
+- `ClientContext.protocol_version` holds the version negotiated by
+  `initialize`.
+- Audit events `request_denied`, `tool_result_withheld`, `middleware_failed`
+  and `request_cancelled`. `tool_denied` names the middleware that refused,
+  when one did.
+
+### Changed
+
+- Every request except `initialize` runs as its own task and can be cancelled
+  with `notifications/cancelled`; before, only `tools/call` could. A cancelled
+  request gets no response, as before for `tools/call`, and one other than
+  `tools/call` is audited as `request_cancelled`.
+- With request middleware registered, a stateless `tools/list` carries
+  `cacheScope: "private"`, because its answer may now depend on the caller.
+  `server/discover` stays `public`.
+- A `tools/call` holds one unit of `max_calls_per_session` from the moment it
+  passes the built-in checks. The unit is returned if the tool never starts:
+  a middleware refusal or failure, a busy answer, or a cancel before the tool
+  starts. So a refused call does not count, but while a call waits in tool
+  middleware, concurrent calls beyond the cap get `-32006`. Before, only a
+  call refused as busy was refunded.
+- The `403` that refuses a browser `Origin` carries `-32600` when the
+  request's `MCP-Protocol-Version` header names the stateless revision, which
+  forbids `-32002` in any response. Older clients still get `-32002`.
+- No error response carries `-32002` on a stateless request (it becomes
+  `-32001`), or a code from `-32023` to `-32099`, which MCP reserves without
+  defining (it becomes `-32603` with an `error_id`, and the original is
+  logged).
+- A stateless Streamable HTTP error carrying `-32020`, `-32021` or `-32022`,
+  which middleware may raise, is answered with HTTP `400`, as the stateless
+  revision requires for these codes. Before, only the transport's own checks
+  answered them with `400`; any other source got `200`.
+- A request (a message with an `id`) that names a `notifications/*` method is
+  answered `-32601`, as an unknown method. Before, it was treated as that
+  notification and got no response at all: over HTTP a bare `202`, on stdio
+  nothing, so the client waited forever.
+- Shutting down the Streamable HTTP transport with `server.run()` (Ctrl-C,
+  `server.stop()`) gives the requests still running 5 s to finish, as stdio
+  does, then cancels them and ends the sessions, before uvicorn waits for
+  connections to close. A second Ctrl-C (uvicorn's forced quit) ends that wait
+  at once. A request cancelled this way, or sent once shutdown has begun, is
+  answered `503` with `-32008` (`data.reason: "shutdown"`) and
+  `Retry-After: 1`, and a handshake cut short opens no session. A
+  `notifications/cancelled` sent meanwhile still cancels the call it names,
+  which then gets no answer. The legacy SSE endpoints close their streams as
+  shutdown begins, cancelling the requests they carry (which get no answer,
+  as before), and answer new streams and messages `503`. Before, shutdown
+  waited for every running request to finish, without a bound for a tool with
+  no timeout.
+
+### Fixed
+
+- `dispatch` no longer swallows a cancellation of its own caller during a
+  `tools/call`. Telling a client's cancel from the caller's by the state of
+  the call's task failed, because asyncio cancels the awaited task in both
+  cases: an `asyncio.timeout()` around `dispatch` never raised `TimeoutError`,
+  and a transport that cancelled a dispatch saw it return normally. The
+  caller's cancellation is now re-raised; a client's cancel still drops the
+  response.
+- A `tools/call` whose id was a JSON array or object answered `-32603` while
+  its tool ran on in the background. Such an id is now served normally; it
+  just cannot be cancelled.
+- A tool that raises `CancelledError` when nothing cancelled the call
+  (awaiting a shared future another waiter cancelled, say) has failed: the
+  client gets an `isError` result with an `error_id`, and the audit log a
+  `tool_call` with `status: "error"`. Before, the request got no response at
+  all (over HTTP a bare `202`, on stdio nothing, so the client waited
+  forever), was audited as `tool_cancelled`, and ran the tool's cancel
+  callbacks. Any other request that raises `CancelledError` on its own is
+  answered `-32603` with an `error_id`.
+- A legacy SSE message whose stream closed while its body was being read is
+  answered `404`, as a message for a closed session is. Before, it was
+  served with no stream to answer on and nothing to cancel it; only the tool
+  timeout ended it.
+
 ## [0.3.1] - 2026-09-30
 
 ### Added

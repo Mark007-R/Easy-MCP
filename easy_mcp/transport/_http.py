@@ -22,8 +22,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from ..exceptions import FORBIDDEN
+from ..exceptions import FORBIDDEN, INVALID_REQUEST
 from ..logging import audit
+from ..middleware import TransportInfo
+from ..protocol import MODERN_PROTOCOL_VERSIONS
 from ..security.auth import ClientIdentity
 from .base import Transport
 
@@ -103,7 +105,12 @@ class OriginGuard:
             origin = _header(scope, b"origin")
             if origin is not None and not origin_allowed(origin, self.allowed_origins):
                 audit("origin_rejected", origin=origin[:200], path=scope.get("path", ""))
-                response = rpc_error(403, FORBIDDEN, "Forbidden: origin not allowed")
+                # The stateless revision forbids -32002 in any response, so a
+                # request that names it gets the generic -32600; older clients
+                # keep the code they have always seen.
+                version = _header(scope, b"mcp-protocol-version")
+                code = INVALID_REQUEST if version in MODERN_PROTOCOL_VERSIONS else FORBIDDEN
+                response = rpc_error(403, code, "Forbidden: origin not allowed")
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
@@ -152,6 +159,10 @@ class BaseHTTPTransport(Transport):
     async def close_streams(self) -> None:
         """End the long-lived streams that would hold up a graceful shutdown."""
 
+    def _forced_exit(self) -> bool:
+        """Whether uvicorn was told to quit without waiting (a second Ctrl-C)."""
+        return self._uvicorn is not None and bool(self._uvicorn.force_exit)
+
     def stop(self) -> None:
         """Ask the running uvicorn server to exit gracefully."""
         if self._uvicorn is not None:
@@ -174,6 +185,21 @@ class BaseHTTPTransport(Transport):
             key = request.headers.get("x-api-key")
         identity: ClientIdentity | None = self._server.authenticate_key(key)
         return identity
+
+    @staticmethod
+    def _transport_info(request: Request, name: str) -> TransportInfo:
+        """How *request* arrived, for middleware; credential headers are left out."""
+        client = request.client
+        return TransportInfo(
+            name,
+            client_address=client.host if client else None,
+            client_port=client.port if client else None,
+            http_version=request.scope.get("http_version"),
+            headers=[
+                (key.decode("latin-1"), value.decode("latin-1"))
+                for key, value in request.headers.raw
+            ],
+        )
 
     async def _handle_health(self, request: Request) -> Response:
         return JSONResponse(

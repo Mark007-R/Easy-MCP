@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
 from ..logging import audit
+from ..middleware import TransportInfo
 from .base import ClientContext, Transport
 
 if TYPE_CHECKING:
@@ -87,6 +88,8 @@ class StdioTransport(Transport):
         self._queue: asyncio.Queue[Any] | None = None
         self._stdout: BinaryIO | None = None
         self._write_lock = threading.Lock()
+        # What middleware sees as the transport: no address, no headers.
+        self._info = TransportInfo("stdio")
 
     def describe(self) -> str:
         return "stdio"
@@ -231,7 +234,7 @@ class StdioTransport(Transport):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._write(_error_response(None, PARSE_ERROR, "Parse error: invalid JSON"))
             return
-        response = await self._server.dispatch(message, context)
+        response = await self._server.dispatch(message, context, transport=self._info)
         if response is not None:
             self._write(response)
 

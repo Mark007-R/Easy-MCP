@@ -43,6 +43,7 @@ from starlette.routing import Route
 
 from ..exceptions import PARSE_ERROR, AuthenticationError, RateLimitError
 from ..logging import audit
+from ..middleware import TransportInfo
 from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport
 from .base import ClientContext
 
@@ -52,6 +53,15 @@ if TYPE_CHECKING:
 KEEPALIVE_SECONDS = 15.0
 
 _CLOSE = object()  # sentinel pushed into session queues on shutdown
+
+
+def _shutting_down() -> Response:
+    """The answer to a stream or message arriving once shutdown has begun."""
+    return JSONResponse(
+        {"error": "server is shutting down; retry shortly"},
+        status_code=503,
+        headers={"Retry-After": "1"},
+    )
 
 
 @dataclass(slots=True)
@@ -79,6 +89,8 @@ class SSETransport(BaseHTTPTransport):
         self._sse_path = sse_path
         self._messages_path = messages_path
         self._sessions: dict[str, _Session] = {}
+        # Set once shutdown closes the streams: nothing new is served after.
+        self._closing = False
 
     def describe(self) -> str:
         return f"sse on {self._server.host}:{self._server.port}"
@@ -97,6 +109,7 @@ class SSETransport(BaseHTTPTransport):
 
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
+            self._closing = False  # an app built again from this transport serves anew
             try:
                 yield
             finally:
@@ -118,8 +131,12 @@ class SSETransport(BaseHTTPTransport):
 
         Calls still running have nobody left to answer; they are cancelled
         now rather than when each stream winds down, so shutdown can wait
-        for their cancel callbacks.
+        for their cancel callbacks.  From now on new streams and messages
+        are refused (``503``): uvicorn may still be accepting connections,
+        and a stream opened now would never be closed, so shutdown would
+        wait for it forever.
         """
+        self._closing = True
         for session in list(self._sessions.values()):
             for task in list(session.tasks):
                 task.cancel()
@@ -128,6 +145,8 @@ class SSETransport(BaseHTTPTransport):
     # ------------------------------------------------------------- endpoints
 
     async def _handle_sse(self, request: Request) -> Response:
+        if self._closing:
+            return _shutting_down()
         try:
             identity = self._resolve_identity(request)
         except AuthenticationError:
@@ -240,16 +259,28 @@ class SSETransport(BaseHTTPTransport):
                 status_code=400,
             )
 
+        if self._closing:
+            # Checked after the last await: its stream may have closed
+            # already, and nothing would cancel the call.
+            return _shutting_down()
+        if self._sessions.get(session_id) is not session:
+            # Its stream closed while the body was read: nothing would
+            # cancel the call (nor could a notifications/cancelled reach it).
+            return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
+
         # Dispatch in the background and answer 202 now: the JSON-RPC response
         # travels over the SSE stream, and holding this POST open would stall
         # clients that send one message at a time (a notifications/cancelled
         # could never overtake the slow call it targets).
-        task = asyncio.create_task(self._deliver(session, message))
+        info = self._transport_info(request, "sse")
+        task = asyncio.create_task(self._deliver(session, message, info))
         session.tasks.add(task)
         task.add_done_callback(session.tasks.discard)
         return Response(status_code=202)
 
-    async def _deliver(self, session: _Session, message: Any) -> None:
-        response = await self._server.dispatch(message, session.context)
+    async def _deliver(
+        self, session: _Session, message: Any, info: TransportInfo | None = None
+    ) -> None:
+        response = await self._server.dispatch(message, session.context, transport=info)
         if response is not None:
             await session.queue.put(response)

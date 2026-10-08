@@ -32,6 +32,14 @@ from .exceptions import (
     ToolRegistrationError,
     ValidationError,
 )
+from .middleware import (
+    RequestInfo,
+    RequestOutcome,
+    ToolCall,
+    ToolOutcome,
+    TransportInfo,
+    current_tool_call,
+)
 from .protocol import SUPPORTED_PROTOCOL_VERSIONS
 from .security.auth import APIKeyAuth, ClientIdentity
 from .security.ratelimit import SlidingWindowRateLimiter
@@ -54,6 +62,8 @@ __all__ = [
     "PayloadTooLargeError",
     "ProtocolError",
     "RateLimitError",
+    "RequestInfo",
+    "RequestOutcome",
     "SSETransport",
     "SUPPORTED_PROTOCOL_VERSIONS",
     "SchemaError",
@@ -65,9 +75,13 @@ __all__ = [
     "ToolDefinition",
     "ToolError",
     "ToolRegistrationError",
+    "ToolCall",
+    "ToolOutcome",
     "Transport",
+    "TransportInfo",
     "ValidationError",
     "__version__",
     "cancel_scope",
     "current_cancel_token",
+    "current_tool_call",
 ]
