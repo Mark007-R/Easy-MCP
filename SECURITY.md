@@ -32,7 +32,7 @@ Consequences:
 | Credential stuffing / key probing | Constant-time comparison of SHA-256 digests over the full key set (`hmac.compare_digest`); timing reveals neither partial matches nor key length |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
-| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE), on whichever worker receives it, must present the same credential the session was opened with (403 otherwise), and its scopes come from that credential, never from stored session state; with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal, comparing its issuer, subject and client in full; the principal's fingerprint (the rate-limit and call-count key) is 128 bits, so no client can grind a client id that shares another's |
+| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP GET/POST/DELETE), on whichever worker receives it, must present the same credential the session was opened with (403 otherwise), and its scopes come from that credential, never from stored session state; with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal, comparing its issuer, subject and client in full; the principal's fingerprint (the rate-limit and call-count key) is 128 bits, so no client can grind a client id that shares another's |
 | Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
 | JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
 | Token passthrough | Tools and middleware never receive the token (`Authorization` is withheld from middleware); `current_identity()` exposes only verified fields; the GitHub connector uses its own credential |
@@ -40,13 +40,13 @@ Consequences:
 | Refresh tokens, ID tokens and bound tokens used as access tokens | Introspected `token_type` must be an access token; `typ` other than `at+jwt`/`JWT` refused; `aud` must be this server; tokens with `cnf` (DPoP, mTLS) refused |
 | Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch however slowly the answer arrives |
 | Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
-| Header/body disagreement (stateless HTTP) | A proxy may route or rate-limit on the mirrored `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers while the server executes the body, so the server rejects any request whose headers are missing, repeated or disagree with its body (`400`, `-32020`); Base64-encoded names are decoded before comparing. A message without an `id` never runs a method (no header checks apply to it), and the client notifications this revision leaves undefined over HTTP, `notifications/cancelled` included, are ignored, so one caller cannot cancel another's call |
+| Header/body disagreement (stateless HTTP) | A proxy may route or rate-limit on the mirrored `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers while the server executes the body, so the server rejects any request whose headers are missing, repeated or disagree with its body (`400`, `-32020`); Base64-encoded names are decoded before comparing. A message without an `id` never runs a method (no header checks apply to it), and the client notifications this revision leaves undefined over HTTP, `notifications/cancelled` included, are ignored, so one caller cannot cancel another's call; a `subscriptions/listen` stream ends only when its own connection closes |
 | DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
 | Request flooding | Per-client sliding-window rate limiting on every method, including discovery and opening an SSE session; idle clients are dropped from the limiter so its memory stays bounded; concurrent session cap (`max_sessions`) |
 | Session exhaustion (Streamable HTTP) | Sessions idle past `session_idle_timeout` (default 1 h) expire; `max_sessions` caps the server's live sessions (503 beyond it), those of every endpoint serving it together and, with a shared store, of every worker; `DELETE` ends a session early and cancels its running calls, on every worker |
-| Shared-store disclosure | A shared store holds no API keys, tokens or session ids: sessions are filed under SHA-256 digests of their ids, and call counts and rate limits under digests of client ids. Each session record keeps its client id in clear (a key fingerprint, a token principal's fingerprint, or `ip:<address>` for an anonymous client), the credential's fingerprint and a digest of a token's principal; reading it yields nothing that opens a session |
+| Shared-store disclosure | A shared store holds no API keys, tokens or session ids: sessions are filed under SHA-256 digests of their ids, and call counts and rate limits under digests of client ids. Each session record keeps its client id in clear (a key fingerprint, a token principal's fingerprint, or `ip:<address>` for an anonymous client), the credential's fingerprint, a digest of a token's principal and 128-bit digests of the tool list its client was last told about; reading it yields nothing that opens a session |
 | Cross-worker message injection | Cancels, session ends and relayed legacy SSE answers between workers are authenticated with a key derived from the session id, which the store never sees, checked against the session's credential fingerprint, and dropped when more than 60 s old; failures are audited as `bus_message_rejected`. Only integer or short string request ids are relayed, and relayed answers are capped at 4 MiB |
 | Limits bypassed during a store outage | When the shared store cannot be reached, requests that depend on it (sessions, rate limits, `max_calls_per_session`) are refused (`-32008` with `data.reason = "store_unavailable"`, HTTP 503) rather than served without their limits; there is no fail-open setting, and `/healthz` answers 503 so a load balancer can drain the worker. A request fails closed the same way when Redis answers but refuses a write it needs (Redis full, read-only, failing to persist); `/healthz`, which checks only that Redis answers, stays 200 then |
 | Resource exhaustion via slow tools | Per-tool and server-default timeouts; sync tools run off the event loop so they cannot stall other clients |
@@ -55,6 +55,9 @@ Consequences:
 | Crash amplification | Exceptions in one tool call are contained; the server keeps serving |
 | Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
 | Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
+| Change notifications revealing hidden tools | A client is told about a list change only when the list it may see changed: each recipient compares a digest of exactly what `tools/list` returns to its credential (on a session, its latest request's) with what it was last told. Notifications carry no names, so even a visible change reveals only "your list changed", which the next `tools/list` shows anyway |
+| Stream exhaustion | `subscriptions/listen`: 8 streams per client and `max_sessions` per process, each opening one rate-limit unit, refused with `-32007` (HTTP 503) beyond; `GET /mcp`: one stream per session (a new one replaces the old) and one rate-limit unit per open, with sessions capped by `max_sessions`. Queued notifications coalesce, so a client that stops reading cannot grow a backlog; keep-alives every 15 s find dead peers, and a stream opened with an OAuth token ends when the token expires |
+| Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
 
 ## Transport trust boundaries
@@ -68,7 +71,8 @@ Consequences:
   Streamable HTTP session lookup and any method. A few checks come first and
   are answered without one. On Streamable HTTP: the `Origin` allowlist
   (`403`), `Accept`, `Content-Type`, body size and JSON parsing (`406`,
-  `415`, `413`, `400`) and `GET /mcp` (`405`). On legacy SSE
+  `415`, `413`, `400`) and a `GET /mcp` without a session id or for the
+  stateless revision (`405`). On legacy SSE
   `POST /messages`: the `Origin` allowlist, body size and an unknown
   `session_id` (`404`) only; its JSON is parsed after the credential, so an
   unparseable body without a valid token gets `401`. Only the Protected
@@ -228,7 +232,8 @@ the client is untrusted, the credential in the environment is trusted.
   with the process, without running its `finally` blocks. So does one in a
   process that drives `dispatch` itself and exits without that wait. Under
   your own uvicorn (`build_app()`), set `--timeout-graceful-shutdown`: uvicorn
-  waits for open SSE streams to close and running requests to finish (one
+  waits for open SSE streams (legacy `/sse`, `GET /mcp` and
+  `subscriptions/listen`) to close and running requests to finish (one
   held in middleware never does) before it shuts the app down, and a forced
   exit skips that wait entirely. `server.run()` closes those streams itself
   and refuses new ones with `503`; the requests they carry are cancelled as
@@ -262,6 +267,18 @@ the client is untrusted, the credential in the environment is trusted.
   between workers can be replayed by someone who can read the store, within
   their 60 s window; that can only repeat a cancel or an answer the client
   has already settled.
+- **Change notifications are per process.** Each worker tells the streams it
+  holds about its own registry, so a tool registered at runtime in one worker
+  only is announced by that worker alone (and the others list a different
+  set). A session's `GET /mcp` stream replaced by a new one opened on another
+  worker is not closed on the first: until that connection drops, a change
+  may be announced on both. Over legacy SSE with a shared store, a
+  `subscriptions/listen` posted to a worker that does not hold the stream is
+  answered `-32601`.
+- **A stdio client that stops reading stdout stalls the server** once the
+  pipe buffer is full, as it always has: responses and notifications share
+  the pipe. Notifications are rate-bounded (one per list per 0.1 s at most)
+  and do not make this worse in practice.
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
   values; for rotating, audience-bound credentials use `oauth=`.
 - **A JWT access token stays valid until it expires, even if it is revoked.**

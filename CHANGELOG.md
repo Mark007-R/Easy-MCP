@@ -226,6 +226,49 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   off from Redis for more than ten minutes may audit a close a second time.
 - `MCPServer.lifespan()` also connects the store at startup and closes it
   last at shutdown.
+- List-change notifications. Registering or unregistering a tool while
+  clients are connected tells each client whose visible tool list changed,
+  so it can call `tools/list` again. A change to a tool a client cannot see
+  (missing key or scope) is not announced to it, and notifications carry no
+  tool names. Changes within 0.1 s are combined into one notification, and a
+  change undone within that time sends none. Registration from any thread
+  works, including a sync tool's. On a session, what the client may see
+  follows the credential of its latest request.
+- Initialize-era clients receive `notifications/tools/list_changed` once
+  `initialize` has been answered: on stdout over stdio, on the `/sse`
+  stream, and over Streamable HTTP on the session's `GET /mcp` stream.
+  `GET /mcp` with the session's `MCP-Session-Id` and credential now opens
+  that stream (`text/event-stream`, keep-alive every 15 s, never a
+  response). One stream per session: a new one replaces the old. A change
+  made while no stream is open is announced when one opens, on whichever
+  worker: what the client was last told is kept with the session in the
+  store. An open stream keeps its session from idle expiry, and opening one
+  spends a request of the rate-limit budget (`429` beyond it). A stream
+  opened with an OAuth token ends when the token expires.
+- `subscriptions/listen` for `2026-07-28` clients, over Streamable HTTP and
+  stdio (and legacy SSE `/messages`). The response is the stream:
+  `notifications/subscriptions/acknowledged` with the honored filter first,
+  then the requested notifications tagged with
+  `io.modelcontextprotocol/subscriptionId`. Kinds the server does not offer,
+  and `resourceSubscriptions`, are left out of the acknowledgment. Over HTTP
+  the client must accept `text/event-stream` (`406` otherwise), a refused
+  listen is answered as JSON, and closing the response ends the
+  subscription; over stdio, `notifications/cancelled` does. At shutdown, and
+  when the OAuth token it was opened with expires, a stream gets the listen
+  request's completion result, followed on stdio and legacy SSE by
+  `notifications/cancelled` naming it. Request middleware sees listen
+  requests and may refuse them.
+- `SubscriptionLimitError` (`-32007`, HTTP `503`): a client may hold 8
+  listen streams in one process, and `max_sessions` caps them across the
+  process. A listen id already open on the same channel is refused with
+  `-32600`.
+- For custom transports: `ClientContext.push` and `ClientContext.multiplexed`,
+  and `MCPServer.close_subscriptions(context)`.
+- `SessionRecord.baselines` and `Store.save_baselines()`, where a store keeps
+  what a session's client was last told its lists hold. The default records
+  nothing, so existing stores keep working.
+- Audit events `subscription_open`, `subscription_close`,
+  `subscription_refused`, `stream_open` and `stream_close`.
 
 ### Changed
 
@@ -319,6 +362,23 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   without any request.
 - Registering or removing a tool while serving with a shared store logs a
   warning: only that worker sees the change.
+- `initialize` and `server/discover` advertise `tools.listChanged: true`.
+  Capabilities only ever grow: a kind, once advertised, stays advertised for
+  the life of the process, and one added after serving began is logged,
+  since clients may cache `server/discover` for an hour.
+- `GET /mcp` without a session id, or with a `2026-07-28`
+  `MCP-Protocol-Version`, still answers `405`; its `Allow` header now lists
+  `GET`.
+- Clients that open a `GET /mcp` or `subscriptions/listen` stream hold a
+  long-lived connection. `server.run()` closes these streams as shutdown
+  begins, as it does legacy SSE streams. Serving `build_app()` with your own
+  uvicorn needs `--timeout-graceful-shutdown`, as with legacy SSE clients.
+- `subscriptions/listen` without the stateless `_meta` is answered `-32602`
+  instead of `-32601`, as `server/discover` is: the method exists only in the
+  stateless revision. On a channel that cannot carry server-initiated
+  messages (`ClientContext.push` unset) it is still `-32601`.
+- `ClientContext` compares and hashes by identity, and can be weakly
+  referenced.
 
 ### Deprecated
 
