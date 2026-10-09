@@ -76,7 +76,7 @@ from ..exceptions import (
 )
 from ..logging import audit
 from ..middleware import TransportInfo
-from ._http import BaseHTTPTransport, store_unavailable
+from ._http import BaseHTTPTransport
 from ._outbox import KEEPALIVE_SECONDS, sse_event
 from ._sessions import CLOSE_STREAM, LocalSession, Rejection, SessionManager
 from .base import ClientContext
@@ -178,6 +178,7 @@ class SSETransport(BaseHTTPTransport):
                 *self.routes(),
                 Route("/healthz", self._handle_health, methods=["GET"]),
                 *self._metadata_routes(),
+                *self._metrics_routes(),
             ],
             middleware=self._middleware(),
             lifespan=lifespan,
@@ -257,13 +258,14 @@ class SSETransport(BaseHTTPTransport):
             await self._server.acheck_rate_limit(client_id)
         except RateLimitError as exc:
             audit("rate_limited", client_id=client_id, method="GET " + self._sse_path)
+            self._server._telemetry.rejected("rate_limited")
             return JSONResponse(
                 {"error": str(exc)},
                 status_code=429,
                 headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
             )
         except StoreUnavailableError:
-            return store_unavailable()
+            return self._store_unavailable()
 
         # 192-bit random token: the session id is a bearer capability, it
         # must be unguessable.
@@ -273,8 +275,9 @@ class SSETransport(BaseHTTPTransport):
                 session_id, client_id=client_id, identity=identity, owned=True
             )
         except StoreUnavailableError:
-            return store_unavailable()
+            return self._store_unavailable()
         if session is None:
+            self._server._telemetry.rejected("too_many_sessions")
             return JSONResponse({"error": "too many concurrent sessions"}, status_code=503)
         if self._closing:
             # Shutdown began meanwhile: a stream opened now would never be closed.
@@ -322,12 +325,13 @@ class SSETransport(BaseHTTPTransport):
         # Cheap header-based rejection first ...
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+            self._server._telemetry.rejected("payload_too_large")
             return JSONResponse({"error": f"request exceeds {max_bytes} bytes"}, status_code=413)
 
         # The stream's own worker knows the session; any other asks the store.
         session = await self._manager.acquire(request.query_params.get("session_id", ""))
         if session is Rejection.UNAVAILABLE:
-            return store_unavailable()
+            return self._store_unavailable()
         if isinstance(session, Rejection):
             return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
         relaying = False
@@ -337,6 +341,7 @@ class SSETransport(BaseHTTPTransport):
             async for chunk in request.stream():
                 body.extend(chunk)
                 if len(body) > max_bytes:
+                    self._server._telemetry.rejected("payload_too_large")
                     return JSONResponse(
                         {"error": f"request exceeds {max_bytes} bytes"}, status_code=413
                     )

@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 import pytest
 from conftest import (
+    OAUTH_RESOURCE,
     LogCapture,
     headers_for,
     make_context,
@@ -27,12 +28,15 @@ from conftest import (
     notification,
     parse_exposition,
     rpc,
+    scrape,
 )
 
 from easy_mcp import (
+    METRICS_SCOPE,
     APIKeyAuth,
     MCPServer,
     MemoryStore,
+    OAuthResourceServer,
     ToolError,
 )
 from easy_mcp.exceptions import (
@@ -43,15 +47,21 @@ from easy_mcp.exceptions import (
 )
 from easy_mcp.middleware import TransportInfo
 from easy_mcp.telemetry.prometheus import (
+    CONTENT_TYPE,
     DURATION_BUCKETS,
     MetricsRegistry,
 )
+from easy_mcp.transport._http import is_local_request
+from easy_mcp.transport.sse import SSETransport
 from easy_mcp.transport.stdio import StdioTransport
 from easy_mcp.transport.streamable_http import StreamableHTTPTransport
 
 LiveServer = Callable[[Any], str]
 
 APP_KEY = "metrics-app-key-" + "a" * 16
+SCRAPE_KEY = "metrics-scrape-key-" + "s" * 13
+ADMIN_KEY = "metrics-admin-key-" + "m" * 14
+WRONG_KEY = "metrics-wrong-key-" + "w" * 14
 
 ACCEPT = {"Accept": "application/json, text/event-stream"}
 INIT = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
@@ -111,6 +121,10 @@ def asgi(app: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
+def bearer(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"}
+
+
 async def wait_until(check: Callable[[], bool], timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while not check():
@@ -120,6 +134,16 @@ async def wait_until(check: Callable[[], bool], timeout: float = 10.0) -> None:
 
 
 # ------------------------------------------------------------- the registry
+
+
+async def test_metrics_are_off_by_default() -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    with pytest.raises(RuntimeError, match="metrics=True"):
+        server.render_metrics()
+    app = server.build_app()
+    assert "/metrics" not in [getattr(route, "path", None) for route in app.routes]
+    async with asgi(app) as http:
+        assert (await http.get("/metrics")).status_code == 404
 
 
 def test_empty_registry_renders_valid_exposition() -> None:
@@ -560,6 +584,153 @@ async def test_exposition_parses_with_reference_parser() -> None:
     assert calls[("add", "busy")] == 1 and calls[("sleepy", "timeout")] == 1
 
 
+# --------------------------------------------------------- GET /metrics
+
+
+async def test_metrics_endpoint_with_auth_requires_scope(logs: LogCapture) -> None:
+    auth = APIKeyAuth({APP_KEY: ["reports"], SCRAPE_KEY: [METRICS_SCOPE], ADMIN_KEY: "*"})
+    server = make_server(auth=auth)
+    async with asgi(server.build_app()) as http:
+        anonymous = await http.get("/metrics")
+        assert anonymous.status_code == 401
+        assert anonymous.headers["www-authenticate"] == "Bearer"
+        wrong = await http.get("/metrics", headers=bearer(WRONG_KEY))
+        assert wrong.status_code == 401
+        unscoped = await http.get("/metrics", headers=bearer(APP_KEY))
+        assert unscoped.status_code == 403
+        assert unscoped.json() == {"error": "the key lacks the 'metrics:read' scope"}
+        scraper = await http.get("/metrics", headers=bearer(SCRAPE_KEY))
+        assert scraper.status_code == 200
+        admin = await http.get("/metrics", headers={"X-API-Key": ADMIN_KEY})
+        assert admin.status_code == 200
+    assert (
+        parse_exposition(admin.text)['easy_mcp_rejected_total{easy_mcp_reason="unauthenticated"}']
+        == 2
+    )
+    reasons = [event["reason"] for event in logs.events("metrics_denied")]
+    assert reasons == ["unauthenticated", "unauthenticated", "insufficient_scope"]
+    assert all(APP_KEY not in record.getMessage() for record in logs.records)
+
+
+def test_metrics_endpoint_with_oauth_needs_the_scope(
+    live_server: LiveServer, fake_as: Any, logs: LogCapture
+) -> None:
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer])
+    server = MCPServer(port=0, rate_limit_per_minute=None, oauth=oauth, metrics=True)
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        anonymous = client.get("/metrics")
+        assert anonymous.status_code == 401
+        assert 'resource_metadata="' in anonymous.headers["www-authenticate"]
+        # Tokens are minted right before the request that presents them.
+        plain = client.get("/metrics", headers=bearer(fake_as.mint()))
+        assert plain.status_code == 403
+        # A token's "*" is a scope like any other, not a wildcard.
+        star = client.get("/metrics", headers=bearer(fake_as.mint(claims={"scope": "*"})))
+        assert star.status_code == 403
+        scoped = fake_as.mint(claims={"scope": f"mcp:access {METRICS_SCOPE}"})
+        allowed = client.get("/metrics", headers=bearer(scoped))
+        assert allowed.status_code == 200
+    reasons = [event["reason"] for event in logs.events("metrics_denied")]
+    assert reasons == ["unauthenticated", "insufficient_scope", "insufficient_scope"]
+
+
+def test_metrics_endpoint_without_auth_is_local_only(
+    live_server: LiveServer, logs: LogCapture
+) -> None:
+    server = make_server()
+    base = live_server(server)
+    port = base.rsplit(":", 1)[1]
+    assert httpx.get(f"{base}/metrics", timeout=10).status_code == 200
+    named = httpx.get(f"{base}/metrics", headers={"Host": f"localhost:{port}"}, timeout=10)
+    assert named.status_code == 200
+    # A DNS-rebinding page: a loopback peer, but the attacker's host name.
+    rebound = httpx.get(f"{base}/metrics", headers={"Host": "attacker.example"}, timeout=10)
+    assert rebound.status_code == 403
+    assert "only to this machine" in rebound.json()["error"]
+    assert [event["reason"] for event in logs.events("metrics_denied")] == ["not_local"]
+
+
+def test_local_request_predicate() -> None:
+    def scope(peer: str | None, *hosts: str) -> dict[str, Any]:
+        return {
+            "type": "http",
+            "client": (peer, 50000) if peer is not None else None,
+            "headers": [(b"host", host.encode("latin-1")) for host in hosts],
+        }
+
+    assert is_local_request(scope("127.0.0.1", "127.0.0.1:8000"))
+    assert is_local_request(scope("127.0.0.2", "localhost"))
+    assert is_local_request(scope("::1", "[::1]:8000"))
+    assert is_local_request(scope("::ffff:127.0.0.1", "LOCALHOST:80"))
+    assert is_local_request(scope("127.0.0.1", "127.0.0.1:"))
+    assert not is_local_request(scope("10.0.0.5", "127.0.0.1"))
+    assert not is_local_request(scope("::ffff:10.0.0.5", "127.0.0.1"))
+    assert not is_local_request(scope("not-an-address", "127.0.0.1"))
+    assert not is_local_request(scope(None, "127.0.0.1"))
+    assert not is_local_request(scope("127.0.0.1"))  # no Host header
+    assert not is_local_request(scope("127.0.0.1", "127.0.0.1", "127.0.0.1"))
+    assert not is_local_request(scope("127.0.0.1", "attacker.example"))
+    assert not is_local_request(scope("127.0.0.1", "attacker.example@127.0.0.1"))
+    assert not is_local_request(scope("127.0.0.1", "127.0.0.1:80x"))
+    assert not is_local_request(scope("127.0.0.1", "[::1"))
+    assert not is_local_request(scope("127.0.0.1", "::1"))  # an IPv6 host needs brackets
+    # A digit, but not an ASCII one (superscript two).
+    assert not is_local_request(scope("127.0.0.1", "127.0.0.1:²"))
+
+
+async def test_metrics_endpoint_is_rate_limited(logs: LogCapture) -> None:
+    server = make_server(rate_limit_per_minute=2)
+    async with asgi(server.build_app()) as http:
+        assert (await http.get("/metrics")).status_code == 200
+        assert (await http.get("/metrics")).status_code == 200
+        limited = await http.get("/metrics")
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert metrics_of(server)['easy_mcp_rejected_total{easy_mcp_reason="rate_limited"}'] == 1
+    assert [event["method"] for event in logs.events("rate_limited")] == ["GET /metrics"]
+
+
+async def test_metrics_endpoint_is_origin_guarded() -> None:
+    server = make_server()
+    async with asgi(server.build_app()) as http:
+        refused = await http.get("/metrics", headers={"Origin": "https://evil.example"})
+        allowed = await http.get("/metrics", headers={"Origin": "http://localhost:3000"})
+    assert refused.status_code == 403
+    assert allowed.status_code == 200
+    assert parse_exposition(allowed.text)['easy_mcp_rejected_total{easy_mcp_reason="origin"}'] == 1
+
+
+def test_metrics_response_headers(live_server: LiveServer) -> None:
+    base = live_server(make_server())
+    response = httpx.get(f"{base}/metrics", timeout=10)
+    assert response.headers["content-type"] == CONTENT_TYPE
+    assert response.headers["cache-control"] == "no-store"
+    assert response.text.endswith("\n")
+    head = httpx.head(f"{base}/metrics", timeout=10)
+    assert head.status_code == 200
+    assert head.headers["content-type"] == CONTENT_TYPE
+    assert head.content == b""
+
+
+def test_metrics_path_collision_is_refused() -> None:
+    with pytest.raises(ValueError, match="collides"):
+        StreamableHTTPTransport(MCPServer(port=0, metrics=True), path="/metrics")
+    # Without metrics the path is free, as it was.
+    StreamableHTTPTransport(MCPServer(port=0), path="/metrics")
+
+
+def test_metrics_route_is_served_once() -> None:
+    server = MCPServer(port=0, metrics=True)
+
+    def paths(app: Any) -> list[Any]:
+        return [getattr(route, "path", None) for route in app.routes]
+
+    # The combined app (Streamable HTTP with the legacy endpoints), and SSE alone.
+    assert paths(StreamableHTTPTransport(server).build_app()).count("/metrics") == 1
+    assert paths(SSETransport(server).build_app()).count("/metrics") == 1
+
+
 # ----------------------------------------------------------- sessions
 
 
@@ -692,6 +863,49 @@ async def test_metrics_over_stdio_warns_once(logs: LogCapture) -> None:
     assert len([r for r in logs.records if "no endpoint over stdio" in r.getMessage()]) == 1
 
 
+async def test_http_rejections_are_counted() -> None:
+    auth = APIKeyAuth({APP_KEY: "*", ADMIN_KEY: "*"})
+    server = make_server(auth=auth, max_sessions=1, max_request_bytes=2000)
+    async with asgi(server.build_app()) as http:
+        too_large = rpc("ping", {"pad": "x" * 5000})
+        big = await http.post("/mcp", json=too_large, headers={**ACCEPT, **bearer(APP_KEY)})
+        assert big.status_code == 413
+        init = rpc("initialize", INIT, "init")
+        opened = await http.post("/mcp", json=init, headers={**ACCEPT, **bearer(APP_KEY)})
+        assert opened.status_code == 200
+        full = await http.post("/mcp", json=init, headers={**ACCEPT, **bearer(APP_KEY)})
+        assert full.status_code == 503
+        session = {"MCP-Session-Id": opened.headers["mcp-session-id"]}
+        other = await http.post(
+            "/mcp", json=rpc("ping", msg_id=2), headers={**ACCEPT, **session, **bearer(ADMIN_KEY)}
+        )
+        assert other.status_code == 403
+        message = modern("tools/list")
+        mismatched = await http.post(
+            "/mcp",
+            json=message,
+            headers={**headers_for(message), "Mcp-Method": "tools/call", **bearer(APP_KEY)},
+        )
+        assert mismatched.status_code == 400
+        wrong = await http.post(
+            "/mcp", json=message, headers={**headers_for(message), **bearer(WRONG_KEY)}
+        )
+        assert wrong.status_code == 401
+    samples = metrics_of(server)
+    rejected = {
+        found["easy_mcp_reason"]: value for found, value in find(samples, "easy_mcp_rejected_total")
+    }
+    assert rejected == {
+        "payload_too_large": 1,
+        "too_many_sessions": 1,
+        "credential_mismatch": 1,
+        "header_mismatch": 1,
+        "unauthenticated": 1,
+    }
+    # None of them was dispatched.
+    assert total(samples, f"{DURATION}_count") == 1  # the initialize
+
+
 def test_stateless_disconnect_counts_cancelled(live_server: LiveServer) -> None:
     server = make_server()
     started = threading.Event()
@@ -718,3 +932,24 @@ def test_stateless_disconnect_counts_cancelled(live_server: LiveServer) -> None:
         assert time.monotonic() < deadline, tool_calls(server)
         time.sleep(0.05)
     assert find(metrics_of(server), f"{DURATION}_count", mcp_method_name="tools/call") == []
+
+
+def test_live_scrape_after_calls(live_server: LiveServer) -> None:
+    auth = APIKeyAuth({APP_KEY: "*", SCRAPE_KEY: [METRICS_SCOPE]})
+    server = make_server(auth=auth)
+    base = live_server(server)
+    message = modern("tools/call", {"name": "add", "arguments": {"a": 2, "b": 3}})
+    for _ in range(3):
+        answer = httpx.post(
+            f"{base}/mcp",
+            json=message,
+            headers={**headers_for(message), **bearer(APP_KEY)},
+            timeout=10,
+        )
+        assert answer.json()["result"]["content"][0]["text"] == "5"
+    samples = scrape(base, SCRAPE_KEY)
+    assert samples['easy_mcp_tool_calls_total{easy_mcp_status="ok",gen_ai_tool_name="add"}'] == 3
+    ((labels, count),) = find(samples, f"{DURATION}_count", gen_ai_tool_name="add")
+    assert count == 3
+    assert labels["network_transport"] == "tcp" and labels["network_protocol_name"] == "http"
+    assert labels["mcp_protocol_version"] == "2026-07-28"

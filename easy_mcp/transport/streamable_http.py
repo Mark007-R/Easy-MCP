@@ -109,7 +109,6 @@ from ._http import (
     BaseHTTPTransport,
     is_store_unavailable,
     rpc_error,
-    store_unavailable,
 )
 from ._outbox import (
     ChannelClosed,
@@ -433,6 +432,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             Route(self._path, self._handle, methods=["GET", "POST", "DELETE"]),
             Route("/healthz", self._handle_health, methods=["GET"]),
             *self._metadata_routes(),
+            *self._metrics_routes(),
         ]
         legacy = self._legacy
         if legacy is not None:
@@ -504,6 +504,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 await self._server.acheck_rate_limit(client_id)
             except RateLimitError as exc:
                 audit("rate_limited", client_id=client_id, method="GET " + self._path)
+                self._server._telemetry.rejected("rate_limited")
                 return rpc_error(
                     429,
                     RATE_LIMITED,
@@ -512,7 +513,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     data=exc.data,
                 )
             except StoreUnavailableError:
-                return store_unavailable()
+                return self._store_unavailable()
             if self._closing:
                 # A stream opened now would hold shutdown up.
                 return rpc_error(
@@ -649,6 +650,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         max_bytes = self._server.max_request_bytes
         body = await _read_body(request, max_bytes)
         if body is None:
+            self._server._telemetry.rejected("payload_too_large")
             return rpc_error(413, PAYLOAD_TOO_LARGE, f"request exceeds {max_bytes} bytes")
         try:
             message = json.loads(body.decode("utf-8"))
@@ -752,6 +754,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             mismatch = _check_mirrored_headers(request, message)
             if mismatch is not None:
                 audit("header_mismatch", client_id=client_id, transport=_TRANSPORT)
+                self._server._telemetry.rejected("header_mismatch")
                 return _json_response(
                     _rpc_error_body(msg_id, HEADER_MISMATCH, mismatch), status=400
                 )
@@ -776,7 +779,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         try:
             await store.touch_client(client_id, ttl=self._idle_timeout)
         except StoreUnavailableError:
-            return store_unavailable(msg_id)
+            return self._store_unavailable(msg_id)
         context = ClientContext(
             client_id=client_id,
             session_id="stateless",
@@ -1001,7 +1004,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # Ended in the store first: every worker answers 404 from now on.
             await self._manager.end(session, reason="client_terminated", strict=True)
         except StoreUnavailableError:
-            return store_unavailable()
+            return self._store_unavailable()
         finally:
             await self._manager.finish(session)
         return Response(status_code=204)
@@ -1030,7 +1033,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 )
                 break
             except StoreUnavailableError:
-                return store_unavailable(message["id"])
+                return self._store_unavailable(message["id"])
             except ValueError:
                 if attempt:  # the store found the id taken twice: something is wrong
                     error_id = uuid.uuid4().hex[:12]
@@ -1041,6 +1044,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                         500, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
                     )
         if session is None:
+            self._server._telemetry.rejected("too_many_sessions")
             return rpc_error(503, TOO_MANY_SESSIONS, "too many concurrent sessions")
 
         response: dict[str, Any] | None = None
@@ -1109,4 +1113,4 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 f"Bad Request: unsupported {PROTOCOL_VERSION_HEADER} "
                 f"(supported: {', '.join(SUPPORTED_PROTOCOL_VERSIONS)})",
             )
-        return store_unavailable()
+        return self._store_unavailable()
