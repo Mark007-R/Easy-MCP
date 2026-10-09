@@ -1042,6 +1042,27 @@ async def test_a_trickled_answer_is_cut_off_at_the_deadline(
         executor.shutdown(wait=False)
 
 
+@pytest.mark.parametrize("error", [ssl.SSLWantReadError, ssl.SSLWantWriteError])
+async def test_a_tls_socket_out_of_time_is_a_timeout_not_unreachable(
+    monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    # A blocking TLS socket whose time runs out mid-handshake can raise "the
+    # operation did not complete" instead of a timeout; it is still a timeout.
+    class Opener:
+        def open(self, *args: Any, **kwargs: Any) -> Any:
+            raise error("The operation did not complete (read)")
+
+    monkeypatch.setattr(_fetch, "_opener", lambda url, deadline: Opener())
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with pytest.raises(_fetch.FetchError, match="timed out"):
+            await _fetch.fetch_json(
+                "https://auth.example.com/jwks", max_bytes=1024, timeout=5.0, executor=executor
+            )
+    finally:
+        executor.shutdown(wait=False)
+
+
 def tls_certificates(host: str) -> tuple[bytes, bytes, bytes]:
     """A test CA, and a certificate it signed for *host*: (CA, certificate, key) as PEM."""
     from cryptography import x509
