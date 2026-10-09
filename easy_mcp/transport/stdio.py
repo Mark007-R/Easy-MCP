@@ -21,6 +21,13 @@ Security handled here (before anything reaches the dispatcher):
 * ``sys.stdout`` is redirected to stderr while serving, so a stray ``print``
   inside a tool cannot break the protocol stream.
 
+The server's own messages share stdout with the responses, one line each:
+``notifications/tools/list_changed`` once ``initialize`` has been answered,
+and the frames of ``subscriptions/listen`` streams, which a
+``notifications/cancelled`` naming the listen request ends.  When stdin
+closes, each open listen stream gets its result and then
+``notifications/cancelled`` before serving ends.
+
 The dispatcher is shared with every other transport, so validation, auth
 decisions, rate limits, timeouts, and error sanitization apply unchanged.
 State stays in this process even when the server has a shared store: one
@@ -138,7 +145,15 @@ class StdioTransport(Transport):
 
         session_id = "stdio-" + secrets.token_urlsafe(12)
         client_id = identity.fingerprint if identity else "stdio"
-        context = ClientContext(client_id=client_id, session_id=session_id, identity=identity)
+        # stdout carries the server's own messages too (list changes, listen
+        # streams), one line each, between the responses.
+        context = ClientContext(
+            client_id=client_id,
+            session_id=session_id,
+            identity=identity,
+            push=self._write,
+            multiplexed=True,
+        )
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -173,6 +188,7 @@ class StdioTransport(Transport):
             client_id=client_id,
             t0=t0,
         )
+        server._started = True
         reader.start()
         try:
             while True:
@@ -183,6 +199,9 @@ class StdioTransport(Transport):
                 in_flight.add(task)
                 task.add_done_callback(in_flight.discard)
         finally:
+            # Open listen streams get their result and cancel lines now, and
+            # their requests return at once rather than holding the drain.
+            server.close_subscriptions(context, reason="shutdown")
             await self._drain(in_flight)
             # Daemon threads die with the process, cancel callbacks included.
             await self._server.wait_for_tool_threads(self._shutdown_timeout)
