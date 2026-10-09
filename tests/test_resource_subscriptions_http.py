@@ -70,8 +70,8 @@ class Stream:
                     except ValueError:
                         self.events.put_nowait(data)  # the legacy endpoint event
                     data = None
-        except httpx.HTTPError:
-            pass
+        except (httpx.HTTPError, httpx.StreamError):
+            pass  # StreamError: closed by aclose() before the read began
         finally:
             self.ended.set()
 
@@ -86,10 +86,10 @@ class Stream:
         await asyncio.wait_for(self.ended.wait(), timeout)
 
     async def aclose(self) -> None:
-        await self.response.aclose()
         self._task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self._task
+        await self.response.aclose()
 
 
 async def open_stream(
