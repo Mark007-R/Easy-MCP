@@ -1033,3 +1033,42 @@ async def test_tool_error_from_request_middleware_on_a_read() -> None:
 
     response = await call(server, read("alpha://first"))
     assert response["error"] == {"code": INTERNAL_ERROR, "message": "Reads are paused."}
+
+
+# ------------------------------------------------------------ operator warnings
+
+
+def test_registering_while_serving_with_a_shared_store_warns(logs: LogCapture) -> None:
+    from shared_store_fake import FakeHub
+
+    server = MCPServer(port=0, rate_limit_per_minute=None, store=FakeHub().store())
+    server._serving = True
+    server.register_resource(lambda: "x", "x://a", name="a")
+    server.register_prompt(lambda: "x", name="p")
+    server.unregister_resource("x://a")
+    assert "resource 'x://a' registered while serving with a shared store" in logs.text
+    assert "prompt 'p' registered while serving with a shared store" in logs.text
+    assert "resource 'x://a' unregistered while serving with a shared store" in logs.text
+    assert "every worker must register the same resources" in logs.text
+
+
+def test_a_capability_added_after_serving_began_is_logged(logs: LogCapture) -> None:
+    server = make_server()
+    server.register_resource(lambda: "x", "x://early", name="early")
+    assert "after serving began" not in logs.text
+    server._started = True
+    server.register_prompt(lambda: "x", name="late")
+    server.register_resource(lambda: "x", "x://late", name="late")  # advertised already
+    assert logs.text.count("after serving began") == 1
+    assert "capability 'prompts' added after serving began" in logs.text
+
+
+def test_protected_items_without_auth_are_warned_about(logs: LogCapture) -> None:
+    server = make_server()
+    server.register_resource(lambda: "x", "x://secret", name="secret", requires_auth=True)
+    server.register_resource(lambda id: id, "x://t/{id}", name="t", scopes=("s",))
+    server.register_prompt(lambda: "x", name="internal", scopes=("s",))
+    server._warn_if_misconfigured()
+    for named in ("resource x://secret", "template x://t/{id}", "prompt internal"):
+        assert named in logs.text
+    assert "they will be unreachable" in logs.text
