@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import json
 import logging
@@ -20,9 +21,19 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Coroutine, Hashable, Iterable, Mapping
+from collections import OrderedDict
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Hashable,
+    Iterable,
+    Mapping,
+)
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from ._version import __version__
 from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
@@ -35,10 +46,14 @@ from .exceptions import (
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     TOOL_TIMEOUT,
+    AuthenticationError,
+    InsufficientScopeError,
     ProtocolError,
     ServerBusyError,
     SessionLimitError,
+    TokenRequiredError,
     ToolError,
+    ToolRegistrationError,
     ValidationError,
 )
 from .logging import audit, configure_logging
@@ -76,9 +91,18 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .schema import build_param_models, dump_model, validate_arguments, validate_result
-from .security.auth import APIKeyAuth, ClientIdentity, authorize, visible
+from .security.auth import (
+    APIKeyAuth,
+    ClientIdentity,
+    Guarded,
+    _identity_scope,
+    authorize,
+    is_scope_token,
+    visible,
+)
+from .security.oauth import OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
-from .transport._http import BaseHTTPTransport, normalize_origins
+from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -97,6 +121,9 @@ TOOLS_LIST_TTL_MS = 0
 # Sync tools that may run at once: the most asyncio's default executor, where
 # sync tools used to run, ever allowed.
 DEFAULT_MAX_SYNC_WORKERS = 32
+
+# OAuth principals remembered for the once-per-principal principal_seen audit.
+_PRINCIPALS_SEEN_MAX = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,9 +284,16 @@ class MCPServer:
             to the easy_mcp package version.
         debug: When True, clients receive full tracebacks and uvicorn logs
             verbosely. Never enable in production.
-        auth: Optional :class:`APIKeyAuth`. Without it, only public tools
-            (no ``requires_auth``/``scopes``) are reachable.
+        auth: Optional :class:`APIKeyAuth`. Without it (or ``oauth``), only
+            public tools (no ``requires_auth``/``scopes``) are reachable.
+        oauth: Optional :class:`~easy_mcp.OAuthResourceServer`: accept OAuth
+            2.1 access tokens on Streamable HTTP and SSE, as the MCP
+            authorization spec describes.  Every HTTP request then needs a
+            credential (a token, or an API key when ``auth`` is set too);
+            stdio ignores it.  A tool's ``scopes`` map onto the token's.
         rate_limit_per_minute: Per-client request budget; ``None`` disables.
+            With ``oauth``, failed token checks from one address are limited
+            to the same budget.
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
             overrides it; ``None`` disables.
@@ -289,6 +323,7 @@ class MCPServer:
         version: str = __version__,
         debug: bool = False,
         auth: APIKeyAuth | None = None,
+        oauth: OAuthResourceServer | None = None,
         rate_limit_per_minute: int | None = 120,
         max_request_bytes: int = 1_048_576,
         default_timeout: float | None = 30.0,
@@ -304,12 +339,18 @@ class MCPServer:
             raise ValueError("max_request_bytes must be >= 1")
         if max_sync_workers is not None and max_sync_workers < 1:
             raise ValueError("max_sync_workers must be >= 1 or None")
+        if oauth is not None and not isinstance(oauth, OAuthResourceServer):
+            raise TypeError("oauth must be an OAuthResourceServer")
         self.host = host
         self.port = port
         self.name = name
         self.version = version
         self.debug = debug
         self.auth = auth
+        self.oauth = oauth
+        # Token principals already audited as principal_seen, oldest first.
+        self._principals_seen: OrderedDict[str, None] = OrderedDict()
+        self._principals_lock = threading.Lock()
         self.max_request_bytes = max_request_bytes
         self.default_timeout = default_timeout
         self.max_sync_workers = max_sync_workers
@@ -386,8 +427,23 @@ class MCPServer:
         return decorate
 
     def register_tool(self, fn: Callable[..., Any], **options: Any) -> ToolDefinition:
-        """Register a tool dynamically at runtime (same options as ``tool``)."""
+        """Register a tool dynamically at runtime (same options as ``tool``).
+
+        Raises:
+            ToolRegistrationError: The function cannot be exposed, or (with
+                ``oauth``) a scope could not appear in a ``WWW-Authenticate``
+                challenge: it is not an RFC 6749 scope-token, or it is
+                ``offline_access``.
+        """
         definition = build_tool(fn, **options)
+        if self.oauth is not None:
+            for scope in definition.declared_scopes:
+                if not is_scope_token(scope) or scope == "offline_access":
+                    raise ToolRegistrationError(
+                        f"cannot register tool {definition.name!r}: scope {scope!r} cannot be "
+                        "used with OAuth (a scope is printable ASCII without spaces, quotes "
+                        "or backslashes, and offline_access is no resource scope)"
+                    )
         self._registry.register(definition)
         self._logger.debug("registered tool %r", definition.name)
         return definition
@@ -485,6 +541,205 @@ class MCPServer:
         if self.auth is None:
             return None
         return self.auth.authenticate(api_key)
+
+    @property
+    def auth_configured(self) -> bool:
+        """Whether callers can authenticate at all: ``auth`` or ``oauth`` is set."""
+        return self.auth is not None or self.oauth is not None
+
+    async def authenticate_request(
+        self,
+        *,
+        bearer: str | None = None,
+        api_key: str | None = None,
+        tool: str | None = None,
+        client: str | None = None,
+    ) -> ClientIdentity | None:
+        """Resolve one HTTP request's credential to an identity.
+
+        *bearer* is the token of an ``Authorization: Bearer`` header and
+        *api_key* the value of an ``X-API-Key`` header (the bearer wins when
+        both are given).  A value that matches an API key is that key; with
+        ``oauth`` set, a bearer value that does not is verified as an access
+        token, which must also hold every ``required_scopes``.  An
+        ``X-API-Key`` value is never sent for token verification.  Query
+        strings and bodies are never consulted.
+
+        *tool* is the tool a ``tools/call`` names.  A token that lacks a
+        required scope is then also asked for the scope that tool needs (with
+        step-up), so one challenge covers the whole call.
+
+        *client* names who presented the credential, as
+        :meth:`~easy_mcp.OAuthResourceServer.verify` takes it (the HTTP
+        transports pass ``"ip:<address>"``).
+
+        Returns:
+            The identity, or ``None`` for anonymous access, which only a
+            server without ``oauth`` allows (as does one without any auth,
+            whatever is presented).
+
+        Raises:
+            TokenRequiredError: ``oauth`` is set and nothing was presented.
+            InvalidTokenError: The access token failed verification.
+            InsufficientScopeError: A valid token lacks a required scope.
+            AuthServerUnavailableError: The token could not be checked.
+            AuthenticationError: The value is no API key and cannot be a token.
+        """
+        presented = bearer if bearer is not None else api_key
+        if presented is None:
+            if self.oauth is not None:
+                raise TokenRequiredError()
+            return None
+        if self.auth is not None:
+            identity = self.auth.match(presented)
+            if identity is not None:
+                return identity
+        elif self.oauth is None:
+            return None  # nothing to check credentials against: anonymous
+        if self.oauth is not None and bearer is not None:
+            identity = await self.oauth.verify(bearer, client=client)
+            required = self.oauth.required_scopes
+            missing = [scope for scope in required if scope not in identity.scopes]
+            if missing:
+                definition = self._registry.get(tool) if tool is not None else None
+                step = self._step_up_scope(identity, definition)
+                if step is not None and step not in missing:
+                    missing.append(step)
+                raise InsufficientScopeError(missing, granted=identity.scopes)
+            self._note_principal(identity)
+            return identity
+        raise AuthenticationError("Invalid API key")
+
+    def _note_principal(self, identity: ClientIdentity) -> None:
+        """Audit ``principal_seen`` the first time a token principal shows up.
+
+        Every other event names the principal by fingerprint only, so its
+        subject is logged once rather than on every call.
+        """
+        with self._principals_lock:
+            if identity.fingerprint in self._principals_seen:
+                self._principals_seen.move_to_end(identity.fingerprint)
+                return
+            self._principals_seen[identity.fingerprint] = None
+            if len(self._principals_seen) > _PRINCIPALS_SEEN_MAX:
+                self._principals_seen.popitem(last=False)
+        audit(
+            "principal_seen",
+            client_id=identity.fingerprint,
+            issuer=identity.issuer,
+            subject=identity.subject,
+            oauth_client_id=identity.client_id,
+        )
+
+    def _reserve_auth_attempt(self, key: str) -> float | None:
+        """Hold one unit of *key*'s failed-authentication budget while a credential is checked.
+
+        The failed-authentication budget of one client address is the
+        server's rate limit, kept under a key of its own.  A failed check
+        keeps its unit; any other outcome gives it back
+        (:meth:`_release_auth_attempt`).  So checks still running count
+        against the budget too, and a burst of bad credentials sent at once
+        cannot all be verified.  Without rate limiting there is no throttle.
+
+        Returns:
+            The reservation, or ``None`` without rate limiting.
+
+        Raises:
+            RateLimitError: The budget is used up, by failures or by checks
+                in flight.
+        """
+        if self._limiter is None:
+            return None
+        return self._limiter._record(key)
+
+    def _release_auth_attempt(self, key: str, reservation: float | None) -> None:
+        """Give back the unit :meth:`_reserve_auth_attempt` held for a check that did not fail."""
+        if self._limiter is not None and reservation is not None:
+            self._limiter._refund(key, reservation)
+
+    def _steps_up(self, identity: ClientIdentity | None) -> bool:
+        """Whether *identity* sees every tool and is challenged for a missing scope.
+
+        Only token identities, and only with ``oauth.step_up``; API keys keep
+        hiding what they cannot call.
+        """
+        return (
+            self.oauth is not None
+            and self.oauth.step_up
+            and identity is not None
+            and identity.issuer is not None
+        )
+
+    def _visible(self, identity: ClientIdentity | None, item: Guarded) -> bool:
+        """Whether *item* exists for this caller (lists and lookups alike)."""
+        return self._steps_up(identity) or visible(identity, item)
+
+    def _step_up_scope(self, identity: ClientIdentity | None, item: Guarded | None) -> str | None:
+        """The scope a token must ask for to use *item*; ``None`` when there is none.
+
+        With step-up, for a token holding none of *item*'s scopes: the first
+        one declared, the narrowest by convention.
+        """
+        if item is None or identity is None or not item.scopes or not self._steps_up(identity):
+            return None
+        if identity.scopes & item.scopes:
+            return None
+        return item.declared_scopes[0] if item.declared_scopes else min(item.scopes)
+
+    def _check_step_up(self, identity: ClientIdentity | None, item: Guarded) -> None:
+        """Refuse a token that holds none of *item*'s scopes, naming the one to ask for.
+
+        Raises:
+            InsufficientScopeError: With the narrowest declared scope.
+        """
+        first = self._step_up_scope(identity, item)
+        if identity is not None and first is not None:
+            raise InsufficientScopeError(
+                (first,), f"Insufficient scope for tool '{item.name}'", granted=identity.scopes
+            )
+
+    def _initial_scopes(self) -> tuple[str, ...]:
+        """What a client should ask for up front: the metadata's ``scopes_supported``.
+
+        With step-up, ``required_scopes`` only, the minimal set; without it
+        every tool scope too, since a tool stays invisible until a token
+        holds its scope.  Never ``offline_access``.
+        """
+        if self.oauth is None:
+            return ()
+        scopes = list(self.oauth.required_scopes)
+        if not self.oauth.step_up:
+            tool_scopes = {scope for definition in self.tools for scope in definition.scopes}
+            scopes.extend(sorted(tool_scopes - set(scopes)))
+        return tuple(scope for scope in scopes if scope != "offline_access")
+
+    def _known_scopes(self) -> frozenset[str]:
+        """Every scope this server checks: ``required_scopes`` and every tool scope."""
+        scopes = set(self.oauth.required_scopes) if self.oauth is not None else set()
+        for definition in self.tools:
+            scopes.update(definition.scopes)
+        scopes.discard("offline_access")
+        return frozenset(scopes)
+
+    @staticmethod
+    def _request_context(
+        context: ClientContext, identity: ClientIdentity | None
+    ) -> ClientContext:
+        """The context one request of a session runs with: the session's, with its identity.
+
+        Each request of a session carries its own credential.  For an API key
+        the identity is always the session's, so the session's own context
+        is used; a refreshed or broader token gets a copy that shares the
+        session's call counts and calls in flight.
+        """
+        current = context.identity
+        same = identity is current or (
+            identity is not None
+            and current is not None
+            and identity == current
+            and identity.claims == current.claims
+        )
+        return context if same else dataclasses.replace(context, identity=identity)
 
     def check_rate_limit(self, client_id: str) -> None:
         """Consume one unit of *client_id*'s request budget.
@@ -902,15 +1157,16 @@ class MCPServer:
         """The ``cacheScope`` of a stateless result.
 
         ``"public"`` only when an anonymous request would get the same bytes.
-        ``server/discover`` is the same for everyone.  A list is not once auth
-        is configured (protected tools are hidden from callers who cannot use
-        them) or request middleware is registered (it may answer each caller
-        differently), and a shared cache must not hand one caller's list to
-        another.
+        ``server/discover`` is the same for everyone (with ``oauth`` it needs
+        a token, but its answer does not depend on which).  A list is not once
+        auth is configured (protected tools are hidden from callers who cannot
+        use them, and API keys and tokens may see different lists) or request
+        middleware is registered (it may answer each caller differently), and
+        a shared cache must not hand one caller's list to another.
         """
         if method == DISCOVER_METHOD:
             return "public"
-        if self.auth is not None or self._request_middleware:
+        if self.auth_configured or self._request_middleware:
             return "private"
         return "public"
 
@@ -921,12 +1177,13 @@ class MCPServer:
         return {**result, "resultType": "complete", "_meta": meta}
 
     def _handle_tools_list(self, context: ClientContext) -> dict[str, Any]:
-        # Protected tools are omitted for callers who could not invoke them.
+        # Protected tools are omitted for callers who could not invoke them
+        # (a token with step-up sees them all, and is challenged on a call).
         return {
             "tools": [
                 definition.to_mcp()
                 for definition in self._registry.list()
-                if visible(context.identity, definition)
+                if self._visible(context.identity, definition)
             ]
         }
 
@@ -953,7 +1210,8 @@ class MCPServer:
 
         Raises:
             ProtocolError: The call is refused before any middleware sees it:
-                an unknown or hidden tool, a missing scope, the session cap,
+                an unknown or hidden tool, a missing scope (for a token with
+                step-up, :class:`InsufficientScopeError`), the session cap,
                 invalid arguments.
         """
         params = request._params
@@ -965,10 +1223,11 @@ class MCPServer:
         definition = request.tool
         # Report protected tools as unknown to unauthorized callers, so their
         # existence is not enumerable.
-        if definition is None or not visible(context.identity, definition):
+        if definition is None or not self._visible(context.identity, definition):
             raise ProtocolError(f"Unknown tool: {name}", code=INVALID_PARAMS)
 
         try:
+            self._check_step_up(context.identity, definition)
             authorize(context.identity, definition)
             call_count = context.tool_calls.get(name, 0)
             if (
@@ -992,11 +1251,16 @@ class MCPServer:
             plain = validate_arguments(arguments, definition.arguments_schema)
             built = build_param_models(definition.param_models, _copy(plain))
         except ProtocolError as exc:
+            # A step-up denial names the scope the client was asked for.
+            scope = {}
+            if isinstance(exc, InsufficientScopeError):
+                scope["scope"] = " ".join(exc.scopes)
             audit(
                 "tool_denied",
                 tool=name,
                 client_id=context.client_id,
                 reason=type(exc).__name__,
+                **scope,
             )
             raise
 
@@ -1012,9 +1276,10 @@ class MCPServer:
         call = ToolCall._create(request, definition, plain, token, timeout)
         try:
             # Set here rather than around the tool alone, so tool middleware
-            # sees the token and the call too, and context variables it sets
-            # reach the tool (a sync tool's thread gets a copy of this context).
-            with cancel_scope(token), _tool_call_scope(call):
+            # sees the token, the call and the caller too, and context
+            # variables it sets reach the tool (a sync tool's thread gets a
+            # copy of this context).
+            with cancel_scope(token), _tool_call_scope(call), _identity_scope(context.identity):
                 run = functools.partial(self._run_tool, call, built, context)
                 layers = request._tool_layers
                 if not layers:
@@ -1418,10 +1683,50 @@ class MCPServer:
         """Return the ASGI app (for tests, mounting, or ``uvicorn --factory``).
 
         It serves Streamable HTTP at ``/mcp`` plus the legacy SSE endpoints.
+        An app mounted inside another one runs no lifespan of its own: run
+        :meth:`lifespan` from the host app's.
         """
         if not isinstance(self._transport, BaseHTTPTransport):
             self._transport = StreamableHTTPTransport(self)
         return self._transport.build_app()
+
+    def lifespan(self) -> contextlib.AbstractAsyncContextManager[None]:
+        """Startup and shutdown of the app :meth:`build_app` returned, for mounting it.
+
+        A Starlette or FastAPI app that mounts ``server.build_app()`` does
+        not run the mounted app's lifespan, so run this from its own::
+
+            @contextlib.asynccontextmanager
+            async def lifespan(app):
+                async with server.lifespan():
+                    yield
+
+            mcp_app = server.build_app()
+            app = Starlette(routes=[Mount("/", mcp_app)], lifespan=lifespan)
+
+        At startup it fetches the OAuth authorization servers' metadata and
+        keys (best effort).  At shutdown it closes the streams and sessions,
+        cancels the requests still running after their grace, gives sync
+        tool threads and cancel callbacks 5 s, and releases the OAuth fetch
+        threads.  ``build_app()``'s own lifespan does exactly this.
+        """
+        transport = self._transport if isinstance(self._transport, BaseHTTPTransport) else None
+        return self._lifespan(transport)
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, transport: BaseHTTPTransport | None) -> AsyncIterator[None]:
+        if transport is not None:
+            transport._reopen()  # an app started again serves anew
+        if self.oauth is not None:
+            await self.oauth.warm_up()
+        try:
+            yield
+        finally:
+            if transport is not None:
+                await transport.close_streams()
+            await self.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
+            if self.oauth is not None:
+                self.oauth.close()
 
     def run(self, transport: Transport | str | None = None) -> None:
         """Start the server (blocking).  Ctrl-C shuts down gracefully.
@@ -1449,6 +1754,7 @@ class MCPServer:
                     "middleware": [describe(fn) for fn in self._request_middleware],
                     "tool_middleware": [describe(fn) for fn in self._tool_middleware],
                     "auth": self.auth is not None,
+                    "oauth": self.oauth is not None,
                     "rate_limit": self._limiter is not None,
                     "debug": self.debug,
                 }
@@ -1479,7 +1785,7 @@ class MCPServer:
         )
 
     def _warn_if_misconfigured(self) -> None:
-        if self.auth is None:
+        if not self.auth_configured:
             protected = [d.name for d in self.tools if d.requires_auth]
             if protected:
                 self._logger.warning(
@@ -1495,5 +1801,37 @@ class MCPServer:
                     "to the network; configure APIKeyAuth",
                     self.host,
                 )
+        if self.oauth is not None:
+            self._warn_about_oauth(self.oauth)
         if self.debug:
             self._logger.warning("debug mode is ON: clients will receive tracebacks")
+
+    def _warn_about_oauth(self, oauth: OAuthResourceServer) -> None:
+        transport = self._transport
+        if isinstance(transport, BaseHTTPTransport):
+            path = urlsplit(oauth.resource).path
+            # The origin is a valid resource for every endpoint of the host.
+            if path and path not in transport._endpoint_paths():
+                self._logger.warning(
+                    "oauth resource %s names the path %r, but the MCP endpoint is %s: tokens "
+                    "must carry the resource clients use. Fine behind a path-rewriting proxy; "
+                    "otherwise set resource to the endpoint's public URL",
+                    oauth.resource,
+                    path,
+                    " and ".join(transport._endpoint_paths()),
+                )
+        for issuer in oauth.authorization_servers:
+            if urlsplit(issuer).scheme == "http":
+                self._logger.warning(
+                    "authorization server %s is reached over plain http (loopback only): "
+                    "use https outside development",
+                    issuer,
+                )
+        if not oauth.step_up:
+            hidden = [d.name for d in self.tools if d.scopes]
+            if hidden:
+                self._logger.info(
+                    "%d tool(s) are hidden from tokens that lack their scope; clients are "
+                    "asked for these scopes up front",
+                    len(hidden),
+                )

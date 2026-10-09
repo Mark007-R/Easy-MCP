@@ -15,7 +15,15 @@ Security handled here (before anything reaches the dispatcher):
 * Browser ``Origin`` headers must be on the allowlist (403 otherwise), the
   DNS-rebinding defense shared with Streamable HTTP.
 * API keys are resolved from ``Authorization: Bearer`` / ``X-API-Key`` and
-  invalid keys are rejected with 401.
+  invalid keys are rejected with 401.  With ``oauth=``, opening a stream and
+  every POST need a valid credential (401 with a challenge otherwise), and a
+  stream is bound to the token's principal.  As in 0.3.1, a POST's session
+  is looked up before its credential, so an unknown ``session_id`` gets 404
+  either way (session ids are unguessable).  The stream itself is not cut
+  when its token expires: it only delivers, and every POST is checked.  A
+  tool call the token lacks a scope for cannot change the ``202`` its POST
+  already got, so it arrives on the stream as a ``-32001`` error with
+  ``data.error = "insufficient_scope"``.
 * Session ids are 192-bit random capability tokens, and every POST must
   present the *same* credential the session was opened with (403 otherwise),
   so a leaked session id alone cannot escalate privileges.
@@ -41,10 +49,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from ..exceptions import PARSE_ERROR, AuthenticationError, RateLimitError
+from ..exceptions import PARSE_ERROR, RateLimitError
 from ..logging import audit
 from ..middleware import TransportInfo
-from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport
+from ._http import BaseHTTPTransport, token_principal
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -73,6 +81,8 @@ class _Session:
     identity_fp: str | None
     queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
     tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # The token principal it is bound to, compared in full (token_principal).
+    principal: tuple[str, str | None, str | None] | None = None
 
 
 class SSETransport(BaseHTTPTransport):
@@ -92,8 +102,22 @@ class SSETransport(BaseHTTPTransport):
         # Set once shutdown closes the streams: nothing new is served after.
         self._closing = False
 
+    _audit_transport = "sse"
+
     def describe(self) -> str:
         return f"sse on {self._server.host}:{self._server.port}"
+
+    def _endpoint_paths(self) -> tuple[str, ...]:
+        return (self._sse_path, self._messages_path)
+
+    def _reserved_paths(self) -> frozenset[str]:
+        return super()._reserved_paths() | {self._sse_path, self._messages_path}
+
+    def _reopen(self) -> None:
+        self._closing = False
+
+    def _invalid_key_response(self) -> Response:
+        return JSONResponse({"error": "invalid API key"}, status_code=401)
 
     # ------------------------------------------------------------------ app
 
@@ -109,16 +133,18 @@ class SSETransport(BaseHTTPTransport):
 
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
-            self._closing = False  # an app built again from this transport serves anew
-            try:
+            # Serves anew (an app built again from this transport), warms up
+            # OAuth, and at the end unblocks every open SSE stream and waits
+            # for tool threads.
+            async with self._server._lifespan(self):
                 yield
-            finally:
-                # Graceful shutdown: unblock every open SSE stream.
-                await self.close_all_sessions()
-                await self._server.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
 
         return Starlette(
-            routes=[*self.routes(), Route("/healthz", self._handle_health, methods=["GET"])],
+            routes=[
+                *self.routes(),
+                Route("/healthz", self._handle_health, methods=["GET"]),
+                *self._metadata_routes(),
+            ],
             middleware=self._middleware(),
             lifespan=lifespan,
         )
@@ -147,10 +173,14 @@ class SSETransport(BaseHTTPTransport):
     async def _handle_sse(self, request: Request) -> Response:
         if self._closing:
             return _shutting_down()
-        try:
-            identity = self._resolve_identity(request)
-        except AuthenticationError:
-            return JSONResponse({"error": "invalid API key"}, status_code=401)
+        resolved = await self._resolve_identity(request, modern=False)
+        if isinstance(resolved, Response):
+            return resolved
+        identity = resolved
+        if self._closing:
+            # Shutdown began while the token was checked: a stream opened now
+            # would never be closed.
+            return _shutting_down()
 
         client_host = request.client.host if request.client else "unknown"
         client_id = identity.fingerprint if identity else f"ip:{client_host}"
@@ -177,6 +207,7 @@ class SSETransport(BaseHTTPTransport):
             id=session_id,
             context=context,
             identity_fp=identity.fingerprint if identity else None,
+            principal=token_principal(identity),
         )
         self._sessions[session_id] = session
         audit("session_open", session_id=session_id, client_id=client_id)
@@ -234,12 +265,12 @@ class SSETransport(BaseHTTPTransport):
 
         # Re-authenticate every POST: the session must not be usable with a
         # different (or missing) credential than it was opened with.
-        try:
-            identity = self._resolve_identity(request)
-        except AuthenticationError:
-            return JSONResponse({"error": "invalid API key"}, status_code=401)
+        resolved = await self._resolve_identity(request, modern=False)
+        if isinstance(resolved, Response):
+            return resolved
+        identity = resolved
         presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp:
+        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
             audit(
                 "session_credential_mismatch",
                 session_id=session_id,
@@ -273,14 +304,34 @@ class SSETransport(BaseHTTPTransport):
         # clients that send one message at a time (a notifications/cancelled
         # could never overtake the slow call it targets).
         info = self._transport_info(request, "sse")
-        task = asyncio.create_task(self._deliver(session, message, info))
+        # This POST's own identity: a refreshed or broader token takes effect
+        # at once, on the same stream.
+        context = self._server._request_context(session.context, identity)
+        task = asyncio.create_task(self._deliver(session, message, info, context=context))
         session.tasks.add(task)
         task.add_done_callback(session.tasks.discard)
         return Response(status_code=202)
 
     async def _deliver(
-        self, session: _Session, message: Any, info: TransportInfo | None = None
+        self,
+        session: _Session,
+        message: Any,
+        info: TransportInfo | None = None,
+        *,
+        context: ClientContext | None = None,
     ) -> None:
-        response = await self._server.dispatch(message, session.context, transport=info)
+        """Dispatch one message and queue its answer on the session's stream.
+
+        *context* is the message's own (the session's, with the identity its
+        POST presented); by default the session's.
+        """
+        if context is None:
+            context = session.context
+        response = await self._server.dispatch(message, context, transport=info)
+        if context is not session.context and context.protocol_version is not None:
+            # An initialize sent with a refreshed token negotiated on the
+            # copy: the session speaks that version from now on.
+            if context.protocol_version != session.context.protocol_version:
+                session.context.protocol_version = context.protocol_version
         if response is not None:
             await session.queue.put(response)

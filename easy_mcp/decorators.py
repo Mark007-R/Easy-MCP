@@ -52,6 +52,9 @@ class ToolDefinition:
     examples: tuple[Mapping[str, Any], ...] = ()
     timeout: float | None = None
     max_calls_per_session: int | None = None
+    #: ``scopes`` in the order given, duplicates removed.  The first is what
+    #: an OAuth step-up challenge asks for, so list the narrowest first.
+    declared_scopes: tuple[str, ...] = ()
 
     def to_mcp(self) -> dict[str, Any]:
         """Serialize this tool for a ``tools/list`` response."""
@@ -100,8 +103,9 @@ def build_tool(
             derived from the return annotation when it describes a JSON
             object; pass ``{}`` to advertise none at all.
         requires_auth: Mark the tool as callable only by authenticated clients.
-        scopes: Scopes an API key must hold to call the tool.  A non-empty
-            value implies ``requires_auth``.
+        scopes: Scopes the caller must hold one of to call the tool.  A
+            non-empty value implies ``requires_auth``.  List the narrowest
+            first: with OAuth, a step-up challenge asks for the first one.
         tags: Free-form labels surfaced to clients in tool metadata.
         category: Optional grouping label surfaced in tool metadata.
         examples: Example invocations, e.g. ``({"arguments": {...}},)``.
@@ -155,7 +159,9 @@ def build_tool(
     else:
         result_schema = output_schema
 
-    scope_set = frozenset(scopes)
+    # Read once: *scopes* may be a one-shot iterator.
+    declared = tuple(dict.fromkeys(scopes))
+    scope_set = frozenset(declared)
     return ToolDefinition(
         name=tool_name,
         description=tool_description,
@@ -174,6 +180,7 @@ def build_tool(
         examples=tuple(dict(example) for example in examples),
         timeout=timeout,
         max_calls_per_session=max_calls_per_session,
+        declared_scopes=declared,
     )
 
 

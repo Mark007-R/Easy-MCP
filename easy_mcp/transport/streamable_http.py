@@ -31,6 +31,15 @@ Security handled here (before anything reaches the dispatcher):
 * API keys are resolved from ``Authorization: Bearer`` / ``X-API-Key`` on
   every request, and a session only answers the credential it was opened
   with (403 otherwise), so a leaked session id alone is useless.
+* With ``oauth=``, every request needs a credential and every access token
+  is verified on every request, sessions included: after the ``Accept``,
+  ``Content-Type``, size and JSON checks, and before the MCP header-mirror
+  checks, the session lookup or dispatch, so an unauthenticated caller
+  learns nothing about headers, sessions or methods.
+  A session is bound to the token's principal rather than the token, so a
+  refreshed or broader token keeps it, and each request runs with the
+  identity its own token grants.  A tool call the token lacks a scope for is
+  answered ``403`` with an ``insufficient_scope`` challenge.
 * Session ids are 192-bit random tokens; idle sessions expire and live ones
   are capped at ``max_sessions``.
 * ``Content-Type`` must be ``application/json`` (415), bodies are size-capped
@@ -57,7 +66,6 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from ..exceptions import (
-    AUTHENTICATION_REQUIRED,
     FORBIDDEN,
     HEADER_MISMATCH,
     INVALID_REQUEST,
@@ -68,7 +76,6 @@ from ..exceptions import (
     SERVER_BUSY,
     TOO_MANY_SESSIONS,
     UNSUPPORTED_PROTOCOL_VERSION,
-    AuthenticationError,
     ProtocolError,
 )
 from ..logging import audit
@@ -81,7 +88,7 @@ from ..protocol import (
     is_modern_request,
 )
 from ..security.auth import ClientIdentity
-from ._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, rpc_error
+from ._http import BaseHTTPTransport, rpc_error, token_principal
 from .base import ClientContext
 from .sse import SSETransport
 
@@ -137,6 +144,8 @@ class _Session:
     opened: bool = False  # whether its handshake succeeded
     # Its messages being dispatched, registered before their dispatch starts.
     dispatches: set[asyncio.Task[Any]] = field(default_factory=set)
+    # The token principal it is bound to, compared in full (token_principal).
+    principal: tuple[str, str | None, str | None] | None = None
 
 
 @dataclass(slots=True)
@@ -278,9 +287,13 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         super().__init__(server)
         if not path.startswith("/"):
             raise ValueError("path must start with '/'")
-        reserved = {"/healthz", "/sse", "/messages"} if legacy_sse else {"/healthz"}
+        reserved = set(self._reserved_paths())
+        if legacy_sse:
+            reserved |= {"/sse", "/messages"}
         if path in reserved:
             raise ValueError(f"path {path!r} collides with another endpoint")
+        if path == "/.well-known" or path.startswith("/.well-known/"):
+            raise ValueError(f"path {path!r} is under /.well-known/, which serves metadata")
         if session_idle_timeout is not None and session_idle_timeout <= 0:
             raise ValueError("session_idle_timeout must be positive or None")
         self._path = path
@@ -292,9 +305,19 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         self._dispatches: set[asyncio.Task[Any]] = set()
         self._closing = False
 
+    _audit_transport = _TRANSPORT
+
     def describe(self) -> str:
         legacy = " (+ legacy sse)" if self._legacy is not None else ""
         return f"streamable-http on {self._server.host}:{self._server.port}{self._path}{legacy}"
+
+    def _endpoint_paths(self) -> tuple[str, ...]:
+        return (self._path,)
+
+    def _reopen(self) -> None:
+        self._closing = False
+        if self._legacy is not None:
+            self._legacy._reopen()
 
     # ------------------------------------------------------------------ app
 
@@ -340,6 +363,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         routes = [
             Route(self._path, self._handle, methods=["GET", "POST", "DELETE"]),
             Route("/healthz", self._handle_health, methods=["GET"]),
+            *self._metadata_routes(),
         ]
         legacy = self._legacy
         if legacy is not None:
@@ -347,14 +371,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         @contextlib.asynccontextmanager
         async def lifespan(app: Starlette) -> Any:
-            self._closing = False  # an app built again from this transport serves anew
-            if legacy is not None:
-                legacy._closing = False
-            try:
+            # Serves anew (an app built again from this transport), warms up
+            # OAuth, and at the end closes streams and waits for threads.
+            async with self._server._lifespan(self):
                 yield
-            finally:
-                await self.close_streams()
-                await self._server.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
 
         return Starlette(routes=routes, middleware=self._middleware(), lifespan=lifespan)
 
@@ -400,16 +420,23 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 "Invalid request: the body must be one JSON-RPC message object "
                 "(batches are not supported)",
             )
-        try:
-            identity = self._resolve_identity(request)
-        except AuthenticationError:
-            return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
+        params = message.get("params")
+        modern = request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
+            isinstance(params, dict) and is_modern_request(message.get("method"), params)
+        )
+        # The tool a tools/call names: a token refused for required_scopes is
+        # asked for its scope in the same challenge, rather than in a second.
+        name = params.get("name") if isinstance(params, dict) else None
+        tool = name if message.get("method") == "tools/call" and isinstance(name, str) else None
+        # Before the MCP header checks, the handshake and the session lookup,
+        # so an unauthenticated caller learns nothing about any of them.
+        resolved = await self._resolve_identity(request, modern=modern, tool=tool)
+        if isinstance(resolved, Response):
+            return resolved
+        identity = resolved
         info = self._transport_info(request, _TRANSPORT)
 
-        params = message.get("params")
-        if request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS or (
-            isinstance(params, dict) and is_modern_request(message.get("method"), params)
-        ):
+        if modern:
             return await self._handle_stateless(message, identity, request, info)
 
         if message.get("method") == "initialize" and "id" in message:
@@ -423,12 +450,15 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # those, so nothing is waiting for it.
             return Response(status_code=202)
 
+        # This request's own identity: a refreshed or broader token takes
+        # effect at once, in the same session.
+        context = self._server._request_context(session.context, identity)
         session.active += 1
         try:
             # A disconnect cancels nothing in this era; ending the session
             # (DELETE) and shutdown do.
             response = await self._dispatch_until_disconnect(
-                message, session.context, request, info, disconnect=False, owner=session
+                message, context, request, info, disconnect=False, owner=session
             )
         except _ShuttingDown:
             if "id" in message:
@@ -441,6 +471,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # A notification, or a request cancelled via notifications/cancelled:
             # MCP sends a reply to neither.
             return Response(status_code=202)
+        challenge = self._step_up_headers(response, identity, modern=False)
+        if challenge is not None:
+            return _json_response(response, headers=challenge, status=403)
         return _json_response(response)
 
     async def _handle_stateless(
@@ -499,6 +532,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return _shutting_down(msg_id)
         if response is None:
             return Response(status_code=202)  # the client hung up: nobody reads it
+        challenge = self._step_up_headers(response, identity, modern=True)
+        if challenge is not None:
+            return _json_response(response, headers=challenge, status=403)
         error = response.get("error")
         code = error.get("code") if isinstance(error, dict) else None
         return _json_response(response, status=_STATELESS_ERROR_STATUS.get(code, 200))
@@ -595,11 +631,12 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         return entry.tool_calls
 
     async def _handle_delete(self, request: Request) -> Response:
-        try:
-            identity = self._resolve_identity(request)
-        except AuthenticationError:
-            return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
-        session = self._session_for(request, identity)
+        # A session era request: it carries its own credential too.
+        modern = request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS
+        resolved = await self._resolve_identity(request, modern=modern)
+        if isinstance(resolved, Response):
+            return resolved
+        session = self._session_for(request, resolved)
         if isinstance(session, Response):
             return session
         self._end_session(session, reason="client_terminated")
@@ -629,6 +666,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity_fp=identity.fingerprint if identity else None,
             last_seen=time.monotonic(),
             active=1,
+            principal=token_principal(identity),
         )
         # Hold the slot while the handshake runs, so concurrent handshakes
         # cannot overshoot max_sessions.
@@ -678,7 +716,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         # The session must not be usable with a different (or missing)
         # credential than it was opened with.
         presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp:
+        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
             audit(
                 "session_credential_mismatch",
                 session_id=session_id,

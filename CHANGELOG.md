@@ -64,6 +64,107 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - Audit events `request_denied`, `tool_result_withheld`, `middleware_failed`
   and `request_cancelled`. `tool_denied` names the middleware that refused,
   when one did.
+- OAuth 2.1 bearer tokens, per the MCP authorization spec, for both protocol
+  eras. `MCPServer(oauth=OAuthResourceServer(resource=..., authorization_servers=[...]))`
+  makes the server an OAuth resource server on Streamable HTTP and SSE. It
+  serves Protected Resource Metadata (RFC 9728) at
+  `/.well-known/oauth-protected-resource` followed by the path of `resource`.
+  A request without a token gets `401` with a
+  `WWW-Authenticate: Bearer resource_metadata="..."` challenge, so clients
+  find the authorization server themselves. Once `oauth=` is set every
+  request needs a credential (`server/discover` and notifications included).
+  It is checked on every request, sessions included. On Streamable HTTP that
+  is after the `Origin`, `Accept`, `Content-Type`, size and JSON checks and
+  before the MCP header checks, the session lookup or any method. On legacy
+  SSE `POST /messages` only the `Origin`, size and unknown-`session_id`
+  (`404`) checks come first: its JSON is parsed after the credential.
+
+  Tokens are verified locally as JWTs against the authorization server's
+  published keys (new `[oauth]` extra, PyJWT 2.15+), or with token
+  introspection (RFC 7662) when `introspection=Introspection(client_id,
+  client_secret)` is passed, which needs no extra. A token must come from a
+  listed authorization server and carry this server in `aud` (RFC 8707), or
+  a value from `audience=`. Only asymmetric algorithms are accepted. `none`,
+  HMAC, keys supplied in the token's header, `crit`, encrypted tokens,
+  proof-of-possession-bound tokens and claims (or introspection answers)
+  nested more than 32 levels deep are refused. Keys are refreshed hourly, in
+  the background from 5 minutes before the hour so that a busy server holds
+  up no request, and when a token names an unknown key, at most once every
+  30 s (that token waits for the fetch). Keys an hour old are not used again
+  before a refresh has been tried (a request waits for it), so a key the
+  authorization server withdraws stops working within the hour. When the
+  authorization server cannot be reached, the keys already fetched stay in
+  use, and once a refresh of keys that old has failed they answer without
+  waiting; a key set that arrives with no usable key withdraws them. With no
+  keys the answer is `503` with `-32008` (`data.reason:
+  "auth_server_unavailable"`) and `Retry-After: 5`, given at once for 5 s
+  after a fetch fails. With introspection, when the authorization server
+  fails a discovery or introspection request, it is not asked again for
+  5 s: meanwhile tokens without a cached answer get that `503` at once, and
+  the failure is logged once. An introspection request shows the server
+  failing when it gets `401` (this server's credentials) or `429`. After
+  any other failure (no answer, a timeout, a `3xx`, `4xx` or `5xx`, or a
+  `2xx` that is not a JSON object or is over 64 KiB) the endpoint is checked
+  with a random token: if that fails too, the server is failing, and no
+  caller is charged for it. Otherwise that token alone fails (`503`, charged
+  to the sender's failed-token budget), so a token that a filter in front of
+  the endpoint blocks or drops cannot shut the others out. An answer nested
+  too deeply to parse is refused as malformed (`401`, cached). At most 8
+  introspection requests are in flight, at most 4 of them for one client
+  address, and each gets a fetch thread at once, so a slow but working
+  authorization server is not taken for a failing one. No fetch (metadata,
+  key set or introspection) lasts more than 5 s, however slowly its answer
+  trickles in.
+
+  Token scopes map onto the existing per-tool `scopes`, which are
+  alternatives: list the narrowest first. A signed-in caller sees every tool,
+  and a call its token does not cover gets `403 insufficient_scope` naming
+  the scope to ask for (`step_up=False` keeps such tools invisible instead).
+  `required_scopes` are needed by every request; on Streamable HTTP a
+  `tools/call` whose token lacks them is also asked for the tool's scope, in
+  the same challenge. Legacy SSE `POST /messages` checks the credential
+  before it reads the body, so its `403` asks only for `required_scopes`; a
+  missing tool scope arrives there as a `-32001` JSON-RPC error on the
+  stream (`data.error = "insufficient_scope"`), not a `403`. A token's `*`
+  scope is never a wildcard. The `401` and `insufficient_scope`
+  `403` bodies carry `-32001`, never `-32002`; a handshake-era session used
+  with another principal's token still gets `403` with `-32002`, as in
+  0.3.1. A token's principal is identified by a 32-hex-digit fingerprint of
+  its issuer, subject and client (the rate-limit and call-count key, and the
+  `client_id` of its audit events), and a session is bound to all three.
+
+  `easy_mcp.current_identity()` gives a tool the verified caller (`subject`,
+  `client_id`, `issuer`, `scopes`, `claims`); the token itself is never
+  exposed. API keys keep working next to tokens. Over stdio OAuth does not
+  apply, as the spec asks. The connectors read `EASY_MCP_OAUTH_*`. New audit
+  events: `auth_failed`, `auth_rate_limited`, `auth_unavailable` and
+  `principal_seen`; `tool_denied` carries the `scope` a step-up asked for.
+- `MCPServer.authenticate_request()` resolves an HTTP request's credential
+  (API key or access token; `client=` names who sent it, as for
+  `OAuthResourceServer.verify()`), and `MCPServer.auth_configured` says
+  whether `auth` or `oauth` is set.
+- `MCPServer.lifespan()`: the startup and shutdown of `build_app()` (OAuth
+  key warm-up; closing streams, cancelling what is left, waiting for tool
+  threads), for apps that mount it and so run no lifespan of its own.
+- `/healthz` reports `"oauth": "ok"` or `"unavailable"` when OAuth is
+  configured (still with status `200`). It is unavailable while no signing
+  keys are cached or, with introspection, while the endpoint is unknown and
+  from the moment the authorization server fails (as above) until a request
+  to it succeeds again.
+- `ClientIdentity` gains `subject`, `client_id`, `issuer`, `expires_at` and
+  `claims`, all empty for API keys. `claims` is a read-only mapping, and an
+  identity can still be copied, pickled and passed to
+  `dataclasses.asdict()`. `ToolDefinition` gains `declared_scopes`,
+  the tool's scopes in the order given. `APIKeyAuth.match()` tries a key
+  without raising, and `SlidingWindowRateLimiter.exceeded()` looks at a
+  budget without spending it.
+- Token checks are rate-limited per client address, with the server's
+  `rate_limit_per_minute` as the budget: every failed check spends a unit,
+  and every check still running holds one. Past it, presented credentials
+  get `429` without being checked, however many arrive at once.
+- Exceptions `TokenRequiredError`, `InvalidTokenError` (`-32001`, `401`),
+  `InsufficientScopeError` (`-32001`, `403`) and `AuthServerUnavailableError`
+  (`-32008`, `503`). No new error codes.
 
 ### Changed
 
@@ -108,6 +209,25 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   as before), and answer new streams and messages `503`. Before, shutdown
   waited for every running request to finish, without a bound for a tool with
   no timeout.
+- In a handshake-era session, each request now runs with the identity its own
+  credential resolves to, rather than the one that opened the session. For
+  API keys the two are always the same. For OAuth it means a refreshed or
+  broader token takes effect at once, in the same session. The session stays
+  bound to the principal that opened it.
+- With `oauth=` set, a stdio server refuses to start when
+  `EASY_MCP_STDIO_API_KEY` is set but no API keys are configured, instead of
+  serving anonymously.
+- With `oauth=` set, tool scopes must be RFC 6749 scope-tokens other than
+  `offline_access` (they appear in `WWW-Authenticate` challenges); such a
+  registration raises `ToolRegistrationError`. Without `oauth=` nothing
+  changes.
+- The GitHub connector's `--allow-write` accepts OAuth as well as API keys on
+  the HTTP transports. With OAuth every signed-in client sees the write
+  tools, and a token without `github:write` is refused with
+  `403 insufficient_scope`. Over stdio, where OAuth does not apply, it still
+  needs `EASY_MCP_API_KEYS`.
+- `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`,
+  where metadata is served.
 
 ### Fixed
 

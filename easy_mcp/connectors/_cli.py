@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..security.auth import APIKeyAuth
+from ..security.oauth import OAuthResourceServer
 from ..server import MCPServer
 
 TRANSPORTS = ("http", "sse", "stdio")
@@ -48,6 +49,13 @@ def auth_from_env(var: str = "EASY_MCP_API_KEYS") -> APIKeyAuth | None:
     return APIKeyAuth.from_env(var)
 
 
+def oauth_from_env(prefix: str = "EASY_MCP_OAUTH_") -> OAuthResourceServer | None:
+    """``OAuthResourceServer`` from ``EASY_MCP_OAUTH_*``, or ``None`` when no resource is set."""
+    if not os.environ.get(prefix + "RESOURCE", "").strip():
+        return None
+    return OAuthResourceServer.from_env(prefix)
+
+
 def run(
     build: Callable[[argparse.Namespace], MCPServer],
     parser: argparse.ArgumentParser,
@@ -57,7 +65,8 @@ def run(
     args = parser.parse_args(argv)
     try:
         server = build(args)
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, ImportError) as exc:
+        # ImportError: EASY_MCP_OAUTH_* asks for JWTs without the [oauth] extra.
         parser.error(str(exc))
     server.run(args.transport)
 
@@ -70,4 +79,5 @@ def server_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "debug": args.debug,
         "rate_limit_per_minute": args.rate_limit or None,
         "auth": auth_from_env(),
+        "oauth": oauth_from_env(),
     }

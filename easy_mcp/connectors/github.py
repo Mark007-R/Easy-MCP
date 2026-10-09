@@ -2,8 +2,13 @@
 
 Read-only by default.  The write tools (``create_issue``,
 ``comment_on_issue``) are registered only when ``enable_write=True`` (CLI:
-``--allow-write``) and are additionally gated by the ``github:write`` scope,
-so a client needs an API key carrying that scope to see or call them.
+``--allow-write``) and are additionally gated by the ``github:write`` scope.
+An API key without that scope neither sees nor calls them.  With OAuth
+(``EASY_MCP_OAUTH_*``, HTTP transports only) every signed-in client sees
+them, and a call from a token without ``github:write`` is refused with
+``403 insufficient_scope`` naming it, so the client can ask for it; pass
+``oauth=OAuthResourceServer.from_env(step_up=False)`` to keep them hidden
+instead.  Over stdio they need an API key.
 
 Cancellation: a request is never started for a tool call that has already
 been cancelled or timed out.  One already sent cannot be taken back, so a
@@ -232,6 +237,7 @@ def build_server(
     api_url: str | None = None,
     enable_write: bool = False,
     client: GitHubClient | None = None,
+    transport: str | None = None,
     **server_options: Any,
 ) -> MCPServer:
     """Build the GitHub connector server.
@@ -242,18 +248,32 @@ def build_server(
         api_url: API base URL; defaults to ``GITHUB_API_URL`` or the public API.
         enable_write: Also register the write tools (``create_issue``,
             ``comment_on_issue``).  They require the ``github:write`` scope,
-            so ``auth`` must be configured for anyone to reach them.
+            so ``auth`` or ``oauth`` must be configured for anyone to reach
+            them.  Either way the connector calls GitHub with its own
+            token, never the client's credential.
         client: Injectable client (tests).
+        transport: The transport the server will run on, when known.
+            ``oauth`` applies to the HTTP transports only, so over
+            ``"stdio"`` the write tools need ``auth``.
         **server_options: Passed to :class:`~easy_mcp.server.MCPServer`.
 
     Raises:
-        ValueError: ``enable_write`` without ``auth``: the write tools would
-            be unreachable, which is almost certainly a misconfiguration.
+        ValueError: ``enable_write`` without ``auth`` or ``oauth`` (over
+            stdio, without ``auth``): the write tools would be unreachable,
+            which is almost certainly a misconfiguration.
     """
-    if enable_write and server_options.get("auth") is None:
+    # The credentials a client of this transport can present.
+    oauth = server_options.get("oauth") if transport != "stdio" else None
+    if enable_write and server_options.get("auth") is None and oauth is None:
+        if server_options.get("oauth") is not None:
+            raise ValueError(
+                "enable_write over stdio requires auth: oauth applies to HTTP transports "
+                f"only, so no stdio client could reach the '{WRITE_SCOPE}' tools "
+                "(set EASY_MCP_API_KEYS)"
+            )
         raise ValueError(
-            "enable_write requires auth: write tools are gated by the "
-            f"'{WRITE_SCOPE}' scope (set EASY_MCP_API_KEYS)"
+            "enable_write requires auth or oauth: write tools are gated by the "
+            f"'{WRITE_SCOPE}' scope (set EASY_MCP_API_KEYS or EASY_MCP_OAUTH_RESOURCE)"
         )
     gh = client or GitHubClient(
         token if token is not None else os.environ.get(TOKEN_ENV_VAR),
@@ -261,7 +281,11 @@ def build_server(
     )
     instructions = "GitHub access. Repositories are addressed as 'owner/name'."
     if enable_write:
-        instructions += f" Write tools need an API key holding the '{WRITE_SCOPE}' scope."
+        credential = "an API key"
+        if oauth is not None:
+            both = server_options.get("auth") is not None
+            credential = "an API key or access token" if both else "an access token"
+        instructions += f" Write tools need {credential} holding the '{WRITE_SCOPE}' scope."
     else:
         instructions = "Read-only " + instructions
     server_options.setdefault("name", "easy-mcp-github")
@@ -478,7 +502,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     def build(args: argparse.Namespace) -> MCPServer:
-        return build_server(enable_write=args.allow_write, **_cli.server_kwargs(args))
+        return build_server(
+            enable_write=args.allow_write, transport=args.transport, **_cli.server_kwargs(args)
+        )
 
     _cli.run(build, parser, argv)
 

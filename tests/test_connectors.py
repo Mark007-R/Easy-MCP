@@ -455,3 +455,100 @@ def test_github_sends_nothing_for_a_cancelled_call() -> None:
     token.cancel()
     with cancel_scope(token), pytest.raises(ToolError, match="not sent"):
         client.request("POST", "/repos/o/r/issues", body={"title": "x"})
+
+
+# ----------------------------------------------------------------- OAuth
+
+OAUTH_ENV = {
+    "EASY_MCP_OAUTH_RESOURCE": "https://mcp.example.com/mcp",
+    "EASY_MCP_OAUTH_AUTHORIZATION_SERVERS": "https://auth.example.com",
+    "EASY_MCP_OAUTH_REQUIRED_SCOPES": "mcp:access",
+}
+
+
+def test_oauth_from_env_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp.connectors import _cli
+
+    monkeypatch.delenv("EASY_MCP_OAUTH_RESOURCE", raising=False)
+    assert _cli.oauth_from_env() is None
+    monkeypatch.setenv("EASY_MCP_OAUTH_RESOURCE", "  ")
+    assert _cli.oauth_from_env() is None
+    args = _cli.build_parser("test").parse_args([])
+    assert _cli.server_kwargs(args)["oauth"] is None
+
+
+def test_oauth_from_env_builds_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp import OAuthResourceServer
+    from easy_mcp.connectors import _cli
+
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("EASY_MCP_API_KEYS", raising=False)
+    oauth = _cli.oauth_from_env()
+    assert isinstance(oauth, OAuthResourceServer)
+    assert oauth.required_scopes == ("mcp:access",)
+    args = _cli.build_parser("test").parse_args(["--port", "0"])
+    server = postgres.build_server(connector=lambda: None, **_cli.server_kwargs(args))
+    assert server.oauth is not None and server.auth is None
+    assert server.auth_configured
+    # A broken setting stops the connector with a usage error, not a traceback.
+    monkeypatch.setenv("EASY_MCP_OAUTH_RESOURCE", "http://example.com/mcp")
+    with pytest.raises(SystemExit):
+        _cli.run(
+            lambda a: postgres.build_server(**_cli.server_kwargs(a)), _cli.build_parser("t"), []
+        )
+
+
+def test_github_allow_write_accepts_oauth(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp import OAuthResourceServer
+
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    oauth = OAuthResourceServer.from_env()
+    server, _ = github_server(enable_write=True, oauth=oauth)
+    names = [definition.name for definition in server.tools]
+    assert {"create_issue", "comment_on_issue"} <= set(names)
+    assert server.instructions is not None
+    assert "an access token holding the 'github:write' scope" in server.instructions
+    both, _ = github_server(enable_write=True, oauth=oauth, auth=APIKeyAuth({WRITE_KEY: "*"}))
+    assert both.instructions is not None and "an API key or access token" in both.instructions
+    keyed, _ = github_server(enable_write=True, auth=APIKeyAuth({WRITE_KEY: "*"}))
+    # API-key-only servers tell clients exactly what they did before.
+    assert keyed.instructions == (
+        "GitHub access. Repositories are addressed as 'owner/name'. "
+        "Write tools need an API key holding the 'github:write' scope."
+    )
+    with pytest.raises(ValueError, match="auth or oauth"):
+        github.build_server(client=FakeGitHub({}), enable_write=True)
+
+
+def test_github_allow_write_over_stdio_needs_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp import OAuthResourceServer
+
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("EASY_MCP_API_KEYS", raising=False)
+    served: list[str] = []
+    monkeypatch.setattr(MCPServer, "run", lambda self, transport="stdio": served.append(transport))
+    # OAuth does not apply over stdio, so no client could reach the write tools.
+    with pytest.raises(SystemExit) as stopped:
+        github.main(["--allow-write", "--transport", "stdio"])
+    assert stopped.value.code == 2
+    assert served == []
+    github.main(["--allow-write", "--transport", "http", "--port", "0"])
+    assert served == ["http"]
+    oauth = OAuthResourceServer.from_env()
+    with pytest.raises(ValueError, match="EASY_MCP_API_KEYS"):
+        github.build_server(
+            client=FakeGitHub({}), enable_write=True, oauth=oauth, transport="stdio"
+        )
+    # With keys as well, stdio clients are told to present a key.
+    keyed = github.build_server(
+        client=FakeGitHub({}),
+        enable_write=True,
+        oauth=oauth,
+        auth=APIKeyAuth({WRITE_KEY: "*"}),
+        transport="stdio",
+    )
+    assert keyed.instructions is not None
+    assert "Write tools need an API key holding" in keyed.instructions

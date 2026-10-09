@@ -44,6 +44,8 @@ pip install easy-mcp-kit
 The package installs as `easy-mcp-kit`; the import name is `easy_mcp`.
 
 Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
+`pip install "easy-mcp-kit[oauth]"` adds PyJWT, to verify OAuth access tokens
+locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 
 ## Why easy_mcp?
 
@@ -54,7 +56,7 @@ Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
 | Validation | Nothing | Rejects unknown fields, wrong types, missing params — before your code runs |
 | Structured results | A return type | Publishes `outputSchema` and answers with `structuredContent` |
 | Rich schemas | A Pydantic model (optional) | The model's own schema and validation, for parameters and results |
-| Auth | `auth=APIKeyAuth({...})` | Constant-time key checks, per-tool scopes, hidden protected tools |
+| Auth | `auth=APIKeyAuth({...})` or `oauth=OAuthResourceServer(...)` | Constant-time key checks, OAuth 2.1 bearer tokens with audience checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Policy & telemetry | `@server.middleware`, `@server.tool_middleware` | Hooks around every request and tool call, after the built-in checks; refuse with an exception |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
@@ -322,6 +324,112 @@ Protected tools are **invisible** to clients that cannot call them — they are
 omitted from `tools/list` and reported as unknown on `tools/call`, so
 unauthorized clients cannot even enumerate them.
 
+### OAuth 2.1 bearer tokens
+
+For people rather than scripts, let an OAuth authorization server issue the
+credentials. The server becomes an OAuth resource server, as the MCP
+authorization spec describes, on Streamable HTTP and SSE, in both protocol
+eras:
+
+```python
+from easy_mcp import MCPServer, OAuthResourceServer
+
+server = MCPServer(
+    host="0.0.0.0",
+    oauth=OAuthResourceServer(
+        resource="https://mcp.example.com/mcp",          # the public URL of this endpoint
+        authorization_servers=["https://auth.example.com"],
+        required_scopes=["mcp:access"],                  # every token must carry these
+    ),
+)
+
+@server.tool(scopes=("files:read", "files:write"))       # narrowest scope first
+def read_file(path: str) -> str:
+    """Read a file."""
+```
+
+`pip install "easy-mcp-kit[oauth]"` adds PyJWT to verify JWT access tokens
+against the authorization server's published keys. Servers whose tokens are
+opaque pass `introspection=Introspection(client_id, client_secret)` instead
+(RFC 7662 token introspection) and need no extra.
+
+What clients see:
+
+- A request without a token gets `401` with
+  `WWW-Authenticate: Bearer resource_metadata="..."`, pointing at the
+  Protected Resource Metadata (RFC 9728) served at
+  `/.well-known/oauth-protected-resource/mcp` (the path of `resource`). MCP
+  clients find the authorization server from there and sign the user in.
+- Every request, sessions included, must carry `Authorization: Bearer <token>`;
+  tokens in query strings or bodies are never read. A token must come from a
+  listed authorization server and name this server in its audience (`aud`).
+  Anything else, an expired token included, gets `401` with
+  `error="invalid_token"`. A session is bound to the signed-in user, not to
+  the token, so a refreshed token keeps it.
+- A tool's `scopes` are alternatives: list the narrowest first and broader
+  scopes after it. A signed-in caller sees every tool. Calling one their token
+  does not cover gets `403 insufficient_scope` naming the scope to ask for
+  (with `required_scopes` too, if the token also lacks them), and the client
+  asks the user for it; the broader token works at once, in the same session.
+  Over legacy SSE the call is answered on the stream instead, with a `-32001`
+  JSON-RPC error whose `data.error` is `"insufficient_scope"`, and the SSE
+  `403` (sent before the body is read) names only `required_scopes`.
+  Pass `step_up=False` to keep protected tools invisible to
+  tokens that cannot call them, as with API keys. A token's `*` scope is never
+  a wildcard.
+- Inside a tool, `current_identity()` tells you who is calling: `subject`,
+  `client_id`, `issuer`, `scopes`, `claims`. The token itself is never handed
+  to your code: use your own credentials for anything the tool calls.
+
+API keys keep working next to tokens (`auth=` and `oauth=` together); a key
+holds its own scopes and `required_scopes` do not apply to it. Over stdio
+OAuth does not apply: the spec has local servers take credentials from the
+environment, so use `EASY_MCP_STDIO_API_KEY` with `auth=`.
+`OAuthResourceServer.from_env()` and the ready-made connectors read
+`EASY_MCP_OAUTH_RESOURCE`, `EASY_MCP_OAUTH_AUTHORIZATION_SERVERS`, and
+optionally `EASY_MCP_OAUTH_AUDIENCE`, `EASY_MCP_OAUTH_REQUIRED_SCOPES`,
+`EASY_MCP_OAUTH_JWKS_URI` and `EASY_MCP_OAUTH_INTROSPECTION_CLIENT_ID` /
+`_CLIENT_SECRET` / `_ENDPOINT`.
+
+Good to know:
+
+- `server/discover` needs a token too (its `401` is what starts sign-in), but
+  its answer is the same for everyone and stays `cacheScope: "public"`. Write
+  `instructions` as public text: never put secrets in them.
+- Signing keys are fetched at startup and refreshed hourly, in the background
+  from 5 minutes before the hour, and when a token names a key the server has
+  not seen, at most once every 30 s. Keys an hour old are not used again
+  before a refresh has been tried (an idle server's next request waits for
+  it), so a withdrawn key stops working within the hour. If the authorization
+  server cannot be reached, the keys already fetched stay in use; with none
+  fetched yet (or a key set that holds no usable key), token requests get
+  `503` and `Retry-After: 5`, and `/healthz` reports `"oauth": "unavailable"`.
+  With introspection, once the authorization server fails a discovery or
+  introspection request it is not asked again for 5 s: tokens without a
+  cached answer get `503` at once meanwhile, and `/healthz` reports
+  `"unavailable"` until a request to it succeeds. Any other failure than a
+  `401` or `429` (a `3xx` or `4xx`, no answer, a timeout, a `5xx`, or a `2xx`
+  that is no JSON object or is over 64 KiB) fails only that token while the
+  endpoint still answers a check with a random token. One client address's
+  tokens take at most 4 of the 8 introspection requests in flight.
+- Token checks are limited per client address with the server's
+  `rate_limit_per_minute`: each failed check spends one unit and each check
+  still running holds one, so past it presented credentials get `429`
+  without being checked, however many arrive at once. A request without any
+  token is never throttled, and an outage of the authorization server is
+  charged to no one.
+- The MCP Python SDK client answers one `401` or `403` per request. A client
+  pinned to `2026-07-28` whose very first request calls a tool needing more
+  than `required_scopes` signs in on that request's `401` and then gets the
+  `403` back as an error; its next call steps up. A client that lists tools
+  (or discovers) first, as clients usually do, steps up on the first call.
+- Mounted inside another app, `build_app()` runs no lifespan of its own: run
+  `async with server.lifespan(): ...` from the host app's, and serve
+  `server.oauth.metadata_path` at the root of the host.
+- Browser-based clients on other origins need CORS headers, which easy_mcp
+  does not send yet; clients behind a proxy (such as the MCP Inspector's) are
+  not affected.
+
 ### Rate limiting, payload caps, timeouts, session limits
 
 ```python
@@ -525,6 +633,9 @@ caller.
 | Middleware refuses with a `ProtocolError` | its code (e.g. `-32001`, `-32003`); on stateless HTTP, `-32020` to `-32022` get HTTP `400` and `-32601` gets `404` |
 | Middleware raises `ToolError` | `isError: true` with your message verbatim (`-32603` with the message outside `tools/call`) |
 | Middleware fails or breaks its contract | `-32603` with `error_id`; the tool does not run if it failed before `call_next()` |
+| No token, or an invalid or expired one (OAuth) | HTTP `401`, `-32001`, with `WWW-Authenticate: Bearer ...` |
+| Token lacks a required or a tool's scope (OAuth) | HTTP `403`, `-32001` with `data.error = "insufficient_scope"` and the scope to ask for; over legacy SSE a missing tool scope arrives on the stream as that `-32001` error, not a `403` |
+| Authorization server unreachable (OAuth) | HTTP `503`, `-32008` with `data.reason = "auth_server_unavailable"`; retry |
 
 In `debug=True` mode (development only) clients receive full tracebacks. The
 `error_id` in production responses matches the server-side log entry that
@@ -556,6 +667,15 @@ answered, with a timeout of its own, say), `middleware_failed` (with its
 `error_id` and `stage`) when one fails or breaks its contract, and
 `request_cancelled` when a request other than `tools/call` is cancelled. None
 of them carries arguments, results, `_meta` or headers.
+
+OAuth adds `auth_failed` (why a token was refused, the client address and a
+fingerprint of the token), `auth_rate_limited`, `auth_unavailable` (the
+authorization server could not be reached) and `principal_seen`, logged once
+per signed-in user and process with the token's issuer, subject and client;
+every other event names that user by fingerprint only (32 hex digits, so no
+client can pick a client id that shares another user's). `tool_denied`
+carries the `scope` a step-up asked for. No event ever holds a token or a
+secret.
 
 ## Connecting a client
 
@@ -623,14 +743,23 @@ MONGODB_URI=mongodb://reader:pass@host/shop easy-mcp-mongodb --port 8014
 ```
 
 All of them take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
-and `--debug`, and load API keys from `EASY_MCP_API_KEYS` when it is set.
+and `--debug`, load API keys from `EASY_MCP_API_KEYS` when it is set, and
+accept OAuth tokens when `EASY_MCP_OAUTH_RESOURCE` is set (see
+[OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 `python -m easy_mcp.connectors.<name>` works as well, and
 each module's `build_server(...)` returns a normal `MCPServer` for embedding.
 
 **GitHub** is read-only by default. `--allow-write` registers `create_issue`
-and `comment_on_issue`, which are gated by the `github:write` scope: only a
-client presenting a key that holds it can see or call them, and starting
-with `--allow-write` but no keys is refused. The token is sent only to
+and `comment_on_issue`, which are gated by the `github:write` scope. A key
+without it neither sees nor calls them. With OAuth every signed-in client
+sees them, and a call from a token without `github:write` gets
+`403 insufficient_scope` naming it, so the client can ask the user for it
+(embedders who want them hidden pass
+`oauth=OAuthResourceServer.from_env(step_up=False)` to `build_server`).
+Starting with `--allow-write` but neither keys nor OAuth is refused, and so
+is `--transport stdio` without keys, since OAuth does not apply over stdio.
+The connector always calls GitHub with its own token, never the
+client's credential. The token is sent only to
 `GITHUB_API_URL` (default `https://api.github.com`) and never appears in logs
 or errors. Use a fine-grained token scoped to the repositories you need.
 No request is sent for a call that has already been cancelled or timed out,
@@ -702,6 +831,8 @@ easy_mcp/
 ├── schema.py        type hints → JSON Schema; docstring parsing; validation
 ├── security/
 │   ├── auth.py      APIKeyAuth (constant-time), scopes, visibility rules
+│   ├── oauth.py     OAuthResourceServer: token checks, resource metadata
+│   ├── _fetch.py    outbound HTTP for OAuth (https only, no redirects, size caps)
 │   └── ratelimit.py sliding-window per-client rate limiter
 ├── transport/
 │   ├── base.py      Transport ABC + ClientContext
@@ -747,10 +878,14 @@ prefer returning compact structures over huge strings.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
 - Browser-based clients on other origins must be listed in `allowed_origins`.
+- With OAuth, set `resource` to the exact URL clients use, and behind a proxy
+  forward `/.well-known/oauth-protected-resource/...` to the server too.
 - For multiple workers: stateless (`2026-07-28`) requests can go to any worker.
   Handshake-era sessions are not shared across processes — run one process,
   or route each `MCP-Session-Id` to the same worker. Rate limits and
-  `max_calls_per_session` counters are per process either way.
+  `max_calls_per_session` counters are per process either way, and so are
+  OAuth key and introspection caches, the failed-token throttle and
+  `principal_seen`.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development

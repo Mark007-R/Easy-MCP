@@ -32,7 +32,14 @@ Consequences:
 | Credential stuffing / key probing | Constant-time comparison of SHA-256 digests over the full key set (`hmac.compare_digest`); timing reveals neither partial matches nor key length |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
-| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise) |
+| Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP POST/DELETE) must present the same credential the session was opened with (403 otherwise); with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal, comparing its issuer, subject and client in full; the principal's fingerprint (the rate-limit and call-count key) is 128 bits, so no client can grind a client id that shares another's |
+| Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
+| JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
+| Token passthrough | Tools and middleware never receive the token (`Authorization` is withheld from middleware); `current_identity()` exposes only verified fields; the GitHub connector uses its own credential |
+| Credential spraying against token verification | Token checks are rate-limited per client address: failed checks and checks still running share the `rate_limit_per_minute` budget, and past it a credential gets `429` without verification, however many arrive at once; key refreshes are bounded to one per 30 s per issuer; introspection is cached, shared between concurrent lookups and capped at 8 in flight (at most 4 for one client address), each with a fetch thread of its own, which no answer, however slowly it trickles in, holds past 5 s; once the authorization server itself fails, it is asked again at most every 5 s (`503` meanwhile, cached keys and answers still used, and no caller charged for its outage). A `401` for this server's credentials or a `429` is a failure of the server. So is any other failure (no answer, a timeout, a `3xx`, `4xx` or `5xx`, a `2xx` that is not a JSON object or is oversized), but only if the endpoint also fails a check with a random token (one at a time): a filter in front of it can do any of these to one token, by dropping or redirecting it or answering with a blocking page. Otherwise only the token sent fails, and it spends a unit of its sender's budget, so no token can shut the others out; an answer nested too deeply to parse is refused as malformed |
+| Refresh tokens, ID tokens and bound tokens used as access tokens | Introspected `token_type` must be an access token; `typ` other than `at+jwt`/`JWT` refused; `aud` must be this server; tokens with `cnf` (DPoP, mTLS) refused |
+| Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch however slowly the answer arrives |
+| Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
 | Header/body disagreement (stateless HTTP) | A proxy may route or rate-limit on the mirrored `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers while the server executes the body, so the server rejects any request whose headers are missing, repeated or disagree with its body (`400`, `-32020`); Base64-encoded names are decoded before comparing. A message without an `id` never runs a method (no header checks apply to it), and the client notifications this revision leaves undefined over HTTP, `notifications/cancelled` included, are ignored, so one caller cannot cancel another's call |
 | DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
@@ -52,7 +59,17 @@ Consequences:
 - **Streamable HTTP** and legacy **SSE** — clients are remote and untrusted;
   credentials arrive in headers, sessions are capability tokens bound to the
   credential that opened them, browsers are held to the `Origin` allowlist,
-  and every protection above applies.
+  and every protection above applies. With `oauth=`, every request needs a
+  valid credential, checked before the MCP header checks
+  (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), `initialize`, the
+  Streamable HTTP session lookup and any method. A few checks come first and
+  are answered without one. On Streamable HTTP: the `Origin` allowlist
+  (`403`), `Accept`, `Content-Type`, body size and JSON parsing (`406`,
+  `415`, `413`, `400`) and `GET /mcp` (`405`). On legacy SSE
+  `POST /messages`: the `Origin` allowlist, body size and an unknown
+  `session_id` (`404`) only; its JSON is parsed after the credential, so an
+  unparseable body without a valid token gets `401`. Only the Protected
+  Resource Metadata and `/healthz` serve anything without a credential.
 - **stdio** — the client is the *parent process* that launched the server
   (a desktop app, a CLI agent, an agent runtime). There is no network
   surface, but the parent is still treated as an MCP client: schema
@@ -60,7 +77,9 @@ Consequences:
   sanitization all apply unchanged. Protected tools stay hidden unless the
   parent presents a valid key via `EASY_MCP_STDIO_API_KEY`. Anything the
   parent can pass as environment it can also read, so a stdio key is a
-  scoping mechanism, not a secret from the host itself.
+  scoping mechanism, not a secret from the host itself. OAuth does not apply
+  over stdio, as the MCP spec asks; a server with `oauth=` and no API keys
+  refuses to start when a stdio key is set, rather than serving anonymously.
 
 ## Middleware
 
@@ -70,9 +89,10 @@ request and tool call. The same trust model applies to them as to tools:
 - **Middleware is trusted code**, like tools. It runs in the server process,
   on the event loop.
 - **What it sees:** validated tool arguments, the request's `_meta`, the
-  caller's key fingerprint and scopes, and the HTTP request's headers with
-  credentials removed (`Authorization`, `Proxy-Authorization`, `X-API-Key`,
-  `Cookie`, `MCP-Session-Id`). Credentials are withheld so that a middleware
+  caller's key fingerprint and scopes (for an OAuth token, also its verified
+  subject, client, issuer and claims, never the token), and the HTTP
+  request's headers with credentials removed (`Authorization`,
+  `Proxy-Authorization`, `X-API-Key`, `Cookie`, `MCP-Session-Id`). Credentials are withheld so that a middleware
   cannot forward them; the MCP authorization spec forbids passing a client's
   token through to another service.
 - **What it cannot do:** skip or reorder a built-in check, grant access, change
@@ -115,8 +135,11 @@ the client is untrusted, the credential in the environment is trusted.
 - **GitHub** — give it a fine-grained token limited to the repositories and
   permissions the tools need (contents, issues, pull requests: read). Write
   tools exist only with `--allow-write` and are hidden from every client whose
-  API key lacks the `github:write` scope; starting with `--allow-write` and no
-  keys is refused. The token is sent only to `GITHUB_API_URL` and never logged.
+  API key lacks the `github:write` scope (with OAuth, a token lacking it is
+  refused); starting with `--allow-write` and neither keys nor OAuth is
+  refused, and so is starting it over stdio without keys, since OAuth does
+  not apply there. The token is sent only to `GITHUB_API_URL` and never
+  logged, and the client's own credential never reaches GitHub.
 - **Postgres** — statements run in `READ ONLY` transactions with
   `default_transaction_read_only=on` at session level, a statement timeout and
   a row cap, so `INSERT`/`UPDATE`/`DDL` fail at the database. That does not
@@ -179,8 +202,9 @@ the client is untrusted, the credential in the environment is trusted.
   shutdown begins and get no answer. Over Streamable HTTP it gives running
   `/mcp` requests 5 s to finish (a forced exit cuts that short) and then
   cancels them, answering each `503` with `-32008`. A mounted `build_app()`
-  gets no lifespan at all, so the host app must call `wait_for_tool_threads`
-  on shutdown. Threads a sync tool starts itself are daemons as well, because
+  gets no lifespan at all, so the host app must run `server.lifespan()` from
+  its own (it closes the streams, waits for the threads and, with OAuth,
+  fetches the signing keys at startup). Threads a sync tool starts itself are daemons as well, because
   they inherit the flag, and nothing waits for them. Pass `daemon=False` for
   work that must finish.
 - **A MongoDB cancel reaches only the primary, and only calls with a
@@ -198,7 +222,39 @@ the client is untrusted, the credential in the environment is trusted.
   routing, but rate limits and per-client call caps are still counted per
   process.
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
-  values; OAuth2 support is on the roadmap.
+  values; for rotating, audience-bound credentials use `oauth=`.
+- **A JWT access token stays valid until it expires, even if it is revoked.**
+  With introspection, a revoked token is refused at most 60 s after
+  revocation. Keep access tokens short-lived. A token's expiry during a
+  running call does not cancel the call.
+- **Proof-of-possession tokens (DPoP, mTLS-bound) are refused** rather than
+  verified: this server cannot check the proof.
+- **Over legacy SSE a missing tool scope arrives as a JSON-RPC error, not a
+  `403`.** The POST has already been answered `202`, so SSE clients get no
+  step-up challenge.
+- **When the authorization server cannot be reached, cached signing keys stay
+  in use**, without a time limit. While it answers, a key removed from its key
+  set stops working within an hour: the hourly refresh starts 5 minutes
+  early, and keys an hour old are not used again before a refresh has been
+  tried (a request waits for it). Only once a refresh of keys that old has
+  failed do they keep answering while later ones are tried in the
+  background, at most every 30 s. A key set that arrives empty, or with no
+  key this server can use, withdraws every cached key: tokens then get `503`
+  until it publishes a usable one.
+- **On Streamable HTTP with step-up, a token that lacks `required_scopes`
+  learns whether a tool it calls exists**: the `403` that asks for the
+  required scopes also names the tool's scope, so one sign-in covers the
+  call. Such a token still comes from a trusted issuer for this audience, and
+  would learn the same after one step-up; `step_up=False` keeps tools hidden.
+  Legacy SSE checks the credential before it reads the body, so its `403`
+  names only `required_scopes`.
+- **OAuth caches and the failed-token throttle are per process.** Each worker
+  fetches its own keys and counts failures on its own; behind a proxy, all
+  clients share the proxy's address for that throttle, as for anonymous rate
+  limiting.
+- **No CORS headers yet.** A browser-based client on another origin cannot
+  read `WWW-Authenticate` or the metadata cross-origin; clients behind a proxy
+  are not affected.
 - **Middleware is not covered by tool timeouts.** A tool's `timeout` bounds the
   tool function only; a middleware must bound its own awaits.
 - **Some messages never reach middleware.** Requests the transport rejects,
@@ -206,11 +262,12 @@ the client is untrusted, the credential in the environment is trusted.
   before any middleware runs, and only some of them are audited: rate-limited
   messages (`rate_limited`), refused browser origins (`origin_rejected`),
   stateless header mismatches (`header_mismatch`), session credential
-  mismatches (`session_credential_mismatch`) and oversized stdio lines
-  (`payload_too_large`). An invalid API key, unparseable JSON, a wrong
-  `Content-Type`, an oversized HTTP body, a missing or unknown session, a
-  malformed message and an unknown method leave no audit event; count them at
-  your proxy if you need them.
+  mismatches (`session_credential_mismatch`), oversized stdio lines
+  (`payload_too_large`) and, with OAuth, refused tokens (`auth_failed`) and
+  throttled addresses (`auth_rate_limited`). An invalid API key, a request
+  without a token, unparseable JSON, a wrong `Content-Type`, an oversized
+  HTTP body, a missing or unknown session, a malformed message and an unknown
+  method leave no audit event; count them at your proxy if you need them.
 - **A refusal after the tool ran cannot undo it.** A middleware that raises
   after `call_next()` replaces the answer, but the tool's side effects stand;
   this is audited as `tool_result_withheld`.
@@ -232,6 +289,8 @@ easy_mcp for sandboxing:
 
 - [ ] `debug=False` (the default) in production.
 - [ ] Auth configured (`APIKeyAuth.from_env()`), keys ≥ 32 random characters.
+- [ ] With OAuth, `resource` is the exact public URL clients use, and the metadata path (`/.well-known/oauth-protected-resource/...`) reaches the server.
+- [ ] Access tokens are short-lived and audience-restricted at the authorization server; `instructions` hold nothing secret (`server/discover` answers are public).
 - [ ] TLS terminated in front of the server.
 - [ ] `allowed_origins` lists only the browser origins that should reach the server (default: loopback).
 - [ ] Rate limit and `max_request_bytes` tuned to your workload.

@@ -11,6 +11,7 @@ Two kinds of errors exist:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 # --- Standard JSON-RPC 2.0 error codes --------------------------------------
@@ -123,3 +124,102 @@ class ServerBusyError(ProtocolError):
     """Every worker thread for sync tools is occupied; retry shortly."""
 
     code = SERVER_BUSY
+
+
+# --- OAuth (MCPServer(oauth=...)) ---------------------------------------------
+
+# What a client is told about a refused token: fixed strings only, so nothing
+# from the token (or the reason it failed) can reach a response.
+_TOKEN_DESCRIPTIONS = {
+    "expired": "The access token expired",
+    "wrong_audience": "The access token was not issued for this resource",
+}
+
+
+class TokenRequiredError(AuthenticationError):
+    """No credential was presented, and the server requires one (``oauth=`` is set)."""
+
+    def __init__(self, message: str = "Authentication required") -> None:
+        super().__init__(message)
+
+
+class InvalidTokenError(AuthenticationError):
+    """An access token failed verification.
+
+    Attributes:
+        reason: Why, for the audit log: ``malformed``, ``too_large``,
+            ``encrypted``, ``unsupported_alg``, ``bad_type``, ``crit``,
+            ``unknown_key``, ``bad_key``, ``bad_signature``, ``expired``,
+            ``not_yet_valid``, ``wrong_issuer``, ``wrong_audience``,
+            ``missing_claims``, ``bound_token``, ``inactive`` or
+            ``wrong_token_type``.
+        description: A fixed text safe to send to the client; it never holds
+            anything taken from the token.
+        issuer: The token's issuer, only when it is a configured one.
+    """
+
+    def __init__(self, reason: str, *, issuer: str | None = None) -> None:
+        self.reason = reason
+        self.issuer = issuer
+        self.description = _TOKEN_DESCRIPTIONS.get(reason, "The access token is invalid")
+        super().__init__("Invalid access token")
+
+
+class InsufficientScopeError(AuthorizationError):
+    """A valid access token lacks a scope the request needs.
+
+    ``scopes`` are the scopes to ask for, narrowest first.  The error carries
+    ``-32001`` rather than :data:`FORBIDDEN`, which the stateless revision
+    forbids, and ``data = {"error": "insufficient_scope", "scope": ...}``;
+    over Streamable HTTP it becomes ``403`` with a ``WWW-Authenticate``
+    challenge naming them.
+    """
+
+    code = AUTHENTICATION_REQUIRED
+
+    def __init__(
+        self,
+        scopes: Iterable[str],
+        message: str = "Insufficient scope",
+        *,
+        granted: Iterable[str] = (),
+    ) -> None:
+        self.scopes = tuple(scopes)
+        # What the token already holds, for the challenge of older clients,
+        # which do not add it to their next request themselves.  Never sent
+        # as it is.
+        self.granted = frozenset(granted)
+        super().__init__(
+            message, data={"error": "insufficient_scope", "scope": " ".join(self.scopes)}
+        )
+
+
+class AuthServerUnavailableError(ProtocolError):
+    """The authorization server's metadata, keys or introspection could not be reached.
+
+    ``-32008`` with ``data.reason = "auth_server_unavailable"``: the token may
+    well be fine, so the client should retry rather than sign in again.  Not
+    a :class:`ServerBusyError`, so code that refunds busy calls never catches it.
+
+    ``sent_request`` is set when this token was sent for introspection and
+    that request failed in a way the token itself may have caused.  Such a
+    failure is charged to the caller's failed-authentication budget, since a
+    token can be made to fail it.  It is not set when the failure turned out
+    to be an outage of the authorization server, nor for a refusal during an
+    outage window, which sends nothing.
+    """
+
+    code = SERVER_BUSY
+
+    def __init__(
+        self,
+        message: str = "Authorization server unavailable; retry shortly",
+        *,
+        issuer: str | None = None,
+        stage: str | None = None,
+        sent_request: bool = False,
+    ) -> None:
+        self.issuer = issuer
+        self.stage = stage
+        self.sent_request = sent_request
+        super().__init__(message, data={"reason": "auth_server_unavailable"})
