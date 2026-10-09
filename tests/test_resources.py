@@ -845,15 +845,31 @@ def test_safe_path_allows_inside_and_refuses_escapes(tmp_path: Path) -> None:
 async def test_safe_path_in_a_resource_reads_as_not_found(tmp_path: Path) -> None:
     (tmp_path / "doc.md").write_text("hello", "utf-8")
     server = make_server()
+    calls: list[str] = []
+    refused: list[str] = []
 
     @server.resource("docs://{+path}")
     def doc(path: str) -> str | None:
-        file = safe_path(tmp_path, path)
+        calls.append(path)
+        try:
+            file = safe_path(tmp_path, path)
+        except ResourceNotFoundError:
+            refused.append(path)
+            raise
         return file.read_text("utf-8") if file.is_file() else None
 
     assert text_of(await call(server, read("docs://doc.md"))) == "hello"
+    assert calls == ["doc.md"] and refused == []
+    # The template guard lets these through; safe_path() refuses them in the function.
+    for path in ("C:/Windows/win.ini", "C:secret"):
+        response = await call(server, read(f"docs://{path}"))
+        assert calls[-1] == path and refused[-1] == path, path
+        assert response["error"]["code"] == LEGACY_NOT_FOUND, path
+    assert len(calls) == 3 and len(refused) == 2
+    # A backslash never reaches the function: the template guard refuses it first.
     response = await call(server, read("docs://nested%5C..%5Cdoc.md"))
     assert response["error"]["code"] == LEGACY_NOT_FOUND
+    assert len(calls) == 3
 
 
 # ----------------------------------------------------------------- stateless era

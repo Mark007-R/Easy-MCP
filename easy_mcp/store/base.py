@@ -117,9 +117,10 @@ class SessionRecord:
     ``t0`` is when the session was opened, in milliseconds since the epoch:
     by the opening worker's clock in the record it files, and by the
     store's own clock in a record a shared store returns.  ``baselines``
-    are ``(list kind, digest)`` pairs: what the session's client was last
-    told each list holds (:meth:`Store.save_baselines`), ``None`` before
-    anything was recorded.  ``subscriptions`` are the resource URIs the
+    are ``(list kind, digest)`` pairs, one for each list the session's
+    ``initialize`` offered changes of: what its client was last told the
+    list holds (:meth:`Store.save_baselines`), ``None`` before anything was
+    recorded.  ``subscriptions`` are the resource URIs the
     session is subscribed to (``resources/subscribe``), sorted; ``None``
     or empty when there are none.
     """
@@ -321,11 +322,13 @@ class Store(abc.ABC):
         """Record what a session's client was last told its lists hold.
 
         *baselines* maps a list kind (``"tools"``) to a digest of the list
-        (32 hex characters).  The session's ``initialize`` records them, and
-        so does the end of its ``GET /mcp`` stream; the worker that opens
-        its next stream announces every list whose digest differs.  The
-        record returned by :meth:`acquire_session` carries them.  A session
-        that is gone, or of another kind, is left alone.
+        (32 hex characters, or empty when what the client holds is not
+        known), for every list the session's ``initialize`` offered changes
+        of.  The session's ``initialize`` records them, and so does the end
+        of its ``GET /mcp`` stream; the worker that opens its next stream
+        watches those lists only, and announces every one whose digest
+        differs.  The record returned by :meth:`acquire_session` carries
+        them.  A session that is gone, or of another kind, is left alone.
 
         The default records nothing: a session's stream then announces only
         the changes made while it is open.

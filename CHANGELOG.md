@@ -359,7 +359,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - The prompts and resources lists are announced like the tool list
   (`notifications/prompts/list_changed`, `notifications/resources/list_changed`,
   which covers templates too, and the listen filter's `promptsListChanged`
-  and `resourcesListChanged`).
+  and `resourcesListChanged`). A session opened with `initialize` hears only
+  of the lists its handshake offered, on every transport (a Streamable HTTP
+  session's `GET /mcp` stream included, on whichever worker it opens): one
+  opened before the first prompt or resource was registered is never told
+  of those lists.
 - Audit events `resource_read` and `prompt_get` (never with contents or
   argument values; URIs cut to 512 characters), `resource_subscribe`,
   `resource_unsubscribe`, `resource_finished_after_cancel`,

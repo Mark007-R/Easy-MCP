@@ -671,3 +671,78 @@ def _sse_session(server: MCPServer) -> str:
     legacy = transport._legacy  # type: ignore[attr-defined]
     (session_id,) = legacy._sessions
     return str(session_id)
+
+
+# ------------------------------------------ the lists a session's handshake offered
+
+TOOLS_CHANGED = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+
+
+def add_tool(server: MCPServer, name: str) -> None:
+    def tool() -> str:
+        """A tool registered at runtime."""
+        return name
+
+    server.register_tool(tool, name=name)
+
+
+def add_prompt_and_resource(server: MCPServer, name: str) -> None:
+    """The first of either advertises its capability, with listChanged."""
+    server.register_prompt(lambda: "x", name=name)
+    server.register_resource(lambda: "x", f"late://{name}", name=name)
+
+
+async def test_a_get_stream_announces_only_the_lists_its_handshake_offered(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)  # tools only
+    base = live_server(server)
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base)
+        # Advertised from now on, but never negotiated with this session.
+        add_prompt_and_resource(server, "late")
+        stream = await get_stream(client, base, session)
+        await stream.quiet()
+        add_prompt_and_resource(server, "later")
+        await stream.quiet()
+        await stream.aclose()
+        # A stream opened again, from what the last one recorded, holds to them too.
+        again = await get_stream(client, base, session)
+        await again.quiet()
+        add_prompt_and_resource(server, "latest")
+        await again.quiet()
+        add_tool(server, "extra")  # the list it was offered is still announced
+        assert await again.next() == TOOLS_CHANGED
+        await again.quiet()
+        await again.aclose()
+
+
+async def test_a_get_stream_on_another_worker_announces_only_the_lists_offered(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    hub = FakeHub()
+    workers = []
+    for name in ("a" * 16, "b" * 16):
+        server = MCPServer(port=0, rate_limit_per_minute=None, store=hub.store(name))
+        workers.append((server, live_server(server)))
+    (server_a, base_a), (server_b, base_b) = workers
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base_a)
+        for server, _ in workers:  # the change runs in every worker, as the docs ask
+            add_prompt_and_resource(server, "late")
+        stream = await get_stream(client, base_b, session)
+        await stream.quiet()
+        for server, _ in workers:
+            add_prompt_and_resource(server, "later")
+        await stream.quiet()
+        for server, _ in workers:
+            add_tool(server, "extra")
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.quiet()
+        await stream.aclose()
+        # Its end recorded what it told, for the lists offered only.
+        told = server_b._list_digest("tools", None)
+        await until(lambda: records(hub)[0].baselines == (("tools", told),))
+        again = await get_stream(client, base_a, session)
+        await again.quiet()
+        await again.aclose()

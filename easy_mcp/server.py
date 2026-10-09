@@ -2440,13 +2440,16 @@ class MCPServer:
         return digest
 
     def _list_baselines(self, identity: ClientIdentity | None) -> dict[str, str]:
-        """The digest of every announced list as *identity* sees it now.
+        """The digest of every announced list as *identity* sees it now, for a handshake.
 
-        A list whose digest cannot be computed is left out, and logged: its
-        recipient is not told about that list, rather than the handshake or
-        stream that asked failing.
+        Every list whose changes the handshake's result offers has an entry;
+        one whose digest cannot be computed has an empty digest, and is
+        logged: rather than the handshake failing, a stream announces it
+        once it can be computed.
         """
-        return self._notifier.baselines(self._list_kinds(), identity)
+        kinds = self._list_kinds()
+        digests = self._notifier.baselines(kinds, identity)
+        return {kind: digests.get(kind, "") for kind in kinds}
 
     def _watch_session(
         self,
@@ -2463,15 +2466,22 @@ class MCPServer:
         """Announce list changes to the session *key* through *push* from now on.
 
         On the loop that delivers to it.  *baselines* is what its client was
-        last told the lists hold; by default the lists as they are now, which
-        is right just before its ``initialize`` result is sent (its client
-        lists after that).  A list that differs from its baseline is
-        announced at once.  A list whose digest cannot be computed is not
-        watched (:meth:`_list_baselines`).  Updates of the resources the
-        session is subscribed to go there too: *subscriptions*, read from
-        the session's record in the store, or those this process holds.
+        last told the lists hold, one entry for each list its ``initialize``
+        offered changes of (an empty digest where what its client holds is
+        not known), and only those lists are watched: a capability added
+        since was never negotiated with it.  By default, the lists as they
+        are now, which is right just before its ``initialize`` result is
+        sent (its client lists after that).  A list that differs from its
+        baseline is announced at once.  A list whose digest cannot be
+        computed now is not watched (and is logged).  Updates of the
+        resources the session is subscribed to go there too:
+        *subscriptions*, read from the session's record in the store, or
+        those this process holds.
         """
-        current = self._list_baselines(identity)
+        kinds = self._list_kinds()
+        if baselines is not None:
+            kinds = tuple(kind for kind in kinds if kind in baselines)
+        current = self._notifier.baselines(kinds, identity)
         sink = self._notifier.watch_session(
             key,
             push=push,

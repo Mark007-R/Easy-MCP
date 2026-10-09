@@ -201,7 +201,8 @@ async def test_methods_belong_to_their_era() -> None:
 
 async def test_listen_validation() -> None:
     server = make_server()
-    context = make_context(push=Pushed())
+    pushed = Pushed()
+    context = make_context(push=pushed)
     bad = [
         {"resourceSubscriptions": "config://app"},
         {"resourceSubscriptions": ["config://app", 3]},
@@ -209,10 +210,14 @@ async def test_listen_validation() -> None:
     for wanted in bad:
         response = await server.dispatch(listen("l", **wanted), context)
         assert response is not None and response["error"]["code"] == INVALID_PARAMS, wanted
-    # The cap is a limit, as the per-session one is (-32007, HTTP 503).
+    # The cap is a limit, as the per-session one is (-32007, HTTP 503).  Bounded:
+    # a listen the cap let through would wait for its stream's end, which never comes.
     many = [f"items://{i}" for i in range(MAX_RESOURCE_SUBSCRIPTIONS + 1)]
-    response = await server.dispatch(listen("l", resourceSubscriptions=many), context)
+    response = await asyncio.wait_for(
+        server.dispatch(listen("l", resourceSubscriptions=many), context), 5
+    )
     assert response is not None and response["error"]["code"] == TOO_MANY_SESSIONS
+    assert pushed.frames == []  # no acknowledgment either
     assert server._notifier.count() == 0
 
 

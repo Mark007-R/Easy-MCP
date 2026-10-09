@@ -424,7 +424,9 @@ The server announces tool-list changes on every transport, and advertises
 resource lists are announced the same way (`prompts.listChanged`,
 `resources.listChanged`; templates count as resources) once the first prompt
 or resource is registered. A capability, once advertised, stays: a kind
-emptied later lists empty. Clients that
+emptied later lists empty. A session opened with `initialize` hears only of
+the lists its handshake offered, so one opened before the first prompt or
+resource was registered is never told of those lists. Clients that
 open with `initialize` get `notifications/tools/list_changed` on their
 session's channel once the handshake is answered: stdout over stdio, the
 `/sse` stream, or over Streamable HTTP a `GET /mcp` stream carrying the
