@@ -137,13 +137,16 @@ class ExpiredSession:
     ``client_id`` and ``t0`` (when it was opened) are ``None`` when the store
     no longer knows them: a shared store's record lapses with its TTL, and
     only the session's ref is left.  ``session_id`` is kept only by a store
-    that stays in this process.
+    that stays in this process.  ``lost`` marks a session a shared store
+    found gone without a trace rather than expired: lost in a failover or a
+    restart, so nobody audited its close (:meth:`Store.refresh_sessions`).
     """
 
     ref: str
     client_id: str | None
     session_id: str | None = None
     t0: int | None = None
+    lost: bool = False
 
 
 class AsyncRateLimiter(Protocol):
@@ -293,11 +296,16 @@ class Store(abc.ABC):
         """Extend the life of sessions still in use here by *ttl*.
 
         A session that expired meanwhile is removed, as :meth:`create_session`
-        removes the expired sessions it finds.
+        removes the expired sessions it finds.  A shared store remembers for
+        a while which sessions were removed, so it can tell one that another
+        call removed (and audited) from one it lost without a trace, in a
+        failover or a restart.
 
         Returns:
             The refs of those that no longer exist, and among them the
-            sessions this call found expired and removed.
+            sessions whose close this call is to audit: those it found
+            expired and removed, and those it found lost (``lost``), which
+            no other call reports from then on.
         """
 
     @abc.abstractmethod
@@ -307,10 +315,12 @@ class Store(abc.ABC):
         Whoever removes a session audits its close, so a store says whether
         this call did.  An expired session the store still holds counts (a
         shared store's index outlives the record): :meth:`create_session`
-        would otherwise find it expired, and remove it, later.
+        would otherwise find it expired, and remove it, later.  So does one
+        a shared store lost without a trace (see :meth:`refresh_sessions`):
+        nobody else will audit it.
 
         Returns:
-            Whether this call removed it (``False``: it was gone already).
+            Whether this call removed it (``False``: another call did).
         """
 
     # ------------------------------------------------- max_calls_per_session

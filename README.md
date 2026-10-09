@@ -364,13 +364,17 @@ holding its stream is still accepted (`202`), but the answer on the stream
 is the same `-32008` unless rate limiting is off and the tool it calls has
 no `max_calls_per_session`.
 
-Give Redis TLS (`rediss://`), a user limited to the `easy-mcp:` keys and
-channels (the ACL is in [SECURITY.md](SECURITY.md)), and the default
-`noeviction` memory policy. Servers that share one Redis need different
-`name=`s, since the name is the store's namespace, or an explicit
-`RedisStore(..., namespace=...)`. `RedisStore.from_client(client)` takes a
-`redis.asyncio` client you configured yourself (a custom TLS context, a
-Sentinel master); Redis Cluster is not supported. Client options may follow
+The store needs Redis 7.0 or later: an older Redis reports a write refused
+inside a script (Redis full, read-only or failing to persist) as a generic
+error, which is answered as an internal error rather than `503`. Give Redis
+TLS (`rediss://`), a user limited to the `easy-mcp:` keys and channels (the
+ACL is in [SECURITY.md](SECURITY.md); as written it needs Redis 7.2 or
+later), and the default `noeviction` memory policy. Servers that share one
+Redis need different `name=`s, since the name is the store's namespace, or
+an explicit `RedisStore(..., namespace=...)`.
+`RedisStore.from_client(client)` takes a `redis.asyncio` client you
+configured yourself (a custom TLS context, a Sentinel master); Redis Cluster
+is not supported. Client options may follow
 in the URL's query string (`?socket_timeout=5`); the defaults are 2 s
 timeouts and 64 connections per worker. `--proxy-headers` with
 `--forwarded-allow-ips` lets anonymous clients be told apart by their own
@@ -780,7 +784,9 @@ stdio sessions are audited as open before their `initialize` arrives, so
 theirs carries none. The raw `session_id` is still there, but is dropped from
 audit events in 0.4: key log processing on `session_ref`. With a shared
 store, session events carry the `worker` that logged them (a session's
-close is logged once, by the worker that removes it from the store),
+close is logged once, by the worker that removes it from the store or, if
+the store lost it, by the worker serving it: `reason: "lease_lost"` on
+legacy SSE, `"store_lost"` on Streamable HTTP),
 `bus_message_rejected` records a message between workers that failed its
 authentication (`reason: "mac"`) or names another identity
 (`reason: "identity"`), and `sse_relay_failed` an answer that could not reach

@@ -3,7 +3,9 @@
 :class:`FakeHub` holds what Redis would: session records with their expiry,
 call counts, rate-limit windows, and the subscribers of the bus.  A record
 lapses at its expiry, as a Redis TTL would, while the session's index keeps
-naming it until a create, a refresh or a delete removes it.  Each
+naming it until a create, a refresh or a delete removes it; the hub then
+remembers it as removed for ``REMOVED_MEMORY_SECONDS``.  ``hub.remove(ref)``
+loses a session without a trace, as a failover or a restart can.  Each
 :class:`FakeSharedStore` is one worker's view of it (``shared = True``), so
 one process can serve two ``MCPServer``s, each with its own store on one
 hub and each on its own ``live_server`` thread and event loop, and every
@@ -36,6 +38,7 @@ from easy_mcp.store.base import (
     SessionRecord,
     Store,
 )
+from easy_mcp.store.redis_store import REMOVED_MEMORY_SECONDS
 
 
 @dataclasses.dataclass
@@ -53,6 +56,8 @@ class FakeHub:
         self.clock = clock
         self.sessions: dict[str, _Session] = {}
         self.index: dict[str, dict[str, float]] = {"http": {}, "sse": {}}
+        # Refs removed lately, with when that memory lapses.
+        self.removed: dict[str, dict[str, float]] = {"http": {}, "sse": {}}
         self.clients: dict[str, tuple[dict[str, int], float]] = {}
         self.windows: dict[str, deque[float]] = {}
         self.stores: list[FakeSharedStore] = []
@@ -70,11 +75,21 @@ class FakeHub:
         return store
 
     def remove(self, ref: str) -> None:
-        """Delete a session behind every worker's back (no message on the bus)."""
+        """Lose a session without a trace, as a failover or a restart can (no message either)."""
         with self.lock:
             self.sessions.pop(ref, None)
             for index in self.index.values():
                 index.pop(ref, None)
+
+    def _remember(self, kind: str, ref: str, now: float) -> bool:
+        """Remember *ref* as removed; whether it was not remembered already."""
+        removed = self.removed[kind]
+        for lapsed in [known for known, until in removed.items() if until <= now]:
+            del removed[lapsed]
+        if ref in removed:
+            return False
+        removed[ref] = now + REMOVED_MEMORY_SECONDS
+        return True
 
     def published(self, op: str) -> list[str]:
         """The payloads published for *op*."""
@@ -165,6 +180,7 @@ class FakeSharedStore(Store):
             for ref in expired:
                 del index[ref]
                 hub.sessions.pop(ref, None)
+                hub._remember(record.kind, ref, now)
             if sum(1 for expiry in index.values() if expiry > now) >= cap:
                 return False, [ExpiredSession(ref, None) for ref in expired]
             if hub._live(record.ref, now) is not None:
@@ -231,7 +247,10 @@ class FakeSharedStore(Store):
                 if entry is None:
                     gone.add(ref)
                     if hub.index[kind].pop(ref, None) is not None:
+                        hub._remember(kind, ref, now)
                         expired.append(ExpiredSession(ref, None))
+                    elif hub._remember(kind, ref, now):
+                        expired.append(ExpiredSession(ref, None, lost=True))
                 else:
                     entry.expires = now + ttl
                     hub.index[kind][ref] = entry.expires
@@ -241,8 +260,11 @@ class FakeSharedStore(Store):
         await self._op("delete")
         hub = self.hub
         with hub.lock:
+            now = hub.clock()
             hub.sessions.pop(ref, None)
-            return hub.index[kind].pop(ref, None) is not None
+            indexed = hub.index[kind].pop(ref, None) is not None
+            # Removed here, or lost without a trace: either way, audited here.
+            return hub._remember(kind, ref, now) or indexed
 
     async def reserve_session_call(self, ref: str, tool: str, limit: int) -> Reservation:
         await self._op("reserve")
@@ -338,6 +360,7 @@ def everything(hub: FakeHub) -> Any:
         return {
             "sessions": {ref: (entry.record, entry.counts) for ref, entry in hub.sessions.items()},
             "index": {kind: dict(index) for kind, index in hub.index.items()},
+            "removed": {kind: dict(removed) for kind, removed in hub.removed.items()},
             "clients": dict(hub.clients),
             "windows": {client: list(window) for client, window in hub.windows.items()},
             "payloads": list(hub.payloads),

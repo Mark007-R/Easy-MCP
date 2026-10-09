@@ -67,6 +67,13 @@ _BACKOFF_MAX = 5.0
 # The life of a session or of a client's counts when no ttl is given.
 _DEFAULT_TTL = 3600.0
 
+# How long the store remembers that a session was removed.  A worker still
+# serving it learns on its next heartbeat (every 15 s for a legacy SSE stream,
+# at most every 30 s otherwise) that whoever removed it audited its close;
+# with no such memory, the session was lost (a failover, a restart), and that
+# worker audits it.  One cut off from Redis for longer may audit it again.
+REMOVED_MEMORY_SECONDS = 600.0
+
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # Error replies that mean "the store cannot serve this now" rather than a bug.
@@ -74,12 +81,22 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # from the message; these are the codes it leaves in place.
 _UNAVAILABLE_REPLIES = ("MISCONF", "BUSY", "NOREPLICAS")
 
-# KEYS: rec, idx   ARGV: ref, ttl_ms, cap, kind, cid, fp, own, pr
+# Each kind's removed sessions are remembered in a sorted set ("gone"), scored
+# by when the memory lapses; the set itself lapses with its newest member.
+
+# KEYS: rec, idx, gone   ARGV: ref, ttl_ms, cap, kind, cid, fp, own, pr, gone_ms.  The
+# expired sessions it removes from the index are remembered as removed.
 SESSION_CREATE = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, 64)
-if #expired > 0 then redis.call('ZREM', KEYS[2], unpack(expired)) end
+if #expired > 0 then
+  redis.call('ZREM', KEYS[2], unpack(expired))
+  local keep = tonumber(ARGV[9])
+  redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+  for _, ref in ipairs(expired) do redis.call('ZADD', KEYS[3], now + keep, ref) end
+  redis.call('PEXPIRE', KEYS[3], keep)
+end
 if redis.call('ZCOUNT', KEYS[2], '(' .. now, '+inf') >= tonumber(ARGV[3]) then
   return {0, expired}
 end
@@ -113,32 +130,54 @@ if ARGV[4] == '1' then return redis.call('HGETALL', KEYS[1]) end
 return 1
 """
 
-# KEYS: idx, rec1..recN   ARGV: ttl_ms, ref1..refN.  Per session: 1 alive, 0 gone,
-# -1 expired, its ref removed from the index here (as SESSION_CREATE prunes it).
+# KEYS: idx, gone, rec1..recN   ARGV: ttl_ms, gone_ms, ref1..refN.  Per session: 1 alive,
+# 0 removed by another call, -1 expired, its ref removed from the index here (as
+# SESSION_CREATE prunes it), -2 lost: no record, index entry or memory of a removal is
+# left.  The caller audits -1 and -2, which are remembered as removed from now on.
 SESSION_REFRESH_MANY = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local ttl = tonumber(ARGV[1])
+local keep = tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 local alive = {}
-for i = 2, #KEYS do
+local removed = false
+for i = 3, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 1 then
     redis.call('PEXPIRE', KEYS[i], ttl)
     redis.call('ZADD', KEYS[1], now + ttl, ARGV[i])
     alive[#alive + 1] = 1
   elseif redis.call('ZREM', KEYS[1], ARGV[i]) == 1 then
+    redis.call('ZADD', KEYS[2], now + keep, ARGV[i])
+    removed = true
     alive[#alive + 1] = -1
+  elseif redis.call('ZADD', KEYS[2], 'NX', now + keep, ARGV[i]) == 1 then
+    removed = true
+    alive[#alive + 1] = -2
   else
     alive[#alive + 1] = 0
   end
 end
+if removed then redis.call('PEXPIRE', KEYS[2], keep) end
 return alive
 """
 
-# KEYS: rec, idx   ARGV: ref.  1 if this call removed the session (an expired one
-# still named by the index included), 0 if it was gone.
+# KEYS: rec, idx, gone   ARGV: ref, gone_ms.  1 if this call removed the session (an
+# expired one still named by the index included) or found it lost, 0 if another call
+# removed it.
 SESSION_DELETE = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local keep = tonumber(ARGV[2])
 redis.call('DEL', KEYS[1])
-return redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
+if redis.call('ZREM', KEYS[2], ARGV[1]) == 1 then
+  redis.call('ZADD', KEYS[3], now + keep, ARGV[1])
+elseif redis.call('ZADD', KEYS[3], 'NX', now + keep, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[3], keep)
+return 1
 """
 
 # KEYS: rec   ARGV: field ('c:<tool>'), limit
@@ -411,6 +450,9 @@ class RedisStore(Store):
     def _index_key(self, kind: SessionKind) -> str:
         return self._key("i", kind)
 
+    def _gone_key(self, kind: SessionKind) -> str:
+        return self._key("g", kind)
+
     def _bus_channel(self) -> str:
         return f"{self._prefix()}:bus"
 
@@ -572,7 +614,11 @@ class RedisStore(Store):
         ttl_ms = _ms(ttl if ttl is not None else _DEFAULT_TTL)
         reply = await self._run(
             "create",
-            [self._session_key(record.ref), self._index_key(record.kind)],
+            [
+                self._session_key(record.ref),
+                self._index_key(record.kind),
+                self._gone_key(record.kind),
+            ],
             [
                 record.ref,
                 ttl_ms,
@@ -582,6 +628,7 @@ class RedisStore(Store):
                 record.identity_fp or "",
                 record.owner or "",
                 record.principal or "",
+                _ms(REMOVED_MEMORY_SECONDS),
             ],
         )
         status = int(reply[0])
@@ -636,15 +683,25 @@ class RedisStore(Store):
             return set(), []
         reply = await self._run(
             "refresh",
-            [self._index_key(kind), *(self._session_key(ref) for ref in refs)],
-            [_ms(ttl), *refs],
+            [
+                self._index_key(kind),
+                self._gone_key(kind),
+                *(self._session_key(ref) for ref in refs),
+            ],
+            [_ms(ttl), _ms(REMOVED_MEMORY_SECONDS), *refs],
         )
         states = list(zip(refs, (int(alive) for alive in reply), strict=False))
         gone = {ref for ref, alive in states if alive <= 0}
-        return gone, [ExpiredSession(ref, None) for ref, alive in states if alive < 0]
+        return gone, [
+            ExpiredSession(ref, None, lost=alive == -2) for ref, alive in states if alive < 0
+        ]
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
-        reply = await self._run("delete", [self._session_key(ref), self._index_key(kind)], [ref])
+        reply = await self._run(
+            "delete",
+            [self._session_key(ref), self._index_key(kind), self._gone_key(kind)],
+            [ref, _ms(REMOVED_MEMORY_SECONDS)],
+        )
         return int(reply) > 0
 
     # ----------------------------------------------- max_calls_per_session

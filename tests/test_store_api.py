@@ -8,6 +8,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -452,6 +453,22 @@ async def test_registering_a_tool_while_serving_with_a_shared_store_warns(
     async with plain.lifespan():
         plain.register_tool(lambda: "late", name="late", description="While serving.")
     assert len([r for r in logs.records if "shared store" in r.getMessage()]) == 2
+
+
+def test_the_docs_name_the_redis_versions_the_store_needs() -> None:
+    # CLIENT SETINFO arrived in Redis 7.2, and Redis 7.0 and 7.1 refuse an ACL
+    # rule naming a subcommand they lack; before 7.0 a write refused inside a
+    # script (OOM, READONLY, MISCONF) comes back as a generic script error.
+    root = Path(__file__).resolve().parent.parent
+    security = (root / "SECURITY.md").read_text(encoding="utf-8")
+    start = security.index("- **Shared store**")
+    shared = security[start : security.index("\n- **stdio**", start)]
+    assert "ACL SETUSER" in shared and "+client|setinfo" in shared
+    assert "Redis 7.2 or later" in shared and "Redis 7.0 or 7.1" in shared
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    workers = readme[readme.index("### Running several workers") :]
+    workers = workers[: workers.index("\n### ")]
+    assert "Redis 7.0 or later" in workers and "7.2" in workers
 
 
 async def test_the_lifespan_starts_and_closes_the_store() -> None:

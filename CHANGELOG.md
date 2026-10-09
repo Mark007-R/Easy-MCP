@@ -175,8 +175,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   cancel token and a connector's `KILL QUERY` included), a legacy SSE message
   posted to another worker is answered on the stream, and sessions survive a
   worker restart. Install it with `pip install "easy-mcp-kit[redis]"`
-  (redis-py 5.0.1 or later); the URL comes from `EASY_MCP_REDIS_URL`, and the
-  server's `name` is the namespace unless `namespace=` says otherwise.
+  (redis-py 5.0.1 or later). It needs Redis 7.0 or later, and the
+  least-privilege ACL in SECURITY.md, as written, Redis 7.2 or later. The URL
+  comes from `EASY_MCP_REDIS_URL`, and the server's `name` is the namespace
+  unless `namespace=` says otherwise.
   `RedisStore.from_client()` takes a client you configured yourself; Redis
   Cluster is not supported.
 
@@ -212,11 +214,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `protocol_version` (legacy SSE and stdio sessions are audited as open
   before their `initialize` arrives). New events:
   `bus_message_rejected` and `sse_relay_failed`. Legacy SSE `session_close`
-  events now carry a `reason` (`stream_closed`, `shutdown`, `lease_lost`).
-  Each session's close is audited once, by the worker that removes it from
-  the store: one that ends while the store is out of reach is audited when
-  its worker reaches the store again, or as `lease_lost` or `idle_timeout`
-  by the worker that finds it expired first.
+  events now carry a `reason` (`stream_closed`, `shutdown`, `lease_lost`),
+  and Streamable HTTP ones have a new reason, `store_lost`. Each session's
+  close is audited once, by the worker that removes it from the store: one
+  that ends while the store is out of reach is audited when its worker
+  reaches the store again, or as `lease_lost` or `idle_timeout` by the worker
+  that finds it expired first. One the store loses (a failover to a replica
+  that missed it, a restart without persistence) is audited by the worker
+  serving it, if any: when it ends there, or as `lease_lost` (legacy SSE) or
+  `store_lost` (Streamable HTTP) when that worker finds it gone. A worker cut
+  off from Redis for more than ten minutes may audit a close a second time.
 - `MCPServer.lifespan()` also connects the store at startup and closes it
   last at shutdown.
 

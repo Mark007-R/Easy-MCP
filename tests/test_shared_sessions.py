@@ -23,6 +23,7 @@ import pytest
 import uvicorn
 from conftest import LogCapture, headers_for, modern, notification, rpc
 from shared_store_fake import FakeHub, everything, records
+from starlette.applications import Starlette
 
 from easy_mcp import (
     APIKeyAuth,
@@ -664,10 +665,39 @@ def test_sse_lease_loss_closes_the_stream(
     threading.Thread(target=drain, daemon=True).start()
     assert ended.wait(3), "the stream was not closed"
     sse(b)  # an open on another worker prunes the index: its close is not audited again
-    (closed,) = logs.events("session_close")
+    # (B's own stream may close meanwhile: its lines are dropped.)
+    ref = session_ref(endpoint.split("=", 1)[1])
+    (closed,) = [event for event in logs.events("session_close") if event["session_ref"] == ref]
     assert closed["reason"] == "lease_lost" and closed["worker"] == WORKER_A
-    assert closed["session_ref"] == session_ref(endpoint.split("=", 1)[1])
     assert closed["client_id"] == fingerprint(KEY_A)
+
+
+def test_sse_a_session_the_store_lost_closes_the_stream(
+    serve: Callable[..., Worker],
+    sse: Callable[[Worker], Any],
+    logs: LogCapture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Its record and index entry vanish together (a failover to a replica
+    # that missed them, a restart without persistence): nobody removed it,
+    # so its owner audits its close.
+    monkeypatch.setattr(_sessions, "SSE_HEARTBEAT_SECONDS", 0.2)
+    hub, a, b = pair(serve)
+    _, lines, endpoint = sse(a)
+    ref = session_ref(endpoint.split("=", 1)[1])
+    hub.remove(ref)
+    ended = threading.Event()
+
+    def drain() -> None:
+        for _ in lines:
+            pass
+        ended.set()
+
+    threading.Thread(target=drain, daemon=True).start()
+    assert ended.wait(3), "the stream was not closed"
+    sse(b)  # nothing is left for another worker to prune (B's own stream may close)
+    (closed,) = [event for event in logs.events("session_close") if event["session_ref"] == ref]
+    assert closed["reason"] == "lease_lost" and closed["worker"] == WORKER_A
 
 
 async def test_a_session_close_is_audited_once_by_whoever_removes_it(logs: LogCapture) -> None:
@@ -746,6 +776,58 @@ async def test_a_session_close_is_audited_once_by_whoever_removes_it(logs: LogCa
         assert closes(handshake) == []
     finally:
         for manager in (a, b, http_a, http_b):
+            await manager.shutdown()
+
+
+async def test_a_session_the_store_lost_is_audited_once(logs: LogCapture) -> None:
+    # The store lost what it held of three sessions (a failover to a replica
+    # that missed them, a restart without persistence): nobody removed them,
+    # so the worker serving each audits its close, and no other worker does.
+    hub = FakeHub()
+    server_a = make_server(hub.store(WORKER_A), Signals())
+    server_b = make_server(hub.store(WORKER_B), Signals())
+    sse_a = SSETransport(server_a)._manager
+    http_a = StreamableHTTPTransport(server_a, legacy_sse=False)._manager
+    http_b = StreamableHTTPTransport(server_b, legacy_sse=False)._manager
+
+    async def stream(name: str) -> _sessions.LocalSession:
+        local = await sse_a.open(name, client_id=f"ip:{name}", identity=None, owned=True)
+        assert local is not None
+        await sse_a.finish(local)
+        sse_a.opened(local)
+        return local
+
+    def closes() -> dict[str, list[tuple[str, str]]]:
+        found: dict[str, list[tuple[str, str]]] = {}
+        for event in logs.events("session_close"):
+            found.setdefault(event["client_id"], []).append((event["reason"], event["worker"]))
+        return found
+
+    try:
+        lost, closing = await stream("lost"), await stream("closing")
+        held = await http_a.open("held", client_id="ip:held", identity=None)
+        assert held is not None  # held by its opener, as during its handshake
+        http_a.opened(held)
+        on_b = await http_b.acquire("held")  # one of its requests runs on B too
+        assert isinstance(on_b, _sessions.LocalSession)
+        for local in (lost, closing, held):
+            hub.remove(local.ref)
+        # A stream that closes before the heartbeat finds it lost.
+        await sse_a.end(closing, reason="stream_closed")
+        for manager in (sse_a, http_a, http_b):
+            await manager._refresh()
+        assert lost.ended and held.ended and on_b.ended
+        expected = {
+            "ip:lost": [("lease_lost", WORKER_A)],
+            "ip:closing": [("stream_closed", WORKER_A)],
+            "ip:held": [("store_lost", WORKER_A)],
+        }
+        assert closes() == expected
+        await http_b._refresh()
+        assert await http_b.open("later", client_id="ip:later", identity=None) is not None
+        assert closes() == expected
+    finally:
+        for manager in (sse_a, http_a, http_b):
             await manager.shutdown()
 
 
@@ -912,3 +994,100 @@ def test_the_store_never_sees_raw_ids_or_keys(
         assert record.identity_fp is not None and len(record.identity_fp) == 12
         int(record.identity_fp, 16)
     assert hub.published("cancel") and hub.published("deliver")
+
+
+# ------------------------------------------ several endpoints, one worker
+#
+# One server served at two endpoints of a kind in one process: their session
+# managers share the worker's store, and so its worker id.
+
+
+@pytest.mark.parametrize("stop", ["cancel", "delete"])
+async def test_a_cancel_or_delete_reaches_a_call_at_another_endpoint(stop: str) -> None:
+    signals = Signals()
+    server = make_server(FakeHub().store(WORKER_A), signals)
+    one, two = (StreamableHTTPTransport(server, legacy_sse=False) for _ in range(2))
+    auth = {**ACCEPT, "Authorization": f"Bearer {KEY_A}"}
+
+    def connect(transport: StreamableHTTPTransport) -> httpx.AsyncClient:
+        app = httpx.ASGITransport(app=transport.build_app())
+        return httpx.AsyncClient(transport=app, base_url="http://127.0.0.1")
+
+    async with connect(one) as first, connect(two) as second:
+        opened = await first.post("/mcp", json=rpc("initialize", INIT, "init"), headers=auth)
+        headers = {**auth, "MCP-Session-Id": opened.headers["mcp-session-id"]}
+        running = asyncio.ensure_future(second.post("/mcp", json=call("slow", 7), headers=headers))
+        try:
+            for _ in range(500):
+                if signals.started.is_set() or running.done():
+                    break
+                await asyncio.sleep(0.01)
+            assert signals.started.is_set()
+            if stop == "cancel":
+                cancel = notification("notifications/cancelled", {"requestId": 7})
+                assert (await first.post("/mcp", json=cancel, headers=headers)).status_code == 202
+            else:
+                assert (await first.delete("/mcp", headers=headers)).status_code == 204
+            answered = await asyncio.wait_for(running, 3)
+        finally:
+            running.cancel()
+    assert answered.status_code == 202  # cancelled: no JSON-RPC answer
+    assert signals.cancelled.is_set() and not signals.finished.is_set()
+
+
+@pytest.mark.parametrize("stop", ["cancel", "close"])
+def test_sse_a_cancel_or_close_reaches_a_call_at_another_endpoint(
+    live_server: Callable[[Any], str], stop: str
+) -> None:
+    signals = Signals()
+    server = make_server(FakeHub().store(WORKER_A), signals)
+    one = SSETransport(server, sse_path="/one/sse", messages_path="/one/messages")
+    two = SSETransport(server, sse_path="/two/sse", messages_path="/two/messages")
+    base = live_server(Starlette(routes=[*one.routes(), *two.routes()]))
+    auth = {"Authorization": f"Bearer {KEY_A}"}
+    with httpx.Client(base_url=base, timeout=10) as http:
+        with http.stream("GET", "/one/sse", headers=auth) as stream:
+            lines = stream.iter_lines()  # kept: dropping it closes the stream
+            endpoint = next_data(lines)
+            elsewhere = endpoint.replace("/one/", "/two/")
+            assert http.post(elsewhere, json=call("slow", 1), headers=auth).status_code == 202
+            assert signals.started.wait(5)
+            if stop == "cancel":
+                cancel = notification("notifications/cancelled", {"requestId": 1})
+                assert http.post(endpoint, json=cancel, headers=auth).status_code == 202
+                assert signals.cancelled.wait(3)
+        # Leaving the stream ends the session: at every endpoint, its calls too.
+        assert signals.cancelled.wait(3)
+    assert not signals.finished.is_set()
+
+
+async def test_an_end_reaches_a_lookup_under_way_at_another_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeHub().store(WORKER_A)
+    server = make_server(store, Signals())
+    one = StreamableHTTPTransport(server, legacy_sse=False)._manager
+    two = StreamableHTTPTransport(server, legacy_sse=False)._manager
+    opened = await one.open("session", client_id="ip:s", identity=None)
+    assert opened is not None
+    one.opened(opened)
+    found, release = asyncio.Event(), asyncio.Event()
+    lookup = store.acquire_session
+
+    async def slow_lookup(*args: Any, **kwargs: Any) -> Any:
+        record = await lookup(*args, **kwargs)
+        found.set()  # found, and on its way back when the session ends
+        await release.wait()
+        return record
+
+    monkeypatch.setattr(store, "acquire_session", slow_lookup)
+    try:
+        acquiring = asyncio.ensure_future(two.acquire("session"))
+        await asyncio.wait_for(found.wait(), 5)
+        await one.end(opened, reason="client_terminated", strict=True)
+        release.set()
+        assert await acquiring is _sessions.Rejection.NOT_FOUND
+    finally:
+        release.set()
+        for manager in (one, two):
+            await manager.shutdown()

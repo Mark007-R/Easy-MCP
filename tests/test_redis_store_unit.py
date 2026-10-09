@@ -155,6 +155,7 @@ def test_keys_are_versioned_namespaced_and_hash_tagged() -> None:
     assert store._session_key(ref) == f"easy-mcp:1:{{my-tools}}:s:{ref}"
     assert store._index_key("http") == "easy-mcp:1:{my-tools}:i:http"
     assert store._index_key("sse") == "easy-mcp:1:{my-tools}:i:sse"
+    assert store._gone_key("http") == "easy-mcp:1:{my-tools}:g:http"
     assert store._key("c", client_ref("ip:1.2.3.4")) == (
         f"easy-mcp:1:{{my-tools}}:c:{client_ref('ip:1.2.3.4')}"
     )
@@ -358,8 +359,18 @@ async def test_script_replies_are_parsed() -> None:
         ]
         name, keys, args = client.calls[-1]
         assert name == "create"
-        assert keys == [store._session_key(ref), store._index_key("sse")]
-        assert args == [ref, 60_000, 5, "sse", "ip:x", "abcdef012345", "0123456789abcdef", ""]
+        assert keys == [store._session_key(ref), store._index_key("sse"), store._gone_key("sse")]
+        assert args == [
+            ref,
+            60_000,
+            5,
+            "sse",
+            "ip:x",
+            "abcdef012345",
+            "0123456789abcdef",
+            "",
+            600_000,
+        ]
         client.replies["create"] = [0, []]
         assert await store.create_session(record, cap=5, ttl=60) == (False, [])
         client.replies["create"] = [-1, []]
@@ -396,22 +407,30 @@ async def test_script_replies_are_parsed() -> None:
         await store.release_session("http", ref, ttl=60, protocol_version="2025-06-18")
         assert client.calls[-1][2] == [ref, 60_000, "2025-06-18", "0", "http"]
 
-        # Alive, gone, and expired with its ref removed from the index here.
-        client.replies["refresh"] = [1, 0, -1]
-        refs = [ref, other, session_ref("u")]
+        # Alive, removed by another call, expired with its ref removed from
+        # the index here, and lost without a trace.
+        client.replies["refresh"] = [1, 0, -1, -2]
+        refs = [ref, other, session_ref("u"), session_ref("v")]
         gone, expired = await store.refresh_sessions("http", refs, ttl=30)
-        assert gone == {other, refs[2]}
-        assert [(found.ref, found.client_id, found.t0) for found in expired] == [
-            (refs[2], None, None)
+        assert gone == {other, refs[2], refs[3]}
+        assert [(found.ref, found.client_id, found.t0, found.lost) for found in expired] == [
+            (refs[2], None, None, False),
+            (refs[3], None, None, True),
         ]
-        assert client.calls[-1][1][0] == store._index_key("http")
-        assert client.calls[-1][2] == [30_000, *refs]
+        keys = [store._index_key("http"), store._gone_key("http")]
+        assert client.calls[-1][1] == keys + [store._session_key(found) for found in refs]
+        assert client.calls[-1][2] == [30_000, 600_000, *refs]
         assert await store.refresh_sessions("http", [], ttl=30) == (set(), [])
 
         client.replies["delete"] = 1
         assert await store.delete_session("sse", ref) is True
-        assert client.calls[-1][1] == [store._session_key(ref), store._index_key("sse")]
-        client.replies["delete"] = 0  # gone already
+        assert client.calls[-1][1] == [
+            store._session_key(ref),
+            store._index_key("sse"),
+            store._gone_key("sse"),
+        ]
+        assert client.calls[-1][2] == [ref, 600_000]
+        client.replies["delete"] = 0  # removed by another call already
         assert await store.delete_session("sse", ref) is False
 
         for reply, outcome in (

@@ -90,6 +90,14 @@ Consequences:
       +zremrangebyscore +zcount +zcard +time
   ```
 
+  As written, these rules need Redis 7.2 or later, the first with
+  `CLIENT SETINFO`. On Redis 7.0 or 7.1, which refuse the whole
+  `ACL SETUSER` over it, leave out `+client|setinfo`: redis-py carries on
+  when the server refuses that command. Redis before 7.0 is not supported:
+  it reports a write refused inside a script as a generic error, so a full
+  or read-only Redis would fail requests as an internal error rather than
+  with `503`.
+
   To fence one server off from another on the same Redis, narrow both
   patterns to its namespace, e.g. `~easy-mcp:1:{reports}:*` and
   `&easy-mcp:1:{reports}:*`. Keep the default `noeviction` memory policy and

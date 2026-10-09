@@ -6,16 +6,18 @@ that a session exists, who opened it, its call counts.  What cannot leave a
 process stays in a :class:`LocalSession`: the session's calls running here,
 and the stream this worker holds for it.
 
-With a shared store, a session's requests can land on any worker, so the
-workers tell each other about them (:mod:`._bus`): a cancel for a call
-running elsewhere, the end of a session, and a legacy SSE answer for the
-worker that holds the stream.  A heartbeat keeps the sessions this worker is
-busy with alive in the store, and renews the lease of the legacy SSE
-streams it holds.
+With a shared store, a session's requests can land on any worker, and at any
+endpoint of its kind, so the session managers tell each other about them
+(:mod:`._bus`): a cancel for a call running elsewhere, the end of a session,
+and a legacy SSE answer for the worker that holds the stream.  The managers
+of one worker's endpoints are handed cancels and ends directly.  A heartbeat
+keeps the sessions this worker is busy with alive in the store, and renews
+the lease of the legacy SSE streams it holds.
 
 Whoever removes a session from the store audits its close, so each close is
-audited once: the worker (or endpoint) that ends it, or the one that finds
-it expired.
+audited once: the worker (or endpoint) that ends it, the one that finds it
+expired, or, if the store lost it (a failover, a restart), the one serving
+it that finds it gone first.
 """
 
 from __future__ import annotations
@@ -489,8 +491,9 @@ class SessionManager:
 
         Its calls running here are cancelled, those yet to start included.
         *reason* is audited with ``session_close`` when this removes the
-        session from the store; whatever removed it first audited it instead
-        (``None``: nothing to audit, as for a handshake that failed).
+        session from the store, or finds that the store lost it; whatever
+        removed it first audited it instead (``None``: nothing to audit, as
+        for a handshake that failed).
 
         Args:
             strict: Remove it from the store first, and raise if that fails
@@ -571,7 +574,7 @@ class SessionManager:
             local.session_id,
             self.store.worker_id,
         )
-        await self._publish(payload)
+        await self._broadcast(payload)
 
     def _end_here(self, local: LocalSession) -> None:
         """Forget *local* on this worker and stop its work (no store call)."""
@@ -598,7 +601,7 @@ class SessionManager:
         )
 
     def _expire(self, expired: Iterable[ExpiredSession]) -> None:
-        """End the sessions the store found expired and removed, and audit their close.
+        """End the sessions the store found expired and removed, or lost, and audit their close.
 
         A session ends on whichever endpoint of this server holds it, which
         knows more of it than the store may: its id, its client and when it
@@ -607,15 +610,16 @@ class SessionManager:
         expired = list(expired)
         if not expired:
             return
-        managers = [self] + [
-            manager
-            for manager in self._server._session_managers
-            if manager is not self and manager._kind == self._kind
-        ]
+        managers = [self, *self._siblings()]
         for gone in expired:
             # An SSE session in a shared store expires when its owner
-            # stopped renewing its lease.
-            reason: str | None = "lease_lost" if self._kind == "sse" else "idle_timeout"
+            # stopped renewing its lease, and its lease is lost with it when
+            # the store loses it.
+            reason: str | None
+            if self._kind == "sse":
+                reason = "lease_lost"
+            else:
+                reason = "store_lost" if gone.lost else "idle_timeout"
             transport = self._transport
             session_id, client_id, t0 = gone.session_id, gone.client_id, gone.t0
             for manager in managers:
@@ -715,8 +719,26 @@ class SessionManager:
             self._server._logger.error("could not publish to the store", exc_info=True)
             return 0
 
+    def _siblings(self) -> list[SessionManager]:
+        """The managers of this server's other endpoints of the same kind, in this process."""
+        return [
+            manager
+            for manager in self._server._session_managers
+            if manager is not self and manager._kind == self._kind
+        ]
+
+    async def _broadcast(self, payload: str) -> None:
+        """Send *payload* to every other endpoint of this kind, on every worker.
+
+        This worker's other endpoints share its id, so they ignore its
+        messages on the bus as their own: they are handed it here instead.
+        """
+        for sibling in self._siblings():
+            sibling._on_bus(payload, sibling=True)
+        await self._publish(payload)
+
     async def cancel_elsewhere(self, local: LocalSession, request_id: object) -> None:
-        """Ask the worker running *request_id* of *local* to cancel it.
+        """Ask whichever worker or endpoint runs *request_id* of *local* to cancel it.
 
         Only with a shared store, and only for an id that can travel
         (:func:`._bus.relayable_id`); any other id is an unknown one.
@@ -732,7 +754,7 @@ class SessionManager:
             self.store.worker_id,
             rid=request_id,
         )
-        await self._publish(payload)
+        await self._broadcast(payload)
 
     async def relay(
         self, local: LocalSession, message: dict[str, Any], *, protocol_version: str | None
@@ -784,19 +806,22 @@ class SessionManager:
         if not await self._publish(payload, to=local.record.owner):
             audit("sse_relay_failed", session_ref=local.ref, reason="owner_unreachable")
 
-    def _on_bus(self, payload: str) -> None:
-        """Act on a message from another worker.  Never raises."""
+    def _on_bus(self, payload: str, *, sibling: bool = False) -> None:
+        """Act on a message from another worker, or (*sibling*) another endpoint of this one.
+
+        Never raises.
+        """
         try:
-            self._handle_bus(payload)
+            self._handle_bus(payload, sibling)
         except Exception:
             self._server._logger.error("could not handle a message from the store", exc_info=True)
 
-    def _handle_bus(self, payload: str) -> None:
+    def _handle_bus(self, payload: str, sibling: bool = False) -> None:
         envelope = _bus.peek(payload)
         if envelope is None or envelope.kind != self._kind:
             return
-        if envelope.op != "deliver" and envelope.src == self.store.worker_id:
-            return  # our own broadcast
+        if not sibling and envelope.op != "deliver" and envelope.src == self.store.worker_id:
+            return  # our own broadcast: this worker's endpoints were handed it (_broadcast)
         local = self._local.get(envelope.ref)
         if local is not None:
             session_id = local.session_id
@@ -879,20 +904,22 @@ class SessionManager:
                 )
             except StoreUnavailableError:
                 return  # tried again on the next beat
-            lost: list[LocalSession] = []
+            ending: list[LocalSession] = []
             for ref in gone:
                 local = self._local.get(ref)
                 if local is not None and not local.ended:
-                    lost.append(local)
-            # The expired ones this refresh removed from the store are
-            # audited here; whoever removed any other audited it.
+                    ending.append(local)
+            # The expired ones this refresh removed from the store, and the
+            # ones it found lost from it, are audited here; whoever removed
+            # any other audited it.
             self._expire(expired)
-            for local in lost:
+            for local in ending:
                 if not local.ended:
                     self._end_here(local)
                 if local.owned:
-                    # Its lease ran out (a store outage longer than the lease,
-                    # or a record removed): the client must open a new session.
+                    # Its lease ran out (a store outage longer than the lease),
+                    # or its record was removed or lost: the client must open
+                    # a new session.
                     await self._announce_end(local)
 
     def _spawn(self, work: Any) -> None:
