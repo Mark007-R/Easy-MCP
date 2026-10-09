@@ -234,10 +234,12 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   change undone within that time sends none. Registration from any thread
   works, including a sync tool's. On a session, what the client may see
   follows the credential of its latest request, and a credential that
-  changes what it may see has it told once to list again. With a shared
-  store this holds for the requests served by the worker holding the
-  session's `GET /mcp` stream; requests served by other workers leave that
-  stream judging by the credential it last saw there.
+  changes what it may see has it told once to list again (with no
+  `GET /mcp` stream open, as soon as one opens). With a shared store this
+  holds for the requests served by the worker holding the session's
+  `GET /mcp` stream, or by any worker while none is open; requests served by
+  other workers leave that stream judging by the credential it last saw
+  there.
 - Initialize-era clients receive `notifications/tools/list_changed` once
   `initialize` has been answered: on stdout over stdio, on the `/sse`
   stream, and over Streamable HTTP on the session's `GET /mcp` stream.

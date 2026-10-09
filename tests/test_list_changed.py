@@ -18,6 +18,7 @@ from easy_mcp import (
     APIKeyAuth,
     ClientIdentity,
     MCPServer,
+    OAuthResourceServer,
     RequestInfo,
     SSETransport,
     SubscriptionLimitError,
@@ -41,7 +42,10 @@ from easy_mcp.transport.base import ClientContext
 REPORTS_KEY = "lc-reports-key-" + "k" * 12
 ADMIN_KEY = "lc-admin-key-" + "k" * 14
 ALL_KEY = "lc-all-key-" + "k" * 16
+STEP_UP_KEY = "lc-stepup-key-" + "k" * 16
 
+ISSUER = "https://auth.example.com"
+RESOURCE = "https://mcp.example.com/mcp"
 TAG = "io.modelcontextprotocol/subscriptionId"
 SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 TOOLS_CHANGED = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
@@ -332,6 +336,36 @@ async def test_scope_change_reaches_gainers_and_losers_only(fast_debounce: float
     assert len(sessions) == 4
 
 
+@pytest.mark.parametrize("token_first", [True, False], ids=["token-first", "key-first"])
+async def test_a_token_that_steps_up_and_a_key_with_its_scopes_are_judged_apart(
+    fast_debounce: float, token_first: bool
+) -> None:
+    # With step-up a token sees every tool, while an API key holding the same
+    # scopes still sees only what they cover: their lists never share a digest.
+    oauth = OAuthResourceServer(RESOURCE, [ISSUER], step_up=True)
+    server = make_server(oauth=oauth, auth=APIKeyAuth({STEP_UP_KEY: ["mcp:access"]}))
+    token = ClientIdentity(
+        fingerprint="token-principal",
+        scopes=frozenset({"mcp:access"}),
+        subject="user-1",
+        client_id="client-1",
+        issuer=ISSUER,
+    )
+    key = identity_of(server, STEP_UP_KEY)
+    assert key is not None and key.scopes == token.scopes
+    channels = {"token": Pushed(), "key": Pushed()}
+    identities = {"token": token, "key": key}
+    order = ["token", "key"] if token_first else ["key", "token"]
+    # Held for the whole test: the notifier holds a session's context weakly.
+    contexts = [await initialized(server, channels[name], identities[name], name) for name in order]
+    register(server, "hidden", scopes=["admin"])
+    assert await channels["token"].wait_for(1) == [TOOLS_CHANGED]
+    await settle(fast_debounce)
+    assert channels["token"].frames == [TOOLS_CHANGED]
+    assert channels["key"].frames == []
+    assert len(contexts) == 2
+
+
 async def test_registration_from_a_worker_thread_notifies(fast_debounce: float) -> None:
     server = make_server()
     pushed = Pushed()
@@ -474,8 +508,16 @@ async def test_a_session_is_judged_by_its_latest_credential(fast_debounce: float
     # A later request of the session presents another credential (as a
     # refreshed OAuth token would): what the session is told follows it.
     await server.dispatch(rpc("ping", msg_id=2), dataclasses.replace(context, identity=admin))
-    register(server, scopes=("admin",))
+    # It sees another list now, so it is told once to list again ...
     assert await pushed.wait_for(1) == [TOOLS_CHANGED]
+    await settle(fast_debounce)
+    # ... and from then on hears of what the new credential sees,
+    register(server, "admin_only", scopes=("admin",))
+    assert await pushed.wait_for(2) == [TOOLS_CHANGED, TOOLS_CHANGED]
+    # and nothing of what only the first one sees.
+    register(server, "reports_only", scopes=("reports",))
+    await settle(fast_debounce)
+    assert pushed.frames == [TOOLS_CHANGED, TOOLS_CHANGED]
 
 
 async def test_a_session_that_listed_with_a_broader_credential_hears_its_list_shrink(

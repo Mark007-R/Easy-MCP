@@ -35,6 +35,7 @@ KEEPALIVE_SECONDS = 15.0
 STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 _LIST_CHANGED = frozenset(method for method, _ in LIST_KINDS.values())
+_KIND_OF = {method: kind for kind, (method, _) in LIST_KINDS.items()}
 _RESOURCE_UPDATED = "notifications/resources/updated"
 
 
@@ -122,6 +123,14 @@ class Outbox:
         while not self._items and not self._closed:
             self._ready.clear()
             await self._ready.wait()
+
+    def pending_kinds(self) -> set[str]:
+        """The lists whose change notification is waiting here, not yet taken by the stream."""
+        return {
+            _KIND_OF[method]
+            for _, message in self._items
+            if (method := message.get("method")) in _KIND_OF
+        }
 
     def drain_into(self, other: Outbox) -> None:
         """Move every message waiting here to *other*, in order."""

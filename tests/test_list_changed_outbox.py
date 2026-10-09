@@ -84,6 +84,18 @@ async def test_drain_into_moves_what_is_waiting_in_order() -> None:
     assert [await new.get(1), await new.get(1)] == [TOOLS, PROMPTS]
 
 
+async def test_pending_kinds_name_the_lists_whose_change_is_not_yet_taken() -> None:
+    outbox = Outbox()
+    ack = {"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged"}
+    for message in (ack, TOOLS, updated("a"), PROMPTS, {"jsonrpc": "2.0", "id": 1, "result": {}}):
+        outbox.put(message)
+    assert outbox.pending_kinds() == {"tools", "prompts"}
+    assert [await outbox.get(1), await outbox.get(1)] == [ack, TOOLS]
+    assert outbox.pending_kinds() == {"prompts"}
+    outbox.drain_into(Outbox())
+    assert outbox.pending_kinds() == set()
+
+
 def test_accepts_event_stream() -> None:
     for accept in (None, "", "text/event-stream", "application/json, text/event-stream", "*/*"):
         assert accepts_event_stream(accept), accept

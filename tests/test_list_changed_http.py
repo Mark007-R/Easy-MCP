@@ -447,6 +447,46 @@ async def test_a_change_a_closing_stream_could_not_send_is_told_on_the_next(
         await second.aclose()
 
 
+async def test_a_change_still_queued_when_its_client_leaves_is_told_on_the_next(
+    live_server: LiveServer, logs: LogCapture
+) -> None:
+    server = make_server()
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        first = await get_stream(client, session)
+        local = transport._sessions[session]
+        sink = local.notify_stream.sink
+        seen: dict[str, Any] = {}
+        done = threading.Event()
+
+        def change_then_leave() -> None:
+            # A new stream (holding the session as a GET does) has a change
+            # queued, and its client leaves before the stream's writer runs.
+            local.active += 1
+            response = transport._open_stream(local, local.context.identity)
+            notify = local.notify_stream
+            register(server)
+            notify.sink.deliver(["tools"])
+            seen["queued"] = [message for _, message in notify.outbox._items]
+            response._on_close()
+            seen["reason"] = notify.reason
+            done.set()
+
+        sink.loop.call_soon_threadsafe(change_then_leave)
+        assert await asyncio.to_thread(done.wait, 5)
+        await first.end()
+        await first.aclose()
+        assert seen == {"queued": [TOOLS_CHANGED], "reason": "client_closed"}
+        # Its end recorded what it told, then let the session go.
+        await until(lambda: len(logs.events("stream_close")) == 2 and local.active == 0)
+        second = await get_stream(client, session)
+        assert await second.next() == TOOLS_CHANGED
+        await second.quiet()
+        await second.aclose()
+
+
 async def test_http_handshake_with_keys_of_mixed_types(
     live_server: LiveServer, fast_debounce: float
 ) -> None:
@@ -553,6 +593,43 @@ async def test_a_session_that_listed_with_a_broader_token_hears_its_list_shrink(
         # list is again the one its stream was opened with.
         server.unregister_tool("secret")
         assert await stream.next() == TOOLS_CHANGED
+        await stream.aclose()
+
+
+@pytest.mark.parametrize("reconnect", [False, True], ids=["no-stream-yet", "stream-dropped"])
+async def test_a_list_fetched_with_a_broader_token_while_no_stream_is_open_is_told_at_open(
+    live_server: LiveServer,
+    fake_as: FakeAuthorizationServer,
+    fast_debounce: float,
+    logs: LogCapture,
+    reconnect: bool,
+) -> None:
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer], step_up=False)
+    server = make_server(oauth=oauth)
+    register(server, "secret", scopes=["admin"])
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    narrow = bearer(fake_as.mint())
+    broad = bearer(fake_as.mint(claims={"scope": "mcp:access admin"}))
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client, narrow)  # told the list holds "add"
+        if reconnect:
+            first = await get_stream(client, session, narrow)
+            await first.quiet(0.1)
+            await first.aclose()
+            local = transport._sessions[session]
+            await until(lambda: bool(logs.events("stream_close")) and local.active == 0)
+        # With no stream open, it lists with a credential that sees more.
+        listed = await client.post(
+            "/mcp",
+            json=rpc("tools/list", msg_id=2),
+            headers={**ACCEPT, "MCP-Session-Id": session, **broad},
+        )
+        assert [tool["name"] for tool in listed.json()["result"]["tools"]] == ["add", "secret"]
+        # Its next stream, opened with the first credential, has it list again.
+        stream = await get_stream(client, session, narrow)
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.quiet()
         await stream.aclose()
 
 
@@ -993,6 +1070,36 @@ async def test_get_on_another_worker_announces_changes_since_initialize(
 
 def told(server: MCPServer) -> str:
     return server._list_digest("tools", None)
+
+
+async def test_a_broader_list_fetched_on_another_worker_is_told_when_a_stream_opens(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer, fast_debounce: float
+) -> None:
+    hub = FakeHub()
+    bases = []
+    for name in ("a" * 16, "b" * 16):
+        oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer], step_up=False)
+        server = make_server(store=hub.store(name), oauth=oauth)
+        register(server, "secret", scopes=["admin"])
+        bases.append(live_server(server))
+    narrow = bearer(fake_as.mint())
+    broad = bearer(fake_as.mint(claims={"scope": "mcp:access admin"}))
+    async with httpx.AsyncClient(timeout=10) as client:
+        client.base_url = httpx.URL(bases[0])
+        session = await initialize(client, narrow)  # told the list holds "add"
+        # No stream is open anywhere: another worker serves a broader list.
+        client.base_url = httpx.URL(bases[1])
+        listed = await client.post(
+            "/mcp",
+            json=rpc("tools/list", msg_id=2),
+            headers={**ACCEPT, "MCP-Session-Id": session, **broad},
+        )
+        assert [tool["name"] for tool in listed.json()["result"]["tools"]] == ["add", "secret"]
+        client.base_url = httpx.URL(bases[0])
+        stream = await get_stream(client, session, narrow)
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.quiet()
+        await stream.aclose()
 
 
 async def test_sse_initialize_relayed_from_another_worker_starts_notifications(

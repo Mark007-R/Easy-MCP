@@ -574,8 +574,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             self._server._notifier.end_session(session.session_id, sink)
             audit("stream_close", **fields, reason=stream.reason)
             # The lists it last told its client about are where the next
-            # stream starts from, on whichever worker it opens.
-            keep = None if stream.reason == "replaced" else dict(sink.baselines)
+            # stream starts from, on whichever worker it opens.  A change
+            # still waiting in its outbox never reached the client, so the
+            # next stream announces that list.
+            keep: dict[str, str] | None = None
+            if stream.reason != "replaced":
+                keep = dict(sink.baselines)
+                for kind in stream.outbox.pending_kinds():
+                    keep.pop(kind, None)
             task = asyncio.ensure_future(self._stream_closed(session, keep))
             self._stream_ends.add(task)
             task.add_done_callback(self._stream_ends.discard)
@@ -588,6 +594,24 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 await self._manager.save_baselines(session, baselines)
         finally:
             await self._manager.finish(session)
+
+    async def _forget_lists_seen_otherwise(
+        self, session: LocalSession, identity: ClientIdentity | None
+    ) -> None:
+        """Forget what *session*'s client was told about a list *identity* sees otherwise.
+
+        For a request of a session with no stream open here, where no sink
+        follows its credential.  Such a list (changed since, or seen with
+        another credential's view) may be fetched with this request, so what
+        the client holds is no longer known: its next stream announces it.
+        """
+        told = session.record.baselines
+        if session.notify_stream is not None or not told:
+            return
+        current = self._server._notifier.baselines([kind for kind, _ in told], identity)
+        kept = {kind: digest for kind, digest in told if current.get(kind) == digest}
+        if len(kept) < len(told):
+            await self._manager.save_baselines(session, kept)
 
     async def _handle_post(self, request: Request) -> Response:
         if not _accepts_json(request.headers.get("accept")):
@@ -645,6 +669,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 # A reply to a server-to-client request.  This server never
                 # sends those, so nothing is waiting for it.
                 return Response(status_code=202)
+            await self._forget_lists_seen_otherwise(session, identity)
             # This request's own identity: a refreshed or broader token takes
             # effect at once, in the same session.
             context = self._manager.context(session, identity)
