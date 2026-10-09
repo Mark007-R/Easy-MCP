@@ -46,6 +46,32 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _USER_AGENT = f"easy-mcp-kit/{__version__}"
 _CHUNK = 65536
 
+# Objects and arrays nested in any JSON this package reads from the network.
+# The parser's own recursion limit is no bound: it differs between platforms
+# (Python 3.12+ allows far deeper C recursion on Linux than on Windows).
+MAX_JSON_DEPTH = 32
+
+
+def nested_deeper_than(value: Any, limit: int) -> bool:
+    """Whether objects and arrays in *value* nest more than *limit* levels.
+
+    The top-level container is level 0.  Walks with a stack, so no input can
+    exhaust the recursion limit here.
+    """
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, dict):
+            children: Any = item.values()
+        elif isinstance(item, list):
+            children = item
+        else:
+            continue
+        if depth >= limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
 
 class FetchError(Exception):
     """A fetch failed; ``status`` is the HTTP status when the server answered.
@@ -325,6 +351,8 @@ def _exchange(
         ) from None
     except Exception:  # invalid UTF-8 or JSON
         raise FetchError(f"{url} did not answer with JSON", status=status) from None
+    if nested_deeper_than(document, MAX_JSON_DEPTH):
+        raise FetchError(f"{url} answered JSON nested too deeply", status=status, malformed=True)
     if not isinstance(document, dict):
         raise FetchError(f"{url} did not answer with a JSON object", status=status)
     return document
