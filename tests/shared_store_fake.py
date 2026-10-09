@@ -25,7 +25,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from easy_mcp.exceptions import RateLimitError, StoreUnavailableError
@@ -255,6 +255,17 @@ class FakeSharedStore(Store):
                     entry.expires = now + ttl
                     hub.index[kind][ref] = entry.expires
         return gone, expired
+
+    async def save_baselines(
+        self, kind: SessionKind, ref: str, baselines: Mapping[str, str]
+    ) -> None:
+        await self._op("baselines")
+        hub = self.hub
+        with hub.lock:
+            entry = hub._live(ref, hub.clock())
+            if entry is not None and entry.record.kind == kind:
+                pairs = tuple(sorted(baselines.items()))
+                entry.record = dataclasses.replace(entry.record, baselines=pairs)
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         await self._op("delete")

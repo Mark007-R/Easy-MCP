@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -180,6 +181,14 @@ redis.call('PEXPIRE', KEYS[3], keep)
 return 1
 """
 
+# KEYS: rec   ARGV: kind, baselines (JSON).  Only a session of that kind that still
+# exists: a bare HSET on an expired one would create the key again, without a TTL.
+SESSION_BASELINES = """
+if redis.call('HGET', KEYS[1], 'kind') ~= ARGV[1] then return 0 end
+redis.call('HSET', KEYS[1], 'bl', ARGV[2])
+return 1
+"""
+
 # KEYS: rec   ARGV: field ('c:<tool>'), limit
 SESSION_RESERVE = """
 if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end
@@ -238,6 +247,7 @@ _SCRIPTS = {
     "touch": SESSION_TOUCH,
     "refresh": SESSION_REFRESH_MANY,
     "delete": SESSION_DELETE,
+    "baselines": SESSION_BASELINES,
     "reserve": SESSION_RESERVE,
     "unreserve": SESSION_UNRESERVE,
     "client_reserve": CLIENT_RESERVE,
@@ -293,6 +303,26 @@ def _record(ref: str, reply: Any) -> SessionRecord | None:
         owner=fields.get("own") or None,
         principal=fields.get("pr") or None,
         t0=int(t0) if t0.isdigit() else None,
+        baselines=_baselines(fields.get("bl")),
+    )
+
+
+def _baselines(value: str | None) -> tuple[tuple[str, str], ...] | None:
+    """The ``bl`` field of a session record; ``None`` when absent or malformed."""
+    if not value:
+        return None
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return tuple(
+        sorted(
+            (kind, digest)
+            for kind, digest in data.items()
+            if isinstance(kind, str) and isinstance(digest, str)
+        )
     )
 
 
@@ -695,6 +725,12 @@ class RedisStore(Store):
         return gone, [
             ExpiredSession(ref, None, lost=alive == -2) for ref, alive in states if alive < 0
         ]
+
+    async def save_baselines(
+        self, kind: SessionKind, ref: str, baselines: Mapping[str, str]
+    ) -> None:
+        value = json.dumps(dict(sorted(baselines.items())), separators=(",", ":"))
+        await self._run("baselines", [self._session_key(ref)], [kind, value])
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         reply = await self._run(

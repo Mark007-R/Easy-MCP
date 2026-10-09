@@ -22,7 +22,7 @@ import enum
 import hashlib
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
@@ -116,7 +116,10 @@ class SessionRecord:
     that stays in this process keeps; a shared store never writes it.
     ``t0`` is when the session was opened, in milliseconds since the epoch:
     by the opening worker's clock in the record it files, and by the
-    store's own clock in a record a shared store returns.
+    store's own clock in a record a shared store returns.  ``baselines``
+    are ``(list kind, digest)`` pairs: what the session's client was last
+    told each list holds (:meth:`Store.save_baselines`), ``None`` before
+    anything was recorded.
     """
 
     ref: str
@@ -128,6 +131,7 @@ class SessionRecord:
     session_id: str | None = None
     principal: str | None = None
     t0: int | None = None
+    baselines: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +311,23 @@ class Store(abc.ABC):
             expired and removed, and those it found lost (``lost``), which
             no other call reports from then on.
         """
+
+    async def save_baselines(
+        self, kind: SessionKind, ref: str, baselines: Mapping[str, str]
+    ) -> None:
+        """Record what a session's client was last told its lists hold.
+
+        *baselines* maps a list kind (``"tools"``) to a digest of the list
+        (32 hex characters).  The session's ``initialize`` records them, and
+        so does the end of its ``GET /mcp`` stream; the worker that opens
+        its next stream announces every list whose digest differs.  The
+        record returned by :meth:`acquire_session` carries them.  A session
+        that is gone, or of another kind, is left alone.
+
+        The default records nothing: a session's stream then announces only
+        the changes made while it is open.
+        """
+        return None
 
     @abc.abstractmethod
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
