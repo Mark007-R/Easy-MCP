@@ -24,6 +24,13 @@ Consequences:
 - MCP clients are often driven by LLMs subject to prompt injection. Design
   tools so that even a confused client cannot cause irreversible damage
   (least privilege, scoped keys, idempotent operations, usage caps).
+- Resource, prompt and completer functions are trusted code too, and
+  resource template values and prompt arguments are attacker-influenced input
+  like tool arguments. Resource contents may carry third-party text (files,
+  web pages, tickets) into a model's context, an indirect prompt-injection
+  channel the library cannot sanitize: mark content meant for people only
+  with `annotations={"audience": ["user"]}`, and keep untrusted content out of
+  resources that models read on their own.
 
 ## Protections built in
 
@@ -32,6 +39,11 @@ Consequences:
 | Credential stuffing / key probing | Constant-time comparison of SHA-256 digests over the full key set (`hmac.compare_digest`); timing reveals neither partial matches nor key length |
 | Key leakage via logs | Raw keys never logged; only SHA-256 fingerprints appear in logs and audit events |
 | Unauthorized tool use | Per-tool `requires_auth` and scope checks; protected tools are omitted from `tools/list` and report as unknown to unauthorized callers (no enumeration) |
+| Unauthorized resource or prompt access | The same `requires_auth`/scope checks as tools; protected resources, templates and prompts are omitted from lists and answer exactly like missing ones on read, get, subscribe and completion (same code, message and `data`); cursors reveal only keys the caller was shown. With OAuth step-up, a token is challenged (`403`) instead, as for tools, and a listen's acknowledgment leaves out resources it cannot read |
+| Directory traversal through resource templates | Template values are percent-decoded as strict UTF-8 and refused before the function runs if they contain a `.` or `..` segment, a backslash or a control character (and any `/` for `{name}`, a leading one for `{+name}`); such a URI reads as missing. `safe_path()` confines file access to a root, symlinks included, refusing absolute, drive and UNC paths |
+| Completion-based disclosure | Completers run only for callers who may see their prompt or template; at most 100 values; every request spends the rate limit; errors are sanitized |
+| Cross-caller caching of protected data | Stateless lists are `cacheScope: "private"` whenever auth is configured or request middleware is registered; a `resources/read` is `private` for a protected resource, with `oauth=`, with request middleware, or for a retry carrying `inputResponses`/`requestState`. Access is checked on every request whatever a cache holds |
+| Notification flooding / subscription exhaustion | Updates carry only a URI and coalesce per recipient; a session watches at most 1000 URIs and a listen names at most 1000 (`-32007`/`-32602` beyond), each at most 2048 characters; listen streams keep their caps (8 per client, `max_sessions` per process); opening a stream spends rate-limit budget |
 | Session hijacking | Session ids are 192-bit random capability tokens; every request on a session (SSE POST, Streamable HTTP GET/POST/DELETE), on whichever worker receives it, must present the same credential the session was opened with (403 otherwise), and its scopes come from that credential, never from stored session state; with OAuth, every request re-verifies its own token and the session is bound to the signed-in principal, comparing its issuer, subject and client in full; the principal's fingerprint (the rate-limit and call-count key) is 128 bits, so no client can grind a client id that shares another's |
 | Tokens for other services or from other issuers | `aud` must name this server (`resource`, or `audience=`) and `iss` must equal a configured authorization server byte for byte, checked before anything is fetched; keys come only from that server's metadata; introspection answers must carry `aud` too |
 | JWT algorithm confusion and forged keys | Asymmetric allow-list; `none`/HMAC refused at construction; each key's type, curve, size, `use`, `alg` and `key_ops` bound to the token's `alg`; `jwk`/`jku`/`x5u`/`x5c` headers ignored; symmetric keys never loaded |
@@ -46,8 +58,8 @@ Consequences:
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
 | Request flooding | Per-client sliding-window rate limiting on every method, including discovery and opening an SSE session; idle clients are dropped from the limiter so its memory stays bounded; concurrent session cap (`max_sessions`) |
 | Session exhaustion (Streamable HTTP) | Sessions idle past `session_idle_timeout` (default 1 h) expire; `max_sessions` caps the server's live sessions (503 beyond it), those of every endpoint serving it together and, with a shared store, of every worker; `DELETE` ends a session early and cancels its running calls, on every worker |
-| Shared-store disclosure | A shared store holds no API keys, tokens or session ids: sessions are filed under SHA-256 digests of their ids, and call counts and rate limits under digests of client ids. Each session record keeps its client id in clear (a key fingerprint, a token principal's fingerprint, or `ip:<address>` for an anonymous client), the credential's fingerprint, a digest of a token's principal and 128-bit digests of the tool list its client was last told about; reading it yields nothing that opens a session |
-| Cross-worker message injection | Cancels, session ends and relayed legacy SSE answers between workers are authenticated with a key derived from the session id, which the store never sees, checked against the session's credential fingerprint, and dropped when more than 60 s old; failures are audited as `bus_message_rejected`. Only integer or short string request ids are relayed, and relayed answers are capped at 4 MiB |
+| Shared-store disclosure | A shared store holds no API keys, tokens or session ids: sessions are filed under SHA-256 digests of their ids, and call counts and rate limits under digests of client ids. Each session record keeps its client id in clear (a key fingerprint, a token principal's fingerprint, or `ip:<address>` for an anonymous client), the credential's fingerprint, a digest of a token's principal, 128-bit digests of the lists its client was last told about, and the resource URIs it subscribed to, in clear (keep secrets out of URIs); reading it yields nothing that opens a session |
+| Cross-worker message injection | Cancels, session ends, relayed legacy SSE answers and "read the subscriptions again" notices between workers are authenticated with a key derived from the session id, which the store never sees, checked against the session's credential fingerprint, and dropped when more than 60 s old; failures are audited as `bus_message_rejected`. Only integer or short string request ids are relayed, and relayed answers are capped at 4 MiB |
 | Limits bypassed during a store outage | When the shared store cannot be reached, requests that depend on it (sessions, rate limits, `max_calls_per_session`) are refused (`-32008` with `data.reason = "store_unavailable"`, HTTP 503) rather than served without their limits; there is no fail-open setting, and `/healthz` answers 503 so a load balancer can drain the worker. A request fails closed the same way when Redis answers but refuses a write it needs (Redis full, read-only, failing to persist); `/healthz`, which checks only that Redis answers, stays 200 then |
 | Resource exhaustion via slow tools | Per-tool and server-default timeouts; sync tools run off the event loop so they cannot stall other clients |
 | Information disclosure | Production errors are opaque (`error_id` only); tracebacks stay in server logs; `debug=True` is loudly warned about at startup |
@@ -55,7 +67,7 @@ Consequences:
 | Crash amplification | Exceptions in one tool call are contained; the server keeps serving |
 | Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
 | Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
-| Change notifications revealing hidden tools | A client is told about a list change only when the list it may see changed: each recipient compares a digest of exactly what `tools/list` returns to its credential (on a session, its latest request's; with a shared store, the latest one the worker holding its `GET /mcp` stream served) with what it was last told, and a session whose credential changes what it may see is told once to list again (with no `GET /mcp` stream open, as soon as one opens). Notifications carry no names, so even a visible change reveals only "your list changed", which the next `tools/list` shows anyway |
+| Change notifications revealing hidden tools, resources or prompts | A client is told about a list change only when the list it may see changed: each recipient compares a digest of exactly what the list returns to its credential (`tools/list`, `prompts/list`, or `resources/list` and `resources/templates/list` together) (on a session, its latest request's; with a shared store, the latest one the worker holding its `GET /mcp` stream served) with what it was last told, and a session whose credential changes what it may see is told once to list again (with no `GET /mcp` stream open, as soon as one opens). Notifications carry no names, so even a visible change reveals only "your list changed", which the next `tools/list` shows anyway |
 | Stream exhaustion | `subscriptions/listen`: 8 streams per client and `max_sessions` per process, each opening one rate-limit unit, refused with `-32007` (HTTP 503) beyond; `GET /mcp`: one stream per session (a new one replaces the old) and one rate-limit unit per open, with sessions capped by `max_sessions`. Change notifications waiting to be written coalesce on every stream (`GET /mcp`, listen streams, legacy `/sse`), so a client that stops reading cannot grow a backlog of them (on `/sse`, answers to its own requests still queue); keep-alives every 15 s find dead peers, and a stream opened with an OAuth token ends when the token expires |
 | Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
@@ -275,6 +287,25 @@ the client is untrusted, the credential in the environment is trusted.
   may be announced on both. Over legacy SSE with a shared store, a
   `subscriptions/listen` posted to a worker that does not hold the stream is
   answered `-32601`.
+- **Resource updates are per process, and best effort.**
+  `notify_resource_updated` tells the streams of its own worker only, so the
+  code calling it must run in every worker. With a shared store, an update
+  made while a session has no stream open is lost (its next stream may open
+  on any worker); with the default store it waits for the next stream, and
+  an update still queued on a stream whose client leaves is lost either way.
+  A client that subscribed while a resource was public keeps being told its
+  URI after it is re-registered as protected; reads are still refused.
+- **Resource contents are not size-capped.** A resource's return value is
+  held in memory and base64-encoded when binary; serve large data in pieces
+  through a template.
+- **Capabilities reflect what is registered.** The first resource or prompt
+  registered after serving began reaches clients that cached
+  `server/discover` only when their copy expires (within the hour; logged).
+  URI templates support `{name}` and `{+name}` only.
+- **URIs are audit subjects.** Resource URIs are logged (cut to 512
+  characters) and, for subscriptions with a shared store, kept in the
+  store: do not put secrets in URIs. Contents and prompt argument values are
+  never logged.
 - **A stdio client that stops reading stdout stalls the server** once the
   pipe buffer is full, as it always has: responses and notifications share
   the pipe. Notifications are rate-bounded (one per list per 0.1 s at most)
@@ -364,6 +395,8 @@ easy_mcp for sandboxing:
 - [ ] Audit logs (`easy_mcp.audit`) shipped to your log store and reviewed.
 - [ ] Scoped keys per client application; no shared "god" key.
 - [ ] Tools validate/sanitize their own argument *content* (paths, SQL, shell).
+- [ ] Resource functions that touch files use `safe_path()`.
+- [ ] Completers return only what every caller allowed to see their prompt or template may see.
 - [ ] Middleware that calls other services bounds each call with a timeout and exports no arguments, results or credentials without review.
 - [ ] Multiple workers: a shared store, TLS to it (`rediss://`), a dedicated ACL user, `noeviction`, and a distinct server `name` (or `namespace=`) per server sharing it.
 

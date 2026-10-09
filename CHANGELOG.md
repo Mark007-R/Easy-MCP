@@ -255,8 +255,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   stdio (and legacy SSE `/messages`). The response is the stream:
   `notifications/subscriptions/acknowledged` with the honored filter first,
   then the requested notifications tagged with
-  `io.modelcontextprotocol/subscriptionId`. Kinds the server does not offer,
-  and `resourceSubscriptions`, are left out of the acknowledgment. Over HTTP
+  `io.modelcontextprotocol/subscriptionId`. Kinds the server does not offer
+  are left out of the acknowledgment (`resourceSubscriptions` too, on a
+  server without resources; see resource updates below). Over HTTP
   the client must accept `text/event-stream` (`406` otherwise), a refused
   listen is answered as JSON, and closing the response ends the
   subscription; over stdio, `notifications/cancelled` does. At shutdown, when
@@ -282,6 +283,91 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   nothing, so existing stores keep working.
 - Audit events `subscription_open`, `subscription_close`,
   `subscription_refused`, `stream_open` and `stream_close`.
+- MCP resources. `@server.resource("scheme://...")` exposes a function as a
+  resource: its return value is the content (`str` as text, `bytes` as a
+  base64 `blob`, dicts, lists and Pydantic models as JSON with sorted keys,
+  `ResourceContent` items as given, several for one read), the MIME type
+  comes from `mime_type=` or the return annotation, and the description from
+  the docstring. A URI with `{name}` or `{+name}` is an RFC 6570 template
+  whose variables become the function's parameters, converted to `int`,
+  `float`, `bool` or a `Literal` from the annotation (`str` without one); a
+  value that does not convert does not match. Other RFC 6570 forms are
+  refused at registration. `resources/list`, `resources/templates/list` and
+  `resources/read` are served in both protocol eras. Returning `None` or
+  raising `ResourceNotFoundError` answers "resource not found": `-32602` for
+  stateless (`2026-07-28`) requests and `-32002` in the handshake era, as
+  each revision specifies, with the URI in `data` (up to 2048 characters).
+  `register_resource`, `unregister_resource`, `server.resources` and
+  `server.resource_templates` mirror the tool API.
+- Template values are refused before your function runs when they contain a
+  `.` or `..` segment, a backslash or a control character (and any `/` for
+  `{name}`, a leading one for `{+name}`), and `safe_path(root, path)` keeps
+  file access inside a folder, symlinks included.
+- MCP prompts. `@server.prompt` exposes a function as a prompt; its
+  parameters become the prompt's arguments (with descriptions from
+  `Annotated` or the docstring), arriving as strings and converted like
+  template variables. A prompt returns a string or a list of `Message`s
+  holding text, `Image`, `Audio`, an embedded `ResourceContent` or a
+  `ResourceLink`. `prompts/list` and `prompts/get` are served in both eras;
+  unknown prompts and invalid arguments are `-32602`, every violation listed
+  in `data.errors`. `register_prompt`, `unregister_prompt` and
+  `server.prompts` mirror the tool API.
+- Argument completion (`completion/complete`) for prompts and resource
+  templates: `Literal` and `bool` parameters complete automatically, and
+  `complete={"arg": [...] or fn}` adds lists (prefix, then substring
+  matches, case-insensitive) or functions `fn(value, arguments)`, sync or
+  async. At most 100 values are returned, with `hasMore` and, when known,
+  `total`.
+- `resources/list`, `resources/templates/list` and `prompts/list` are
+  paginated (100 per page) with cursors that stay valid while items come
+  and go; an invalid cursor is `-32602`. `tools/list` is not paginated.
+- Stateless results carry the cache hints the revision requires: the three
+  lists `ttlMs: 0`, `private` when auth is configured or request middleware
+  is registered; `resources/read` the resource's `cache_ttl=` (seconds,
+  default 0), `private` for a protected resource, with `oauth=`, with
+  request middleware, or for a retry carrying `inputResponses` or
+  `requestState` (then also `ttlMs: 0`). `prompts/get` and
+  `completion/complete` carry none, as the revision specifies.
+- Resources, prompts and completers run with the same timeouts, cancel
+  tokens, `max_sync_workers` cap and sanitized errors as tools, and
+  `current_identity()` works inside them; a `ToolError`'s text reaches the
+  client as a `-32603` message. Their `requires_auth` and `scopes` work as
+  for tools: protected items are left out of lists and answer exactly like
+  missing ones. With OAuth step-up a token sees them all and is challenged
+  (`403 insufficient_scope`) on a read, `prompts/get`, completion or
+  `resources/subscribe` it cannot use. With `oauth=`, their scopes must be
+  RFC 6749 scope-tokens other than `offline_access`.
+- Resource updates. `server.notify_resource_updated(uri)`, callable from any
+  thread, sends `notifications/resources/updated` to every client watching
+  that exact URI and returns how many subscriptions matched and had it
+  queued: through `resources/subscribe` in the handshake era (over stdio,
+  legacy SSE, or the session's `GET /mcp` stream) and through a listen's
+  `resourceSubscriptions` for stateless clients (tagged with the listen's
+  id; the acknowledgment lists the URIs honored, those the caller may read).
+  An update still waiting to be written is not queued again. A session may
+  watch 1000 URIs (`-32007`, HTTP `503`, beyond) and a listen name 1000
+  (`-32602`). A session's subscriptions end with it. With the default store,
+  an update made while a Streamable HTTP session has no `GET /mcp` stream
+  open is sent when one opens; with a shared store a session's subscriptions
+  are kept in its record, and the worker that changes them tells the worker
+  holding the session's stream to read them again.
+- The prompts and resources lists are announced like the tool list
+  (`notifications/prompts/list_changed`, `notifications/resources/list_changed`,
+  which covers templates too, and the listen filter's `promptsListChanged`
+  and `resourcesListChanged`).
+- Audit events `resource_read` and `prompt_get` (never with contents or
+  argument values; URIs cut to 512 characters), `resource_subscribe`,
+  `resource_unsubscribe`, `resource_finished_after_cancel`,
+  `prompt_finished_after_cancel` and `completion_finished_after_cancel`;
+  `request_cancelled` covers reads, prompts and completions, and
+  `subscription_open` counts the `resources` a listen watches.
+- `RegistrationError`, the new base of `ToolRegistrationError` (existing
+  `except` clauses keep working), `ResourceNotFoundError`, and the content
+  types `ResourceContent`, `Image`, `Audio`, `ResourceLink` and `Message`.
+- For custom stores: `SessionRecord.subscriptions` and
+  `Store.update_subscriptions()`. The default raises `NotImplementedError`,
+  and `resources/subscribe` is then answered `-32601` for that store's
+  sessions; existing stores keep working otherwise.
 
 ### Changed
 
@@ -400,6 +486,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   server-initiated messages (`ClientContext.push` unset) is still `-32601`.
 - `ClientContext` compares and hashes by identity, and can be weakly
   referenced.
+- `initialize` and `server/discover` advertise `resources`
+  (`{"subscribe": true, "listChanged": true}`), `prompts`
+  (`{"listChanged": true}`) and `completions` (`{}`) from the first
+  resource or template, prompt, or completion source registered, under the
+  same rule: never withdrawn. A server with only tools reports exactly what
+  it did, and `resources/list` and the other new methods still answer it
+  `-32601` (HTTP `404` statelessly).
+- `ToolRegistrationError` is now a subclass of the new `RegistrationError`.
+  Registering a tool, resource or prompt while serving with a shared store
+  logs the same warning.
 
 ### Deprecated
 

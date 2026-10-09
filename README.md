@@ -12,9 +12,9 @@
 Watch the [demo video](docs/Demo.mp4) and browse the [server](docs/server.py.png) / [client](docs/client.py.png) code snapshots in [`docs/`](docs/).
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
-Schema generation, validation, authentication, rate limiting, timeouts,
-structured logging, and sanitized error handling are all built in — and secure
-by default.
+Tools, resources and prompts are all plain functions. Schema generation,
+validation, authentication, rate limiting, timeouts, structured logging, and
+sanitized error handling are all built in — and secure by default.
 
 ```python
 from easy_mcp import MCPServer
@@ -59,6 +59,8 @@ Several worker processes sharing sessions and limits need Redis:
 | Validation | Nothing | Rejects unknown fields, wrong types, missing params — before your code runs |
 | Structured results | A return type | Publishes `outputSchema` and answers with `structuredContent` |
 | Rich schemas | A Pydantic model (optional) | The model's own schema and validation, for parameters and results |
+| Resources | `@server.resource("scheme://...")` | Lists, reads, URI templates, MIME types, binary as base64, path-traversal guard, subscriptions |
+| Prompts | `@server.prompt` | Argument metadata from the signature, typed arguments, completion from `Literal` |
 | Auth | `auth=APIKeyAuth({...})` or `oauth=OAuthResourceServer(...)` | Constant-time key checks, OAuth 2.1 bearer tokens with audience checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Several workers | `store=RedisStore.from_env()` | Sessions, call caps and rate limits shared between processes, no sticky routing |
@@ -207,6 +209,138 @@ hoisting those out of an arbitrary nesting depth is ambiguous; wrap it in a
 model instead. And two different models that share a class name in one tool are
 refused for the same reason: their definitions would collide.
 
+### Resources
+
+A resource is data a client can read by URI: a configuration, a document, a
+database schema. Declare it the way you declare a tool; the return value is
+the content:
+
+```python
+from easy_mcp import ResourceContent, ResourceNotFoundError, safe_path
+
+@server.resource("config://app", mime_type="application/json", cache_ttl=300)
+def app_config() -> dict[str, Any]:
+    """The application's runtime configuration."""
+    return {"region": "eu-west-1", "features": {"beta": True}}
+
+# A URI with {name} or {+name} is a template: its variables are the parameters.
+@server.resource("users://{user_id}/avatar", mime_type="image/png", scopes=("users",))
+def avatar(user_id: int) -> bytes | None:
+    """A user's avatar image."""
+    return load_avatar(user_id)          # None: "resource not found"
+
+@server.resource("docs://guides/{+path}", mime_type="text/markdown")
+def guide(path: Annotated[str, "Path below the guides folder"]) -> str | None:
+    """A guide from the documentation folder."""
+    file = safe_path(GUIDES_ROOT, path)  # refuses anything that leaves the folder
+    return file.read_text("utf-8") if file.is_file() else None
+
+server.register_resource(load_schema, "db://schema", mime_type="application/sql")
+server.unregister_resource("db://schema")
+server.resources, server.resource_templates   # what is registered
+```
+
+| The function returns | The client reads | Default `mimeType` |
+|---|---|---|
+| `None` (or raises `ResourceNotFoundError`) | "resource not found" | — |
+| `str` | one text item | `text/plain` |
+| `bytes` | one `blob` item, base64 | `application/octet-stream` |
+| a dict, list, number or Pydantic model | one text item, JSON with sorted keys | `application/json` |
+| `ResourceContent(text=...)` or `(blob=...)`, or a list of them | those items (several files for one read) | as given |
+
+`mime_type=` wins over the default, which comes from the return annotation,
+never from a file extension. The description comes from the docstring.
+`resources/list` lists the concrete resources and `resources/templates/list`
+the templates; both are paginated (100 per page) and sorted.
+
+Template variables arrive as strings and are converted to the parameter's
+type: `str` (also the type of a parameter without an annotation), `int`,
+`float`, `bool` or a `Literal`. A value that does not convert means the URI
+does not match. `{name}` matches one path segment, `{+name}` several; every
+other RFC 6570 form is refused at registration. Values are percent-decoded,
+and one that could walk out of a folder (a `.` or `..` segment, a backslash,
+a control character, a `/` in `{name}`, a leading `/` in `{+name}`) never
+matches, so your function never sees it. A concrete resource with the exact
+URI wins over templates; among templates the one with the most literal
+characters wins. `safe_path(root, path)` is the second layer for code that
+touches files: it resolves symlinks and refuses anything outside `root` by
+raising `ResourceNotFoundError`.
+
+A missing resource is `-32602` for stateless (`2026-07-28`) clients and
+`-32002` in the handshake era, as each revision specifies, with the URI in
+`data.uri`. `requires_auth` and `scopes` work as for tools: a protected
+resource or template is left out of the lists, and reads as missing to a
+caller who cannot use it. `cache_ttl` (seconds, default 0) is the `ttlMs` a
+stateless client may cache a read for; reads of protected resources are
+`cacheScope: "private"`. A resource that reads `current_identity()` to tailor
+its content should keep `cache_ttl=0` or require authentication.
+`ToolError("message")` raised in a resource is `-32603` with your message;
+anything else is `-32603` with an `error_id`.
+
+### Prompts
+
+A prompt is a message template a user picks in the client. Its parameters are
+its arguments:
+
+```python
+from easy_mcp import Image, Message, ResourceContent, ResourceLink
+
+@server.prompt
+def summarize(text: str) -> str:
+    """Summarize a passage in three bullet points."""
+    return f"Summarize this in three bullet points:\n\n{text}"   # one user message
+
+@server.prompt(title="Review code", scopes=("dev",))
+def code_review(
+    code: Annotated[str, "The code to review"],
+    language: Literal["python", "go", "rust"] = "python",   # completes automatically
+    max_issues: int = 5,                                      # "5" on the wire -> 5
+) -> list[Message]:
+    """Ask for a focused review of a snippet."""
+    return [
+        Message.user(f"Review this {language} code; list at most {max_issues} issues."),
+        Message.user(ResourceContent(uri=f"docs://style/{language}", text=STYLE[language],
+                                     mime_type="text/markdown")),
+        Message.user(code),
+    ]
+```
+
+Arguments arrive as strings and are converted like template variables (`str`,
+`int`, `float`, `bool`, `Literal`, and `T | None` with a default); every
+other type is refused at registration. Bad arguments (not a string, unknown,
+missing, not convertible) are `-32602` with every violation listed in
+`data.errors`. A prompt returns a string, a `Message`, or a list of strings
+and messages; a message's content is text, `Image(data, mime_type)`,
+`Audio(data, mime_type)`, an embedded `ResourceContent` (with `uri` and
+`mime_type`) or a `ResourceLink(uri, name)`. `register_prompt`,
+`unregister_prompt` and `server.prompts` mirror the tool API. Unknown and
+hidden prompts answer alike: `-32602 "Unknown prompt"`.
+
+### Completion
+
+Clients ask `completion/complete` for values of a prompt argument or a
+template variable as the user types. `Literal` and `bool` parameters complete
+from their values with nothing to write; `complete=` adds a list or a
+function for the others:
+
+```python
+@server.prompt(complete={"table": list_tables})          # fn(value, arguments) -> strings
+def explain_table(table: str, schema: str = "public") -> str:
+    """Explain what a database table holds."""
+    return f"Explain the table {schema}.{table}."
+
+@server.resource("db://{schema}/tables/{table}", complete={"schema": ["public", "audit"]})
+def table_info(schema: str, table: str) -> str: ...
+```
+
+A list is matched case-insensitively, prefix matches first, then substring
+matches. A function gets the partial value and the arguments the client
+already filled in (of the same prompt or template only), may be async, and
+ranks its own results; a sync one runs on a worker thread. At most 100 values
+are returned, with `hasMore` and, when the size is known, `total`; an endless
+generator is read no further than that. A completer runs only for callers who
+may see its prompt or template, so treat it as data access.
+
 ### Transports: Streamable HTTP, SSE, or stdio
 
 The same server object serves every transport; nothing else changes.
@@ -282,7 +416,11 @@ fails at startup rather than silently downgrading to anonymous access.
 ### Change notifications
 
 The server announces tool-list changes on every transport, and advertises
-`tools.listChanged: true` in `initialize` and `server/discover`. Clients that
+`tools.listChanged: true` in `initialize` and `server/discover`. Prompt and
+resource lists are announced the same way (`prompts.listChanged`,
+`resources.listChanged`; templates count as resources) once the first prompt
+or resource is registered. A capability, once advertised, stays: a kind
+emptied later lists empty. Clients that
 open with `initialize` get `notifications/tools/list_changed` on their
 session's channel once the handshake is answered: stdout over stdio, the
 `/sse` stream, or over Streamable HTTP a `GET /mcp` stream carrying the
@@ -329,6 +467,41 @@ sends on the client's channel) and `ClientContext.multiplexed`, and by calling
 `server.close_subscriptions(context)` when the channel ends, and again once
 the requests it was still running have finished (an `initialize` answered
 meanwhile starts the session's notifications anew).
+
+### Resource updates
+
+When a resource changes, tell the clients watching it:
+
+```python
+server.notify_resource_updated("config://app")   # any thread; returns how many were told
+```
+
+Clients get the URI only, and read the resource again. Handshake-era clients
+watch a resource with `resources/subscribe` (and stop with
+`resources/unsubscribe`), and the update arrives as
+`notifications/resources/updated` on the same channel as list changes:
+stdout, the `/sse` stream, or the session's `GET /mcp` stream. With the
+default store, an update made while a Streamable HTTP session has no
+`GET /mcp` stream open is sent when one opens. Stateless clients put the
+URIs in a listen's `resourceSubscriptions`; the acknowledgment lists those
+honored (the ones they may read), and each update is tagged with the listen
+request's id:
+
+```json
+{"jsonrpc": "2.0", "id": "watch", "method": "subscriptions/listen",
+ "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                      "io.modelcontextprotocol/clientCapabilities": {}},
+            "notifications": {"resourceSubscriptions": ["config://app"]}}}
+```
+
+URIs match exactly: to tell the watchers of a "directory" URI, notify that
+URI too. An update still waiting to be written is not queued again, so a burst
+of updates reaches a client as one. A session may watch 1000 URIs and a
+listen stream name 1000 (`-32007`, HTTP `503`, and `-32602` respectively,
+beyond); a URI over 2048 characters cannot be watched. Subscriptions end with
+the session (or the listen stream), and a resource re-registered as
+protected keeps its watchers: they are told its URI, which they knew, but
+cannot read it.
 
 ### Launching from the command line
 
@@ -398,13 +571,19 @@ No sticky routing is needed. With the store in place:
   worker).
 
 Some things stay with one worker: a running call, an open stream,
-`max_sync_workers`, timeouts, and tools registered at runtime (registering
-one while serving logs a warning). Every worker must import the same module,
-with the same tools, keys and settings. Change notifications are per worker
-too: each tells the streams it holds about its own tools, so a change made at
-runtime must be made in every worker. What a session's client was last told
-is kept in the store, so its `GET /mcp` stream, on whichever worker it opens,
-announces exactly the changes since then. Stateless (`2026-07-28`) requests
+`max_sync_workers`, timeouts, and tools, resources and prompts registered at
+runtime (registering one while serving logs a warning). Every worker must
+import the same module, with the same tools, resources, prompts, keys and
+settings. Change notifications are per worker too: each tells the streams it
+holds about its own lists, so a change made at runtime must be made in every
+worker. What a session's client was last told is kept in the store, so its
+`GET /mcp` stream, on whichever worker it opens, announces exactly the
+changes since then. So are the resources a session subscribed to: a
+`resources/subscribe` served by one worker reaches the stream another holds
+(the store tells it to read them again). `notify_resource_updated` tells the
+streams of its own worker only, so call it in every worker, and an update
+made while a session has no stream open is lost (its next stream may open on
+any worker). Stateless (`2026-07-28`) requests
 never had sessions; the store shares their rate limits and per-client call
 counts, which with `RedisStore` lapse after `session_idle_timeout` without a
 counted (or refused) call, rather than without any request.
@@ -477,7 +656,10 @@ def admin_tool() -> str:
 Clients authenticate with `Authorization: Bearer <key>` or `X-API-Key`.
 Protected tools are **invisible** to clients that cannot call them — they are
 omitted from `tools/list` and reported as unknown on `tools/call`, so
-unauthorized clients cannot even enumerate them.
+unauthorized clients cannot even enumerate them. Resources, templates and
+prompts take the same `requires_auth` and `scopes`: a protected one is left
+out of its list, and reads, gets, completes and subscribes exactly like one
+that does not exist.
 
 ### OAuth 2.1 bearer tokens
 
@@ -531,7 +713,10 @@ What clients see:
   `403` (sent before the body is read) names only `required_scopes`.
   Pass `step_up=False` to keep protected tools invisible to
   tokens that cannot call them, as with API keys. A token's `*` scope is never
-  a wildcard.
+  a wildcard. Resources, templates and prompts follow the same rule: a
+  signed-in caller sees them all, and a read, a `prompts/get`, a completion or
+  a `resources/subscribe` its token does not cover gets the same `403`. A
+  listen's acknowledgment leaves such resources out instead.
 - Inside a tool, `current_identity()` tells you who is calling: `subject`,
   `client_id`, `issuer`, `scopes`, `claims`. The token itself is never handed
   to your code: use your own credentials for anything the tool calls.
@@ -604,7 +789,12 @@ async def expensive(query: str) -> str:
 The rate limit and `max_calls_per_session` count per process by default; with
 a shared store they count across every worker (see
 [Running several workers](#running-several-workers)). Timeouts, payload caps
-and `max_sync_workers` always apply per process. Opening a notification
+and `max_sync_workers` always apply per process. Resources, prompts and
+completers run like tools: `default_timeout` (or their own `timeout=`), a
+cancel token, and the same `max_sync_workers` for sync functions, so a flood
+of slow sync reads can make a sync tool answer `-32008`. Every request,
+completion included, spends the rate limit. `max_calls_per_session` is for
+tools only. Opening a notification
 stream (`GET /mcp`, `GET /sse` or `subscriptions/listen`) costs one request of
 the budget, like any message; neither timeouts nor `max_calls_per_session`
 apply to it.
@@ -790,7 +980,12 @@ caller.
 | Invalid arguments | JSON-RPC `-32602` listing every violation |
 | Tool raises `ToolError("msg")` | `isError: true` with your message verbatim |
 | Tool raises anything else | `isError: true` with `Tool execution failed (error_id=...)` — no traceback, no exception text |
-| Tool exceeds its timeout | `-32005` timeout error |
+| Tool exceeds its timeout | `-32005` timeout error (also for a resource, prompt or completer) |
+| Resource not found, or hidden from the caller | `-32602` (stateless) / `-32002` (handshake era), with `data.uri` |
+| Unknown or hidden prompt, bad prompt arguments, invalid cursor | `-32602` (arguments: every violation in `data.errors`) |
+| Resource, prompt or completer raises `ToolError("msg")` | `-32603` with your message verbatim |
+| Resource, prompt or completer raises anything else, or returns what cannot be sent | `-32603` with `error_id` |
+| A session watches 1000 resources already (`resources/subscribe`) | `-32007`; HTTP `503` |
 | Rate limit exceeded | `-32003` with `retry_after_seconds` |
 | Session cap reached | `-32006` |
 | Too many open `subscriptions/listen` streams | `-32007`; HTTP `503` |
@@ -836,8 +1031,23 @@ answered, with a timeout of its own, say), `middleware_failed` (with its
 `request_cancelled` when a request other than `tools/call` is cancelled. None
 of them carries arguments, results, `_meta` or headers.
 
+Resources and prompts add `resource_read` (the URI, cut to 512 characters,
+the `template` it matched, the client, duration and `status`: `ok`,
+`not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`, with an
+`error_id` when one was logged, and `hidden: true` when the URI matched an
+item the caller may not see) and `prompt_get` (the prompt, the client,
+duration and `status`, `denied` for bad arguments). Neither carries
+contents or argument values. `resource_subscribe` and `resource_unsubscribe`
+name the URI, the client and the session. `request_cancelled` covers reads,
+prompts and completions, and `resource_finished_after_cancel`,
+`prompt_finished_after_cancel` and `completion_finished_after_cancel` mirror
+`tool_finished_after_cancel`. Completions are not audited one by one (they
+arrive per keystroke); their failures are logged with an `error_id`, and list
+requests are not audited, as `tools/list` is not.
+
 Change notifications add `subscription_open` (the client, the listen
-request's id and the list kinds it gets), `subscription_close` (with its
+request's id, the list kinds it gets and how many `resources` it watches),
+`subscription_close` (with its
 `reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`,
 `token_expired`, `undeliverable` or `closed`), `subscription_refused`
 (`client_limit` or `server_limit`), and `stream_open` / `stream_close` for a
@@ -1020,10 +1230,16 @@ user with only the `read` role.
 ```
 easy_mcp/
 ├── server.py        MCPServer: registration, dispatch, execution, lifecycle
-├── subscriptions.py list-change fan-out: debounce, visibility, subscriptions/listen
+├── subscriptions.py change fan-out: list changes, resource updates, subscriptions/listen
 ├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
 ├── middleware.py    request and tool middleware, current_tool_call()
-├── decorators.py    @tool machinery, ToolDefinition, thread-safe registry
+├── decorators.py    @tool machinery, ToolDefinition, thread-safe registries
+├── resources.py     resources and URI templates, their registry, safe_path()
+├── prompts.py       prompts and their arguments
+├── content.py       ResourceContent, Message, Image, Audio, ResourceLink; rendering
+├── completion.py    completion sources: lists, functions, Literal and bool
+├── uritemplate.py   the RFC 6570 subset ({name}, {+name}) and the traversal guard
+├── pagination.py    stable keyset cursors for the resource and prompt lists
 ├── schema.py        type hints → JSON Schema; docstring parsing; validation
 ├── security/
 │   ├── auth.py      APIKeyAuth (constant-time), scopes, visibility rules
@@ -1064,8 +1280,8 @@ WebSocket transport cannot silently bypass one. A custom transport should pass
 `transport=TransportInfo(name=..., headers=...)` to `dispatch`, so middleware
 knows how a message arrived.
 
-**Determinism:** tool listings are sorted, JSON output uses sorted keys, and
-identical inputs produce byte-identical responses — useful for reproducible
+**Determinism:** tool, resource and prompt listings are sorted, JSON output
+uses sorted keys, and identical inputs produce byte-identical responses — useful for reproducible
 agent runs and caching.
 
 **Performance notes:** each sync tool call runs in a worker thread of its own
@@ -1093,13 +1309,21 @@ prefer returning compact structures over huge strings.
   sessions need sticky routing (each `MCP-Session-Id` to the same worker).
   OAuth key and introspection caches, the failed-token throttle and
   `principal_seen` are per process either way.
+- Register tools, resources and prompts before serving. One registered later
+  still works, but its capability (the first resource or prompt) reaches
+  clients that cached `server/discover` only when their copy expires, within
+  the hour, and with several workers every worker must make the same change.
+  `notify_resource_updated` is per process: run the code that calls it in
+  every worker.
+- A resource's content is held in memory and base64-encoded when binary, and
+  nothing caps its size: serve large data in pieces through a template.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development
 
 ```bash
 pip install -e .[dev]
-pytest            # 100+ tests: schema, dispatch, security, Streamable HTTP, SSE, stdio
+pytest            # 1,200+ tests: schema, dispatch, resources, prompts, security, transports
 ruff check .
 mypy easy_mcp
 ```
