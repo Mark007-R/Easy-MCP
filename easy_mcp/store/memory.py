@@ -89,9 +89,12 @@ class MemoryStore(Store):
         return ttl is not None and entry.active == 0 and now - entry.last_seen > ttl
 
     @staticmethod
-    def _gone(entry: _Session) -> ExpiredSession:
+    def _gone(entry: _Session, now: float) -> ExpiredSession:
         record = entry.record
-        return ExpiredSession(record.ref, record.client_id, record.session_id, record.t0)
+        idle_ms = max(0, round((now - entry.last_seen) * 1000))
+        return ExpiredSession(
+            record.ref, record.client_id, record.session_id, record.t0, idle_ms=idle_ms
+        )
 
     def _entry(self, kind: SessionKind, ref: str) -> _Session | None:
         entry = self._sessions.get(ref)
@@ -105,7 +108,7 @@ class MemoryStore(Store):
         for ref, entry in list(self._sessions.items()):
             if entry.record.kind == record.kind and self._expired(entry, now):
                 del self._sessions[ref]
-                expired.append(self._gone(entry))
+                expired.append(self._gone(entry, now))
         live = sum(1 for entry in self._sessions.values() if entry.record.kind == record.kind)
         if live >= cap:
             return False, expired
@@ -130,9 +133,10 @@ class MemoryStore(Store):
         entry = self._entry(kind, ref)
         if entry is None:
             return None, []
-        if self._expired(entry, self._clock()):
+        now = self._clock()
+        if self._expired(entry, now):
             del self._sessions[ref]
-            return None, [self._gone(entry)]
+            return None, [self._gone(entry, now)]
         entry.active += 1
         return entry.record, []
 

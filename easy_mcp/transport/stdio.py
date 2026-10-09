@@ -146,6 +146,12 @@ class StdioTransport(Transport):
             audit("stdio_auth_failed")
             raise
 
+        if server._telemetry.registry is not None:
+            # A desktop host's child process must not open a listener.
+            server._logger.warning(
+                "metrics=True has no endpoint over stdio; use an OpenTelemetry metrics "
+                "exporter or server.render_metrics()"
+            )
         session_id = "stdio-" + secrets.token_urlsafe(12)
         client_id = identity.fingerprint if identity else "stdio"
         loop = asyncio.get_running_loop()
@@ -237,6 +243,7 @@ class StdioTransport(Transport):
                 session_id=session_id,
                 ref=ref,
                 client_id=client_id,
+                protocol_version=context.protocol_version,
                 t0=t0,
             )
 
@@ -302,6 +309,7 @@ class StdioTransport(Transport):
     async def _handle(self, item: Any, context: ClientContext) -> None:
         if item is _TOO_LARGE:
             audit("payload_too_large", client_id=context.client_id, transport="stdio")
+            self._server._telemetry.rejected("payload_too_large")
             self._write(
                 _error_response(
                     None,
