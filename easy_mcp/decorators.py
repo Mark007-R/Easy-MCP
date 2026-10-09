@@ -1,4 +1,4 @@
-"""Tool registration: the ``@server.tool`` decorator machinery and registry."""
+"""Tool registration: the ``@server.tool`` decorator machinery, and the registries."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generic, Protocol, TypeVar
 
-from .exceptions import SchemaError, ToolRegistrationError
+from .exceptions import RegistrationError, SchemaError, ToolRegistrationError
 from .schema import (
     build_input_schema,
     build_output_schema,
@@ -184,30 +184,47 @@ def build_tool(
     )
 
 
-class ToolRegistry:
-    """Thread-safe, deterministic registry of tool definitions."""
+class _Named(Protocol):
+    @property
+    def name(self) -> str: ...
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
+
+_T = TypeVar("_T", bound=_Named)
+
+
+class Registry(Generic[_T]):
+    """Thread-safe, deterministic registry of definitions, keyed by name.
+
+    Args:
+        noun: What the definitions are, for messages (``"tool"``).
+        error: What a refused registration or removal raises.
+    """
+
+    def __init__(
+        self, *, noun: str = "item", error: type[RegistrationError] = RegistrationError
+    ) -> None:
+        self._items: dict[str, _T] = {}
         self._lock = threading.Lock()
+        self._noun = noun
+        self._error = error
         # Bumped by every change, so a digest of the list knows it is stale.
         self._version = 0
 
-    def register(self, tool: ToolDefinition, *, replace: bool = False) -> None:
-        """Add a tool; refuses silent overwrites unless ``replace=True``."""
+    def register(self, item: _T, *, replace: bool = False) -> None:
+        """Add an item; refuses silent overwrites unless ``replace=True``."""
         with self._lock:
-            if tool.name in self._tools and not replace:
-                raise ToolRegistrationError(f"a tool named {tool.name!r} is already registered")
-            self._tools[tool.name] = tool
+            if item.name in self._items and not replace:
+                raise self._error(f"a {self._noun} named {item.name!r} is already registered")
+            self._items[item.name] = item
             self._version += 1
 
-    def unregister(self, name: str) -> ToolDefinition:
-        """Remove and return a tool by name."""
+    def unregister(self, name: str) -> _T:
+        """Remove and return an item by name."""
         with self._lock:
             try:
-                removed = self._tools.pop(name)
+                removed = self._items.pop(name)
             except KeyError:
-                raise ToolRegistrationError(f"no tool named {name!r} is registered") from None
+                raise self._error(f"no {self._noun} named {name!r} is registered") from None
             self._version += 1
             return removed
 
@@ -217,25 +234,32 @@ class ToolRegistry:
         with self._lock:
             return self._version
 
-    def snapshot(self) -> tuple[int, list[ToolDefinition]]:
-        """The version and the tools sorted by name, as they stood together."""
+    def snapshot(self) -> tuple[int, list[_T]]:
+        """The version and the items sorted by name, as they stood together."""
         with self._lock:
-            return self._version, sorted(self._tools.values(), key=lambda tool: tool.name)
+            return self._version, sorted(self._items.values(), key=lambda item: item.name)
 
-    def get(self, name: str) -> ToolDefinition | None:
-        """Look up a tool by name, or ``None``."""
+    def get(self, name: str) -> _T | None:
+        """Look up an item by name, or ``None``."""
         with self._lock:
-            return self._tools.get(name)
+            return self._items.get(name)
 
-    def list(self) -> list[ToolDefinition]:
-        """Tools sorted by name, so ``tools/list`` output is reproducible."""
+    def list(self) -> list[_T]:
+        """Items sorted by name, so list output is reproducible."""
         with self._lock:
-            return sorted(self._tools.values(), key=lambda tool: tool.name)
+            return sorted(self._items.values(), key=lambda item: item.name)
 
     def __contains__(self, name: object) -> bool:
         with self._lock:
-            return name in self._tools
+            return name in self._items
 
     def __len__(self) -> int:
         with self._lock:
-            return len(self._tools)
+            return len(self._items)
+
+
+class ToolRegistry(Registry[ToolDefinition]):
+    """Thread-safe, deterministic registry of tool definitions."""
+
+    def __init__(self) -> None:
+        super().__init__(noun="tool", error=ToolRegistrationError)

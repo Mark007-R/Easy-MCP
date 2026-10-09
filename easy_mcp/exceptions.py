@@ -36,12 +36,22 @@ HEADER_MISMATCH = -32020
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 
+# "Resource not found" in the handshake era (2025-11-25 and earlier).  It
+# shares its value with FORBIDDEN, and is sent only to initialize-era
+# clients: the stateless revision answers a missing resource with -32602 and
+# forbids -32002 altogether.
+RESOURCE_NOT_FOUND_LEGACY = -32002
+
 
 class EasyMCPError(Exception):
     """Base class for every easy_mcp exception."""
 
 
-class ToolRegistrationError(EasyMCPError):
+class RegistrationError(EasyMCPError):
+    """A function could not be registered as a tool, resource or prompt."""
+
+
+class ToolRegistrationError(RegistrationError):
     """A function could not be registered as a tool."""
 
 
@@ -54,7 +64,9 @@ class ToolError(EasyMCPError):
 
     Unlike arbitrary exceptions (which are sanitized down to an opaque
     ``error_id``), the message of a ``ToolError`` is sent to the client
-    verbatim.  Only raise it with text you would show an end user.
+    verbatim.  Only raise it with text you would show an end user.  From a
+    tool it becomes an ``isError`` result; from a resource, a prompt or a
+    completer, a ``-32603`` error carrying the message.
     """
 
 
@@ -132,9 +144,28 @@ class SubscriptionLimitError(ProtocolError):
     ``-32007``, the code of the session cap, since a listen stream holds a
     connection as a session does; over HTTP it is answered ``503``.  A client
     may hold 8 streams in one process, and ``max_sessions`` caps them all.
+    A handshake-era session subscribed to 1000 resources gets it too, for
+    ``resources/subscribe``.
     """
 
     code = TOO_MANY_SESSIONS
+
+
+class ResourceNotFoundError(ProtocolError):
+    """Raise inside a resource to answer "resource not found".
+
+    Returning ``None`` from a resource means the same.  The server answers
+    with the code the client's protocol revision specifies: ``-32602`` for a
+    stateless (``2026-07-28``) request, ``-32002`` in the handshake era, with
+    the URI in ``data.uri``.  *uri* names another URI than the one requested
+    (rare: a sub-resource); by default the requested one is reported.
+    """
+
+    code = INVALID_PARAMS
+
+    def __init__(self, uri: str | None = None, message: str = "Resource not found") -> None:
+        self.uri = uri
+        super().__init__(message, data={"uri": uri} if uri is not None else None)
 
 
 # --- OAuth (MCPServer(oauth=...)) ---------------------------------------------
