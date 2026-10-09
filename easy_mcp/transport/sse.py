@@ -9,9 +9,10 @@ Flow:
    an ``endpoint`` event containing the URL to POST messages to.
 2. The client POSTs JSON-RPC messages to ``/messages?session_id=...``.
 3. Responses are streamed back over the open SSE connection.
-4. The stream also carries the server's own messages:
-   ``notifications/tools/list_changed`` once ``initialize`` has been
-   answered, and the frames of a ``subscriptions/listen`` posted to
+4. The stream also carries the server's own messages: the list-change
+   notifications once ``initialize`` has been answered,
+   ``notifications/resources/updated`` for the resources the session
+   subscribed to, and the frames of a ``subscriptions/listen`` posted to
    ``/messages``.  The stream is shared, as stdout is on stdio, so the
    client ends a listen with ``notifications/cancelled``, and the server
    ends one with its result followed by ``notifications/cancelled``.  With

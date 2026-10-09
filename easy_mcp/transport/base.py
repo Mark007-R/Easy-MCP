@@ -42,14 +42,16 @@ class ClientContext:
     ``in_flight`` only, and the rate limit is the server's in-process one.
 
     ``push`` delivers a server-initiated message (a list-change
-    notification, or a frame of a ``subscriptions/listen`` stream) on this
-    context's channel.  The server calls it on the event loop only; it must
+    notification, a resource update, or a frame of a ``subscriptions/listen``
+    stream) on this context's channel.  The server calls it on the event loop only; it must
     not block, and raises once the channel can take no more messages.  The
     contexts of one channel share the same ``push`` (it is how the server
     tells channels apart), and ``session_id`` names the session the channel
     carries, uniquely.  ``None``: this channel cannot carry server-initiated
     messages, so a well-formed ``subscriptions/listen`` is unknown on it
-    (``-32601``) and it is never told that a list changed.  With ``push``
+    (``-32601``) and it is never told that a list changed; nor is
+    ``resources/subscribe`` served, unless a ``store_handle`` keeps the
+    session (whose ``GET /mcp`` stream then delivers).  With ``push``
     set and no ``store_handle``, a successful ``initialize`` starts the
     session's list-change notifications as ``dispatch`` returns its result,
     so send that result before awaiting anything else.

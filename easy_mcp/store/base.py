@@ -22,7 +22,7 @@ import enum
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
@@ -119,7 +119,9 @@ class SessionRecord:
     store's own clock in a record a shared store returns.  ``baselines``
     are ``(list kind, digest)`` pairs: what the session's client was last
     told each list holds (:meth:`Store.save_baselines`), ``None`` before
-    anything was recorded.
+    anything was recorded.  ``subscriptions`` are the resource URIs the
+    session is subscribed to (``resources/subscribe``), sorted; ``None``
+    or empty when there are none.
     """
 
     ref: str
@@ -132,6 +134,7 @@ class SessionRecord:
     principal: str | None = None
     t0: int | None = None
     baselines: tuple[tuple[str, str], ...] | None = None
+    subscriptions: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +332,34 @@ class Store(abc.ABC):
         """
         return None
 
+    async def update_subscriptions(
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        add: Collection[str] = (),
+        remove: Collection[str] = (),
+        cap: int,
+    ) -> tuple[str, ...] | None:
+        """Change the resource URIs a session is subscribed to, atomically.
+
+        *remove* is taken out first, then *add* put in, as long as the
+        session watches fewer than *cap* URIs; a URI over the cap is left
+        out (the caller sees it missing from the result).  The record
+        returned by :meth:`acquire_session` carries them.  A session of
+        another kind is neither found nor changed.
+
+        Returns:
+            Every URI the session is now subscribed to, sorted, or ``None``
+            when the session is gone.
+
+        Raises:
+            NotImplementedError: The default: this store keeps no
+                subscriptions, so ``resources/subscribe`` is refused
+                (``-32601``) for its sessions.
+        """
+        raise NotImplementedError("this store keeps no resource subscriptions")
+
     @abc.abstractmethod
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         """Remove a session.
@@ -412,3 +443,16 @@ class StoreHandle(abc.ABC):
     async def cancel_elsewhere(self, request_id: str | int) -> None:
         """Cancel *request_id* on whichever worker runs it, if it runs on another one."""
         return None
+
+    async def update_subscriptions(
+        self, *, add: Collection[str] = (), remove: Collection[str] = (), cap: int
+    ) -> tuple[str, ...] | None:
+        """Change the resource URIs the session is subscribed to, as the store's method does.
+
+        Returns:
+            Every URI it is now subscribed to, or ``None`` when it is gone.
+
+        Raises:
+            NotImplementedError: The default: no session to subscribe.
+        """
+        raise NotImplementedError("no session keeps resource subscriptions here")

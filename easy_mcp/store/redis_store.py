@@ -25,7 +25,7 @@ import math
 import os
 import secrets
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -189,6 +189,46 @@ redis.call('HSET', KEYS[1], 'bl', ARGV[2])
 return 1
 """
 
+# KEYS: rec   ARGV: kind, cap, n_add, add_1..add_n, remove_1..remove_m.  The resource
+# URIs a session is subscribed to, as a JSON array in its 'rs' field: the removed ones
+# taken out, then the added ones put in while fewer than cap are there.  Returns them
+# all, or false for a session that is gone (or of another kind): as for the baselines,
+# a bare HSET on an expired session would create the key again, without a TTL.
+SESSION_SUBSCRIPTIONS = """
+if redis.call('HGET', KEYS[1], 'kind') ~= ARGV[1] then return false end
+local cap = tonumber(ARGV[2])
+local nadd = tonumber(ARGV[3])
+local removed = {}
+for i = 4 + nadd, #ARGV do removed[ARGV[i]] = true end
+local seen = {}
+local kept = {}
+local raw = redis.call('HGET', KEYS[1], 'rs')
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == 'table' then
+    for _, uri in ipairs(decoded) do
+      if type(uri) == 'string' and not seen[uri] and not removed[uri] then
+        seen[uri] = true
+        kept[#kept + 1] = uri
+      end
+    end
+  end
+end
+for i = 4, 3 + nadd do
+  local uri = ARGV[i]
+  if not seen[uri] and #kept < cap then
+    seen[uri] = true
+    kept[#kept + 1] = uri
+  end
+end
+if #kept == 0 then
+  redis.call('HDEL', KEYS[1], 'rs')
+else
+  redis.call('HSET', KEYS[1], 'rs', cjson.encode(kept))
+end
+return kept
+"""
+
 # KEYS: rec   ARGV: field ('c:<tool>'), limit
 SESSION_RESERVE = """
 if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end
@@ -248,6 +288,7 @@ _SCRIPTS = {
     "refresh": SESSION_REFRESH_MANY,
     "delete": SESSION_DELETE,
     "baselines": SESSION_BASELINES,
+    "subscriptions": SESSION_SUBSCRIPTIONS,
     "reserve": SESSION_RESERVE,
     "unreserve": SESSION_UNRESERVE,
     "client_reserve": CLIENT_RESERVE,
@@ -304,7 +345,21 @@ def _record(ref: str, reply: Any) -> SessionRecord | None:
         principal=fields.get("pr") or None,
         t0=int(t0) if t0.isdigit() else None,
         baselines=_baselines(fields.get("bl")),
+        subscriptions=_subscriptions(fields.get("rs")),
     )
+
+
+def _subscriptions(value: str | None) -> tuple[str, ...] | None:
+    """The ``rs`` field of a session record; ``None`` when absent or malformed."""
+    if not value:
+        return None
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return tuple(sorted({uri for uri in data if isinstance(uri, str)}))
 
 
 def _baselines(value: str | None) -> tuple[tuple[str, str], ...] | None:
@@ -731,6 +786,25 @@ class RedisStore(Store):
     ) -> None:
         value = json.dumps(dict(sorted(baselines.items())), separators=(",", ":"))
         await self._run("baselines", [self._session_key(ref)], [kind, value])
+
+    async def update_subscriptions(
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        add: Collection[str] = (),
+        remove: Collection[str] = (),
+        cap: int,
+    ) -> tuple[str, ...] | None:
+        added = list(dict.fromkeys(add))
+        reply = await self._run(
+            "subscriptions",
+            [self._session_key(ref)],
+            [kind, cap, len(added), *added, *dict.fromkeys(remove)],
+        )
+        if reply is None:  # the script's false: the session is gone
+            return None
+        return tuple(sorted({_text(uri) for uri in reply or ()}))
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         reply = await self._run(

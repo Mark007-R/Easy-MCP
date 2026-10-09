@@ -60,6 +60,7 @@ from .exceptions import (
     ServerBusyError,
     SessionLimitError,
     StoreUnavailableError,
+    SubscriptionLimitError,
     TokenRequiredError,
     ToolError,
     ToolRegistrationError,
@@ -122,9 +123,10 @@ from .security.auth import (
 )
 from .security.oauth import LEEWAY_SECONDS, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
-from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle
+from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle, session_ref
 from .store.memory import MemoryStore
 from .subscriptions import (
+    MAX_RESOURCE_SUBSCRIPTIONS,
     ChangeNotifier,
     Push,
     _Sink,
@@ -202,6 +204,10 @@ class _Method:
     # Served only on a channel that can carry server-initiated messages
     # (ClientContext.push).
     needs_push: bool = False
+    # Served only for a session something can later be delivered to: one
+    # with a channel (ClientContext.push), or one kept in the store, whose
+    # GET /mcp stream delivers.
+    needs_session: bool = False
 
 
 # Every method dispatch serves.  Anything else is answered -32601 (or, for a
@@ -215,6 +221,14 @@ _METHODS: dict[str, _Method] = {
     "resources/list": _Method(legacy=True, modern=True, capability="resources"),
     "resources/templates/list": _Method(legacy=True, modern=True, capability="resources"),
     "resources/read": _Method(legacy=True, modern=True, capability="resources"),
+    # Removed in 2026-07-28, where subscriptions/listen replaces them (they
+    # would keep per-connection state).
+    "resources/subscribe": _Method(
+        legacy=True, modern=False, capability="resources", needs_session=True
+    ),
+    "resources/unsubscribe": _Method(
+        legacy=True, modern=False, capability="resources", needs_session=True
+    ),
     "prompts/list": _Method(legacy=True, modern=True, capability="prompts"),
     "prompts/get": _Method(legacy=True, modern=True, capability="prompts"),
     "completion/complete": _Method(legacy=True, modern=True, capability="completions"),
@@ -1419,6 +1433,8 @@ class MCPServer:
             return None
         if spec.needs_push and context.push is None:
             return None
+        if spec.needs_session and context.push is None and context.store_handle is None:
+            return None
         return spec
 
     def _request_info(
@@ -1662,6 +1678,10 @@ class MCPServer:
                 result = await self._get_prompt(request, context)
             elif method == "completion/complete":
                 result = await self._complete(request, context)
+            elif method == "resources/subscribe":
+                result = await self._subscribe(request, context)
+            elif method == "resources/unsubscribe":
+                result = await self._unsubscribe(request, context)
             elif request.stateless:
                 result = self._dispatch_modern(method, context, request._params)
             elif method == "initialize":
@@ -2397,6 +2417,7 @@ class MCPServer:
         multiplexed: bool = False,
         baselines: dict[str, str] | None = None,
         anchor: object | None = None,
+        subscriptions: Iterable[str] | None = None,
     ) -> _Sink:
         """Announce list changes to the session *key* through *push* from now on.
 
@@ -2405,7 +2426,9 @@ class MCPServer:
         is right just before its ``initialize`` result is sent (its client
         lists after that).  A list that differs from its baseline is
         announced at once.  A list whose digest cannot be computed is not
-        watched (:meth:`_list_baselines`).
+        watched (:meth:`_list_baselines`).  Updates of the resources the
+        session is subscribed to go there too: *subscriptions*, read from
+        the session's record in the store, or those this process holds.
         """
         current = self._list_baselines(identity)
         sink = self._notifier.watch_session(
@@ -2417,6 +2440,10 @@ class MCPServer:
             baselines=current if baselines is None else baselines,
             multiplexed=multiplexed,
             anchor=anchor,
+            subscriptions=subscriptions,
+            # Updates made while no stream is open wait for one only where
+            # the session is kept: in this process.
+            hold=not self._store.shared,
         )
         if baselines is not None:
             sink.deliver(sorted(current))
@@ -2461,11 +2488,16 @@ class MCPServer:
                 "Invalid request: subscriptions/listen needs a string or number id",
                 code=INVALID_REQUEST,
             )
-        requested, _ = parse_filter(request._params.get("notifications"))
-        # Kinds the server does not announce, and resourceSubscriptions, are
-        # left out of the acknowledgment and never sent; so is a list whose
-        # digest cannot be computed (the sink's kinds).
+        requested, asked = parse_filter(request._params.get("notifications"))
+        # Kinds the server does not announce are left out of the
+        # acknowledgment and never sent; so is a list whose digest cannot be
+        # computed (the sink's kinds).
         kinds = requested & frozenset(self._list_kinds())
+        # Resource URIs only with the resources capability, and only those
+        # the caller may read: a missing and a protected one look the same.
+        honored: tuple[str, ...] | None = None
+        if asked is not None and "resources" in self._capabilities():
+            honored = self._honored_resources(asked, context.identity)
         sink = self._notifier.open(
             channel=push,
             client_id=context.client_id,
@@ -2475,12 +2507,13 @@ class MCPServer:
             push=push,
             multiplexed=context.multiplexed,
             max_total=self.max_sessions,
+            uris=frozenset(honored or ()),
         )
         request._subscription = sink
         # In the same step as the registration, and flushes run only from
         # loop callbacks: the acknowledgment is the stream's first frame.
         try:
-            push(ack_message(msg_id, sink.kinds))
+            push(ack_message(msg_id, sink.kinds, honored))
         except Exception:
             self._notifier.drop(sink, "undeliverable")
             raise
@@ -2489,6 +2522,7 @@ class MCPServer:
             client_id=context.client_id,
             subscription_id=msg_id,
             kinds=sorted(sink.kinds),
+            **({"resources": len(honored)} if honored is not None else {}),
         )
         timer: asyncio.TimerHandle | None = None
         deadline = self._stream_deadline(context.identity)
@@ -2509,7 +2543,9 @@ class MCPServer:
         its completion result (and, on a multiplexed channel,
         ``notifications/cancelled``) through ``context.push`` before this
         returns; then its ``dispatch`` returns ``None``.  The session the
-        context carries stops receiving list changes.  Transports call this,
+        context carries stops receiving list changes, and its resource
+        subscriptions end (this is the end of the session, not of one of
+        its streams).  Transports call this,
         on the event loop, when a channel ends or the server shuts down, and
         again once the channel's requests still running have finished (an
         ``initialize`` answered meanwhile starts the session's notifications
@@ -2519,6 +2555,160 @@ class MCPServer:
             How many subscriptions ended.
         """
         return self._notifier.close(context.push, context.session_id, reason=reason)
+
+    def _honored_resources(
+        self, uris: Iterable[str], identity: ClientIdentity | None
+    ) -> tuple[str, ...]:
+        """The URIs of a listen's ``resourceSubscriptions`` its acknowledgment honors.
+
+        Those that resolve to a resource *identity* may read, each once, in
+        order.  A missing one, a protected one, one a token would need a
+        scope for (one acknowledgment cannot carry a partial 403) and one
+        over 2048 characters are left out alike.
+        """
+        honored: list[str] = []
+        for uri in dict.fromkeys(uris):
+            if len(uri) > _ECHO_URI_MAX:
+                continue
+            definition, _, _ = self._resolve_resource(uri, identity)
+            if definition is None or self._step_up_scope(identity, definition) is not None:
+                continue
+            try:
+                authorize(identity, definition, "Resource")
+            except (AuthenticationError, AuthorizationError):
+                continue
+            honored.append(uri)
+        return tuple(honored)
+
+    def notify_resource_updated(self, uri: str) -> int:
+        """Tell every client subscribed to the resource *uri* that it changed.
+
+        Thread-safe: call it from anywhere (a sync tool's thread, a file
+        watcher, an async task).  Clients get the URI only and read the
+        resource again: ``notifications/resources/updated`` on the channel of
+        each handshake-era session that subscribed to exactly *uri*
+        (``resources/subscribe``), and tagged on each ``subscriptions/listen``
+        stream whose acknowledgment honored it.  An update still waiting to
+        be written is not queued again.  A session without an open stream
+        (a Streamable HTTP session between ``GET /mcp`` streams) gets it when
+        one opens, with the in-process store; with a shared store it is
+        lost.  Per process: with several workers, call it in each.
+
+        Returns:
+            How many subscriptions matched and had the update queued (0 when
+            nobody listens); delivery happens on the event loop.
+
+        Raises:
+            TypeError: *uri* is not a string.
+        """
+        if not isinstance(uri, str):
+            raise TypeError(f"uri must be a str, got {type(uri).__name__}")
+        return self._notifier.publish_resource_updated(uri)
+
+    async def _subscribe(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/subscribe`` (handshake era): watch one resource for the session.
+
+        The URI must resolve to a resource the caller may read now, as for a
+        read, without running it.  The session's subscriptions live with it:
+        in this process (stdio, a direct ``dispatch``), or in the store's
+        session record (the HTTP transports), and end with it.
+
+        Raises:
+            ProtocolError: ``-32602`` for a URI that is no string or is too
+                long, ``-32002`` for one that resolves to nothing the caller
+                may read, ``-32007`` at 1000 URIs, ``-32601`` with a store
+                that keeps no subscriptions, ``-32600`` for a session gone,
+                or a step-up ``InsufficientScopeError``.
+        """
+        uri = self._subscription_uri(request)
+        identity = context.identity
+        definition, _, _ = self._resolve_resource(uri, identity)
+        if definition is None:
+            raise self._resource_not_found(uri, request.stateless)
+        self._check_step_up(identity, definition, "resource", self._label(uri))
+        try:
+            authorize(identity, definition, "Resource")
+        except (AuthenticationError, AuthorizationError):
+            raise self._resource_not_found(uri, request.stateless) from None
+        key = context.session_id
+        handle = context.store_handle
+        if handle is None:
+            added = self._notifier.subscribe(key, uri, cap=MAX_RESOURCE_SUBSCRIPTIONS)
+        else:
+            subscribed = await self._update_subscriptions(handle, add=(uri,))
+            self._notifier.set_subscriptions(key, subscribed, hold=not self._store.shared)
+            added = uri in subscribed
+        if not added:
+            raise SubscriptionLimitError(
+                f"Too many resource subscriptions for this session (at most "
+                f"{MAX_RESOURCE_SUBSCRIPTIONS}); unsubscribe from one first"
+            )
+        self._audit_subscription("resource_subscribe", uri, context)
+        return {}
+
+    async def _unsubscribe(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/unsubscribe``: stop watching a resource.  Idempotent.
+
+        Raises:
+            ProtocolError: ``-32602`` for a URI that is no string or is too
+                long, ``-32601`` with a store that keeps no subscriptions,
+                ``-32600`` for a session gone.
+        """
+        uri = self._subscription_uri(request)
+        key = context.session_id
+        handle = context.store_handle
+        if handle is None:
+            self._notifier.unsubscribe(key, uri)
+        else:
+            subscribed = await self._update_subscriptions(handle, remove=(uri,))
+            self._notifier.set_subscriptions(key, subscribed, hold=not self._store.shared)
+        self._audit_subscription("resource_unsubscribe", uri, context)
+        return {}
+
+    @staticmethod
+    def _subscription_uri(request: RequestInfo) -> str:
+        uri = request._params.get("uri")
+        if not isinstance(uri, str):
+            raise ProtocolError(f"{request.method} requires a string 'uri'", code=INVALID_PARAMS)
+        if len(uri) > _ECHO_URI_MAX:
+            raise ProtocolError(
+                f"{request.method}: the URI is longer than {_ECHO_URI_MAX} characters",
+                code=INVALID_PARAMS,
+            )
+        return uri
+
+    async def _update_subscriptions(
+        self, handle: StoreHandle, *, add: Iterable[str] = (), remove: Iterable[str] = ()
+    ) -> tuple[str, ...]:
+        """Change a stored session's subscriptions; every URI it is subscribed to now.
+
+        Raises:
+            ProtocolError: ``-32601`` when the store keeps none; ``-32600``
+                when the session is gone.
+        """
+        try:
+            subscribed = await handle.update_subscriptions(
+                add=tuple(add), remove=tuple(remove), cap=MAX_RESOURCE_SUBSCRIPTIONS
+            )
+        except NotImplementedError:
+            raise ProtocolError(
+                "Method not found: this server's store keeps no resource subscriptions",
+                code=METHOD_NOT_FOUND,
+            ) from None
+        if subscribed is None:
+            raise ProtocolError(
+                "Session not found; send a new initialize request", code=INVALID_REQUEST
+            )
+        return subscribed
+
+    def _audit_subscription(self, event: str, uri: str, context: ClientContext) -> None:
+        audit(
+            event,
+            uri=uri[:_AUDIT_URI_MAX],
+            client_id=context.client_id,
+            session_id=context.session_id,
+            session_ref=session_ref(context.session_id),
+        )
 
     def _cancel_subscription(self, context: ClientContext, request_id: object) -> bool:
         """End the listen stream *request_id* names on *context*'s channel, as its client asked."""

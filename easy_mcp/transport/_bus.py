@@ -1,8 +1,10 @@
 """The messages workers sharing a store send each other about a session.
 
-Three operations travel between workers: ``cancel`` (a request running on
-another worker), ``end`` (a session ended on another worker) and
-``deliver`` (an answer for the legacy SSE stream another worker holds).
+Four operations travel between workers: ``cancel`` (a request running on
+another worker), ``end`` (a session ended on another worker), ``deliver``
+(an answer for the legacy SSE stream another worker holds) and ``resub``
+(the session's resource subscriptions changed in the store: the worker
+holding its stream reads them again).
 Each is a JSON envelope naming the session by its ref and authenticated
 with a MAC keyed by the raw session id.  The store never sees that id, so
 access to the store alone cannot forge, and so inject into a stream,
@@ -22,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 VERSION = 1
-OPS = frozenset({"cancel", "end", "deliver"})
+OPS = frozenset({"cancel", "end", "deliver", "resub"})
 KINDS = frozenset({"http", "sse"})
 
 # A relayed legacy SSE answer larger than this is replaced by an error: it

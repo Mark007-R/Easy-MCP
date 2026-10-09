@@ -7,10 +7,13 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
   responses get ``202 Accepted``.  The one exception is
   ``subscriptions/listen``, whose answer is a ``text/event-stream``.
 * ``GET`` with a session's ``MCP-Session-Id`` opens that session's stream
-  (``text/event-stream``), which carries ``notifications/tools/list_changed``
-  and nothing else.  One per session: a new one replaces the old.  A change
-  made while none is open is announced when one opens.  Without a session,
-  or for the stateless revision, ``GET`` answers ``405``.
+  (``text/event-stream``), which carries the list-change notifications
+  (tools, prompts, resources) and ``notifications/resources/updated`` for the
+  resources the session subscribed to, and nothing else.  One per session: a
+  new one replaces the old.  A list change made while none is open is
+  announced when one opens, and so is a resource update, with the in-process
+  store.  Without a session, or for the stateless revision, ``GET`` answers
+  ``405``.
 
 Two protocol eras share the endpoint, chosen per request:
 
@@ -527,7 +530,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         """The session's stream, replacing any other it has here; holds the session while open.
 
         It starts with a ``list_changed`` for every list that changed since
-        the client was last told (at ``initialize``, or by its last stream).
+        the client was last told (at ``initialize``, or by its last stream),
+        and the updates of subscribed resources made while no stream was
+        open (with the in-process store).
         """
         stream = _NotifyStream()
         baselines: dict[str, str] | None = None
@@ -549,6 +554,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity=identity,
             client_id=client_id,
             baselines=baselines,
+            subscriptions=session.record.subscriptions or (),
         )
         stream.sink = sink
         fields = {
@@ -692,6 +698,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         challenge = self._step_up_headers(response, identity, modern=False)
         if challenge is not None:
             return _json_response(response, headers=challenge, status=403)
+        error = response.get("error")
+        if (
+            message.get("method") == "resources/subscribe"
+            and isinstance(error, dict)
+            and error.get("code") == TOO_MANY_SESSIONS
+        ):
+            # The subscription cap, answered as the stream caps are.
+            return _answer(response, status=503)
         return _answer(response)
 
     async def _handle_stateless(
