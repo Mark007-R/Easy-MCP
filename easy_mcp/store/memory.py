@@ -6,7 +6,7 @@ import dataclasses
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..security.ratelimit import SlidingWindowRateLimiter
@@ -168,6 +168,15 @@ class MemoryStore(Store):
             else:
                 entry.last_seen = now
         return gone, []
+
+    async def save_baselines(
+        self, kind: SessionKind, ref: str, baselines: Mapping[str, str]
+    ) -> None:
+        entry = self._entry(kind, ref)
+        if entry is not None:
+            entry.record = dataclasses.replace(
+                entry.record, baselines=tuple(sorted(baselines.items()))
+            )
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         if self._entry(kind, ref) is None:

@@ -108,6 +108,11 @@ server.register_tool(my_function, name="late_tool")
 server.unregister_tool("late_tool")
 ```
 
+Clients that are connected when a tool is registered or removed are told the
+tool list changed, so they can fetch it again. Nothing to configure: bursts
+are combined into one notice, and a client only hears about tools it is
+allowed to see (see [Change notifications](#change-notifications)).
+
 ### Supported parameter types
 
 | Python annotation | JSON Schema |
@@ -227,7 +232,8 @@ once and match the body (`400` / `-32020` otherwise), every request needs an
 Clients that open with `initialize` get the handshake era instead:
 `2024-11-05` through `2025-11-25` are negotiated there, and the
 `MCP-Session-Id` header the client echoes on later requests identifies the
-session. `DELETE /mcp` ends a session, and sessions idle for an hour expire.
+session. `DELETE /mcp` ends a session, `GET /mcp` with the session's id opens
+its notification stream, and sessions idle for an hour expire.
 The era is chosen per request, so old and new clients can share one server.
 Over stdio, and in the handshake era over HTTP, `notifications/cancelled`
 cancels any request still in flight except `initialize`.
@@ -272,6 +278,57 @@ Authentication works the same way as over SSE, except the credential is the
 `EASY_MCP_STDIO_API_KEY` environment variable (or
 `StdioTransport(server, api_key=...)`) instead of a header. An invalid key
 fails at startup rather than silently downgrading to anonymous access.
+
+### Change notifications
+
+The server announces tool-list changes on every transport, and advertises
+`tools.listChanged: true` in `initialize` and `server/discover`. Clients that
+open with `initialize` get `notifications/tools/list_changed` on their
+session's channel once the handshake is answered: stdout over stdio, the
+`/sse` stream, or over Streamable HTTP a `GET /mcp` stream carrying the
+session's `MCP-Session-Id` (and its credential). A session has one such
+stream; a new one replaces the old. A change made while no stream is open is
+announced as soon as one opens, and an open stream keeps its session from
+expiring.
+
+Stateless (`2026-07-28`) clients ask for what they want with
+`subscriptions/listen`. The response is the stream: an acknowledgment first,
+naming what the server will send, then the notifications the client opted
+into, each tagged with the listen request's id. Over HTTP the answer is a
+`text/event-stream`, so the client must accept one, and closing it ends the
+subscription; over stdio the client sends `notifications/cancelled`. When the
+server shuts down, each stream receives the listen request's result before it
+ends (over stdio and legacy SSE followed by `notifications/cancelled`), and a
+stream opened with an OAuth token ends the same way when the token expires.
+Open the stream before listing tools, so no change falls in between:
+
+```json
+{"jsonrpc": "2.0", "id": "listen-1", "method": "subscriptions/listen",
+ "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                      "io.modelcontextprotocol/clientCapabilities": {}},
+            "notifications": {"toolsListChanged": true}}}
+```
+
+Notifications carry no tool names and respect permissions: a change to a tool
+a client cannot see is not announced to it, and neither is a tool added and
+removed again. Changes within 0.1 s are combined. A client may hold 8 listen
+streams at once in each process (each worker), and `max_sessions` caps them
+in each process, even with a shared store (`-32007`, HTTP `503`, beyond
+either). Opening a listen or `GET` stream costs one request
+of the rate-limit budget; what the server sends on it costs nothing.
+
+Request middleware sees listen requests and may refuse them; `call_next()`
+returns once the stream ends. A listen that middleware cuts short after its
+acknowledgment (a timeout around `call_next()`, say) is answered with the
+middleware's error, over HTTP as the stream's last event. Once a stream has
+had its result, or its client cancelled it, an error raised after
+`call_next()` is not sent: a request gets one answer.
+
+A custom transport takes part by setting `ClientContext.push` (how the server
+sends on the client's channel) and `ClientContext.multiplexed`, and by calling
+`server.close_subscriptions(context)` when the channel ends, and again once
+the requests it was still running have finished (an `initialize` answered
+meanwhile starts the session's notifications anew).
 
 ### Launching from the command line
 
@@ -337,12 +394,17 @@ No sticky routing is needed. With the store in place:
   worker holds;
 - `max_calls_per_session`, rate limits and `max_sessions` count across all
   workers together (`max_sessions` still separately for Streamable HTTP and
-  legacy SSE).
+  legacy SSE; as the cap on `subscriptions/listen` streams it counts per
+  worker).
 
 Some things stay with one worker: a running call, an open stream,
 `max_sync_workers`, timeouts, and tools registered at runtime (registering
 one while serving logs a warning). Every worker must import the same module,
-with the same tools, keys and settings. Stateless (`2026-07-28`) requests
+with the same tools, keys and settings. Change notifications are per worker
+too: each tells the streams it holds about its own tools, so a change made at
+runtime must be made in every worker. What a session's client was last told
+is kept in the store, so its `GET /mcp` stream, on whichever worker it opens,
+announces exactly the changes since then. Stateless (`2026-07-28`) requests
 never had sessions; the store shares their rate limits and per-client call
 counts, which with `RedisStore` lapse after `session_idle_timeout` without a
 counted (or refused) call, rather than without any request.
@@ -542,7 +604,10 @@ async def expensive(query: str) -> str:
 The rate limit and `max_calls_per_session` count per process by default; with
 a shared store they count across every worker (see
 [Running several workers](#running-several-workers)). Timeouts, payload caps
-and `max_sync_workers` always apply per process.
+and `max_sync_workers` always apply per process. Opening a notification
+stream (`GET /mcp`, `GET /sse` or `subscriptions/listen`) costs one request of
+the budget, like any message; neither timeouts nor `max_calls_per_session`
+apply to it.
 
 Clients can also cancel long-running calls with the standard MCP
 `notifications/cancelled` message, or on a stateless HTTP request by closing
@@ -580,17 +645,20 @@ The threads are daemons, so the transports give them a bounded time to finish
 as they shut down: stdio's `shutdown_timeout`, or 5 s over HTTP. That is when
 a cancel callback's `KILL QUERY` gets out. If you drive `server.dispatch`
 yourself, `await server.wait_for_tool_threads(5)` before exiting does the
-same. `server.run()` closes open legacy SSE streams as shutdown begins,
-cancelling the requests they carry (those get no answer), and refuses new
-streams and messages with `503`. It gives the Streamable HTTP `/mcp` requests
-still running 5 s to finish (a second Ctrl-C cuts that short) and then cancels
+same. `server.run()` closes open SSE streams (legacy `/sse`, `GET /mcp` and
+`subscriptions/listen`) as shutdown begins, sending each listen stream its
+result first and cancelling the requests a legacy SSE stream carries (those
+get no answer), and refuses new streams and messages with `503`. It gives the
+Streamable HTTP `/mcp` requests still running 5 s to finish (a second Ctrl-C
+cuts that short) and then cancels
 them, since uvicorn waits for every connection to close before it shuts the
 app down. A `/mcp` request cancelled this way, or sent once shutdown has
 begun, is answered `503` with `-32008` and `Retry-After: 1`, so the client can
 retry; a `notifications/cancelled` sent meanwhile still cancels its call.
 When you serve `server.build_app()` with your own uvicorn, pass
-`--timeout-graceful-shutdown`, or shutdown waits for SSE clients to leave and
-for running requests (one held in middleware included) to finish.
+`--timeout-graceful-shutdown`, or shutdown waits for the clients of `/sse`,
+`GET /mcp` and `subscriptions/listen` streams to leave and for running
+requests (one held in middleware included) to finish.
 When you mount `server.build_app()` inside another Starlette or FastAPI app,
 its lifespan does not run: call `await server.wait_for_tool_threads(5)` from
 the host app's shutdown.
@@ -725,6 +793,7 @@ caller.
 | Tool exceeds its timeout | `-32005` timeout error |
 | Rate limit exceeded | `-32003` with `retry_after_seconds` |
 | Session cap reached | `-32006` |
+| Too many open `subscriptions/listen` streams | `-32007`; HTTP `503` |
 | Every sync-tool worker busy (`max_sync_workers`) | `-32008`; retry shortly |
 | Stateless request names a version the server does not speak | `-32022` with `supported` and `requested` |
 | HTTP headers disagree with the body (stateless) | `-32020`, HTTP `400` |
@@ -766,6 +835,15 @@ answered, with a timeout of its own, say), `middleware_failed` (with its
 `error_id` and `stage`) when one fails or breaks its contract, and
 `request_cancelled` when a request other than `tools/call` is cancelled. None
 of them carries arguments, results, `_meta` or headers.
+
+Change notifications add `subscription_open` (the client, the listen
+request's id and the list kinds it gets), `subscription_close` (with its
+`reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`,
+`token_expired`, `undeliverable` or `closed`), `subscription_refused`
+(`client_limit` or `server_limit`), and `stream_open` / `stream_close` for a
+session's `GET /mcp` stream (closed as `client_closed`, `replaced`,
+`session_closed`, `shutdown` or `token_expired`). The notifications
+themselves are logged at debug level only.
 
 OAuth adds `auth_failed` (why a token was refused, the client address and a
 fingerprint of the token), `auth_rate_limited`, `auth_unavailable` (the
@@ -942,6 +1020,7 @@ user with only the `read` role.
 ```
 easy_mcp/
 ├── server.py        MCPServer: registration, dispatch, execution, lifecycle
+├── subscriptions.py list-change fan-out: debounce, visibility, subscriptions/listen
 ├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
 ├── middleware.py    request and tool middleware, current_tool_call()
 ├── decorators.py    @tool machinery, ToolDefinition, thread-safe registry
@@ -959,6 +1038,7 @@ easy_mcp/
 │   ├── base.py      Transport ABC + ClientContext
 │   ├── _http.py     shared HTTP plumbing: Origin allowlist, credentials, uvicorn
 │   ├── _sessions.py session records, cross-worker cancel and SSE relay
+│   ├── _outbox.py   coalescing outbox and SSE framing of notification streams
 │   ├── _bus.py      authenticated messages between workers
 │   ├── streamable_http.py  Streamable HTTP transport (/mcp, sessions)
 │   ├── sse.py       legacy HTTP + SSE transport (Starlette/uvicorn)
@@ -1003,6 +1083,10 @@ prefer returning compact structures over huge strings.
 - Browser-based clients on other origins must be listed in `allowed_origins`.
 - With OAuth, set `resource` to the exact URL clients use, and behind a proxy
   forward `/.well-known/oauth-protected-resource/...` to the server too.
+- Notification streams (`GET /mcp`, `subscriptions/listen`, `/sse`) stay
+  open: keep proxy buffering off for them (the server sends
+  `X-Accel-Buffering: no`) and proxy idle timeouts above 15 s, the keep-alive
+  interval.
 - For multiple workers, configure a shared store (see
   [Running several workers](#running-several-workers)). Without one,
   handshake-era sessions, rate limits and call caps are per process, so
@@ -1025,6 +1109,9 @@ service for the shared-store live tests. Those run only when
 `EASY_MCP_LIVE_REDIS_URL` names a scratch database, e.g.
 `docker run -d -p 6379:6379 redis:7-alpine` and
 `EASY_MCP_LIVE_REDIS_URL=redis://127.0.0.1:6379/15 pytest tests/test_live_redis.py`.
+Interop tests against the official MCP Python SDK client run when
+`EASY_MCP_LIVE_SDK_CLIENT=1` is set and `mcp` 2.3 or later is installed (best
+in a virtualenv of its own: `pip install "mcp>=2.3" -e .`).
 Releases are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License

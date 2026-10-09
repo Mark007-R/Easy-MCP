@@ -138,6 +138,7 @@ def test_http_level_rejections(live_server: LiveServer) -> None:
         get = client.get("/mcp", headers={"Accept": "text/event-stream"})
         assert get.status_code == 405
         assert "POST" in get.headers["allow"]
+        assert "GET" in get.headers["allow"]
 
         plain = client.post("/mcp", content=b"{}", headers={**ACCEPT, "Content-Type": "text/plain"})
         assert plain.status_code == 415

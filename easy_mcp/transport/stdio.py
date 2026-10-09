@@ -21,6 +21,13 @@ Security handled here (before anything reaches the dispatcher):
 * ``sys.stdout`` is redirected to stderr while serving, so a stray ``print``
   inside a tool cannot break the protocol stream.
 
+The server's own messages share stdout with the responses, one line each:
+``notifications/tools/list_changed`` once ``initialize`` has been answered,
+and the frames of ``subscriptions/listen`` streams, which a
+``notifications/cancelled`` naming the listen request ends.  When stdin
+closes, each open listen stream gets its result and then
+``notifications/cancelled`` before serving ends.
+
 The dispatcher is shared with every other transport, so validation, auth
 decisions, rate limits, timeouts, and error sanitization apply unchanged.
 State stays in this process even when the server has a shared store: one
@@ -30,6 +37,7 @@ client, one process, and no network dependency for a desktop host.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import secrets
@@ -41,6 +49,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
 from ..logging import audit
 from ..middleware import TransportInfo
+from ..protocol import ACKNOWLEDGED_METHOD
 from ..store.base import session_ref
 from .base import ClientContext, Transport
 
@@ -138,9 +147,29 @@ class StdioTransport(Transport):
 
         session_id = "stdio-" + secrets.token_urlsafe(12)
         client_id = identity.fingerprint if identity else "stdio"
-        context = ClientContext(client_id=client_id, session_id=session_id, identity=identity)
-
         loop = asyncio.get_running_loop()
+        closing = False
+
+        def push(message: dict[str, Any]) -> None:
+            self._write(message)
+            if closing and message.get("method") == ACKNOWLEDGED_METHOD:
+                # A listen acknowledged once serving began to end (its line
+                # came with the end of input, or middleware held it): it ends
+                # at once, gracefully, rather than holding the drain.
+                loop.call_soon(
+                    functools.partial(server.close_subscriptions, context, reason="shutdown")
+                )
+
+        # stdout carries the server's own messages too (list changes, listen
+        # streams), one line each, between the responses.
+        context = ClientContext(
+            client_id=client_id,
+            session_id=session_id,
+            identity=identity,
+            push=push,
+            multiplexed=True,
+        )
+
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._loop = loop
         self._queue = queue
@@ -173,6 +202,7 @@ class StdioTransport(Transport):
             client_id=client_id,
             t0=t0,
         )
+        server._started = True
         reader.start()
         try:
             while True:
@@ -183,13 +213,22 @@ class StdioTransport(Transport):
                 in_flight.add(task)
                 task.add_done_callback(in_flight.discard)
         finally:
+            # Open listen streams get their result and cancel lines now, and
+            # their requests return at once rather than holding the drain;
+            # so do those acknowledged from now on (push).
+            closing = True
+            server.close_subscriptions(context, reason="shutdown")
             await self._drain(in_flight)
+            # Again: an initialize answered during the drain started the
+            # session's notifications after the first close.
+            server.close_subscriptions(context, reason="shutdown")
             # Daemon threads die with the process, cancel callbacks included.
             await self._server.wait_for_tool_threads(self._shutdown_timeout)
             if self._stdout_override is None:
                 sys.stdout = real_stdout
             self._loop = None
             self._queue = None
+            self._stdout = None  # nothing more is written once serving has ended
             server._session_event(
                 False,
                 kind="stdio",

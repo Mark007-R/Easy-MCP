@@ -1568,7 +1568,8 @@ def capped_server() -> tuple[MCPServer, list[str]]:
 
 async def quota(call: ToolCall, call_next: ToolNext) -> ToolOutcome:
     """Asks a remote quota service first, as a real one would."""
-    await asyncio.sleep(0.05)
+    # Far slower than the 10 ms failures it races, even on a loaded CI runner.
+    await asyncio.sleep(0.3)
     return await call_next()
 
 
@@ -1589,7 +1590,7 @@ async def test_work_call_next_left_in_a_gather_is_stopped(logs: LogCapture) -> N
     for n, name in enumerate(("once", "once", "once_sync", "once_sync")):
         response = await server.dispatch(rpc("tools/call", {"name": name}, n), context)
         assert response is not None and response["error"]["code"] == INTERNAL_ERROR
-    await asyncio.sleep(0.2)  # time enough for left-behind work to reach the tool
+    await asyncio.sleep(0.6)  # time enough for left-behind work to reach the tool
     assert runs == [] and context.tool_calls == {"once": 0, "once_sync": 0}
     assert [event["stage"] for event in logs.events("middleware_failed")] == ["before"] * 4
 
@@ -1606,14 +1607,14 @@ async def test_work_call_next_left_in_a_gather_is_stopped(logs: LogCapture) -> N
 
     @request_level.middleware
     async def policy(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
-        await asyncio.sleep(0.05)  # a remote policy service
+        await asyncio.sleep(0.3)  # a remote policy service
         return await call_next()
 
     context = make_context()
     for n in range(2):
         response = await request_level.dispatch(rpc("tools/call", {"name": "once"}, n), context)
         assert response is not None and response["error"]["code"] == INTERNAL_ERROR
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.6)
     assert runs == [] and context.tool_calls.get("once", 0) == 0
 
 
@@ -1643,7 +1644,7 @@ async def test_work_call_next_left_in_a_task_is_stopped(logs: LogCapture) -> Non
             for n in range(3):
                 response = await server.dispatch(rpc("tools/call", {"name": "once"}, n), context)
                 assert response is not None and response["error"]["code"] == INTERNAL_ERROR
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.6)
             assert runs == [] and context.tool_calls == {"once": 0}, started
             assert all(task.done() for task in kept)
             kept.clear()

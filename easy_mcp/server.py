@@ -14,6 +14,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import hashlib
 import json
 import logging
 import threading
@@ -82,8 +83,11 @@ from .middleware import (
 from .protocol import (
     DISCOVER_METHOD,
     LATEST_PROTOCOL_VERSION,
+    LIST_KINDS,
+    LISTEN_METHOD,
     META_PROTOCOL_VERSION,
     META_SERVER_INFO,
+    META_SUBSCRIPTION_ID,
     SUPPORTED_PROTOCOL_VERSIONS,
     check_request_meta,
     era_error_code,
@@ -101,10 +105,18 @@ from .security.auth import (
     is_scope_token,
     visible,
 )
-from .security.oauth import OAuthResourceServer
+from .security.oauth import LEEWAY_SECONDS, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
 from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle
 from .store.memory import MemoryStore
+from .subscriptions import (
+    ChangeNotifier,
+    Push,
+    _Sink,
+    ack_message,
+    parse_filter,
+    valid_subscription_id,
+)
 from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
 from .transport._sessions import SessionManager
 from .transport.base import ClientContext, Transport
@@ -115,12 +127,18 @@ from .transport.streamable_http import StreamableHTTPTransport
 # The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
 PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 
-# Cache hints (ttlMs) on stateless results.  What server/discover reports is
-# fixed for the life of the process, so clients may keep it for an hour.  The
-# tool list is not: tools can be registered at runtime and no listChanged
-# notification announces it yet, so a cached copy is stale immediately.
+# Cache hints (ttlMs) on stateless results.  What server/discover reports
+# only ever grows (a capability, once advertised, stays), so clients may keep
+# it for an hour.  The tool list is not fixed: tools can be registered at
+# runtime.  A list_changed notification tells the clients holding a
+# subscriptions/listen stream, but only them, so for every other client a
+# cached copy is stale immediately.
 DISCOVER_TTL_MS = 3_600_000
 TOOLS_LIST_TTL_MS = 0
+
+# Digests of lists as one visibility class sees them, kept for this many
+# (kind, class) pairs: enough for every scope set a deployment uses.
+_DIGESTS_MAX = 1024
 
 # Sync tools that may run at once: the most asyncio's default executor, where
 # sync tools used to run, ever allowed.
@@ -146,6 +164,9 @@ class _Method:
     cancellable: bool = True
     # Served only while the server advertises this capability.
     capability: str | None = None
+    # Served only on a channel that can carry server-initiated messages
+    # (ClientContext.push).
+    needs_push: bool = False
 
 
 # Every method dispatch serves.  Anything else is answered -32601 (or, for a
@@ -159,6 +180,8 @@ _METHODS: dict[str, _Method] = {
     # Refusing server/discover would make a dual-era client take this server
     # for a legacy one.
     DISCOVER_METHOD: _Method(legacy=False, modern=True, observe_only=True),
+    # Its response is the stream; the client ends it by cancelling it.
+    LISTEN_METHOD: _Method(legacy=False, modern=True, needs_push=True),
     # Notifications carry no era of their own and have no response to refuse.
     "notifications/initialized": _Method(
         legacy=True, modern=False, notification=True, observe_only=True, cancellable=False
@@ -313,7 +336,10 @@ class MCPServer:
         max_sessions: Cap on concurrent handshake-era sessions, counted
             separately for Streamable HTTP and legacy SSE; stdio has exactly
             one.  With a shared ``store`` it counts the sessions of every
-            worker together.
+            worker together.  It also caps the ``subscriptions/listen``
+            streams open in this process, over every transport together (a
+            client may hold 8 of them); a stream over the cap is refused
+            with ``-32007`` (HTTP ``503``).
         allowed_origins: Browser origins allowed to call the HTTP endpoints,
             e.g. ``["https://app.example.com"]``; ``"*"`` allows any.  The
             default (``None``) allows loopback origins only.  Requests that
@@ -410,8 +436,24 @@ class MCPServer:
         self._session_managers: weakref.WeakSet[SessionManager] = weakref.WeakSet()
         # Set while an HTTP app of this server is serving (its lifespan runs).
         self._serving = False
+        # Set once any transport has started serving: clients may have
+        # cached what server/discover reported since.
+        self._started = False
         self._transport: Transport | None = None
         self._logger: logging.Logger = configure_logging(debug=debug, json_logs=json_logs)
+        # The capabilities advertised so far, by kind.  Sticky: a kind once
+        # advertised stays, so a capability a client cached never goes
+        # wrong; a kind emptied later is listed empty.
+        self._advertised: dict[str, dict[str, Any]] = {"tools": {"listChanged": True}}
+        self._advertised_lock = threading.Lock()
+        # Digests of each list as a visibility class sees it: (kind, class)
+        # -> (the registry version it was computed at, digest).
+        self._digests: OrderedDict[tuple[str, Hashable], tuple[int, str]] = OrderedDict()
+        self._digests_lock = threading.Lock()
+        # Who is told when a list changes: sessions and listen streams.
+        self._notifier = ChangeNotifier(
+            self._list_digest, view=self._visibility_class, final=self._listen_final
+        )
 
     # ------------------------------------------------------------ registration
 
@@ -461,6 +503,10 @@ class MCPServer:
     def register_tool(self, fn: Callable[..., Any], **options: Any) -> ToolDefinition:
         """Register a tool dynamically at runtime (same options as ``tool``).
 
+        Works from any thread.  Clients connected meanwhile that may see the
+        tool are told the tool list changed (changes within 0.1 s are
+        combined into one notice).
+
         Raises:
             ToolRegistrationError: The function cannot be exposed, or (with
                 ``oauth``) a scope could not appear in a ``WWW-Authenticate``
@@ -479,13 +525,19 @@ class MCPServer:
         self._registry.register(definition)
         self._logger.debug("registered tool %r", definition.name)
         self._warn_if_shared("registered", definition.name)
+        self._notifier.changed("tools")
         return definition
 
     def unregister_tool(self, name: str) -> ToolDefinition:
-        """Remove a tool at runtime; returns its definition."""
+        """Remove a tool at runtime; returns its definition.
+
+        Clients connected meanwhile that could see it are told the tool list
+        changed, as for :meth:`register_tool`.
+        """
         removed = self._registry.unregister(name)
         self._logger.debug("unregistered tool %r", name)
         self._warn_if_shared("unregistered", name)
+        self._notifier.changed("tools")
         return removed
 
     def _warn_if_shared(self, change: str, name: str) -> None:
@@ -963,6 +1015,10 @@ class MCPServer:
         # A request carrying the modern per-request _meta is served statelessly
         # (2026-07-28); anything else keeps the initialize-era behaviour.
         modern = not is_notification and is_modern_request(method, params)
+        if not modern:
+            # What the session is told about follows the credential of its
+            # latest request (a refreshed or broader token).
+            self._notifier.refresh_identity(context.session_id, context.identity)
         response: dict[str, Any] | None
         try:
             if modern:
@@ -974,7 +1030,9 @@ class MCPServer:
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
             # Methods the server does not serve never reach middleware, so
             # RequestInfo.method only ever holds one of the table's names.
-            spec = self._method(method, modern=modern, notification=notification_method)
+            spec = self._method(
+                method, modern=modern, notification=notification_method, context=context
+            )
             if spec is None:
                 if notification_method:
                     return None  # unknown notifications are ignored, per JSON-RPC
@@ -1005,11 +1063,14 @@ class MCPServer:
             response = self._finalize_error(response, modern)
         return response
 
-    def _method(self, method: str, *, modern: bool, notification: bool) -> _Method | None:
+    def _method(
+        self, method: str, *, modern: bool, notification: bool, context: ClientContext
+    ) -> _Method | None:
         """The table row serving *method* in this era, or ``None`` if there is none.
 
-        A method of the other era, or one whose capability is not
-        advertised, does not exist for this request.
+        A method of the other era, one whose capability is not advertised, or
+        one that needs a channel *context* lacks, does not exist for this
+        request.
         """
         spec = _METHODS.get(method)
         if spec is None or spec.notification != notification:
@@ -1017,6 +1078,8 @@ class MCPServer:
         if not (spec.modern if modern else spec.legacy):
             return None
         if spec.capability is not None and spec.capability not in self._capabilities():
+            return None
+        if spec.needs_push and context.push is None:
             return None
         return spec
 
@@ -1071,10 +1134,19 @@ class MCPServer:
         we await in both cases.  Middleware runs inside the task, so a
         cancel reaches it wherever the request is.  A ``CancelledError``
         the request raised when nothing cancelled it is an internal error.
+
+        A ``subscriptions/listen`` stream ends here whichever way it ends:
+        audited ``subscription_close`` (not ``request_cancelled``) with
+        ``disconnected`` when our caller was cancelled and
+        ``client_cancelled`` when the request itself was.
         """
         caller = asyncio.current_task()
         baseline = caller.cancelling() if caller is not None else 0
-        task: asyncio.Task[dict[str, Any]] = asyncio.create_task(self._serve(request, context))
+        listen = request.method == LISTEN_METHOD
+        ended = "closed"
+        task: asyncio.Task[dict[str, Any] | None] = asyncio.create_task(
+            self._serve(request, context)
+        )
         self._calls.add(task)
         task.add_done_callback(self._calls.discard)
         msg_id = request.request_id
@@ -1106,7 +1178,9 @@ class MCPServer:
                     msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
                 )
             if not task.done() or task.cancelled():
-                if request.method == "tools/call":
+                if listen:
+                    ended = "disconnected" if ours else "client_cancelled"
+                elif request.method == "tools/call":
                     audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
                 else:
                     audit(
@@ -1126,17 +1200,53 @@ class MCPServer:
                 msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
         finally:
+            if listen and request._subscription is not None:
+                # Gone already when the server or the client ended it.
+                self._notifier.drop(request._subscription, ended)
             if registered and context.in_flight.get(msg_id) is task:
                 del context.in_flight[msg_id]
 
-    async def _serve(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
-        """Run the request middleware around the request; returns the response."""
+    async def _serve(self, request: RequestInfo, context: ClientContext) -> dict[str, Any] | None:
+        """Run the request middleware around the request; returns the response.
+
+        ``None`` for a ``subscriptions/listen`` that was served, or whose
+        stream had its answer before middleware replaced it: its frames, the
+        final one included, went through ``context.push``.
+        """
         outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
         if request.method == "initialize" and outcome.error_code is None:
             # Only a handshake the client is answered with negotiates a
             # version; later requests on this connection or session are
             # spoken in it.
             context.protocol_version = request.protocol_version
+            if context.push is not None and context.store_handle is None:
+                # The context holds the session's whole state, its channel
+                # included: list changes are announced on it from now on,
+                # since the transport sends this result before anything
+                # else.  (A transport keeping sessions in the store starts
+                # them itself, on the worker holding the session's stream.)
+                self._watch_session(
+                    context.session_id,
+                    push=context.push,
+                    identity=context.identity,
+                    client_id=context.client_id,
+                    multiplexed=context.multiplexed,
+                    anchor=context,
+                )
+        if request.method == LISTEN_METHOD:
+            if outcome.error_code is None:
+                return None
+            sink = request._subscription
+            if sink is not None and sink.settled:
+                # Its stream had its answer already (its completion result,
+                # or none for a client's cancel): a request gets one.
+                self._logger.info(
+                    "subscriptions/listen %r: withheld the error (code %s) middleware "
+                    "answered once its stream had ended",
+                    request.request_id,
+                    outcome.error_code,
+                )
+                return None
         if outcome.error_code is not None:
             return _error_response(
                 request.request_id, outcome.error_code, outcome.message or "", outcome._data
@@ -1202,6 +1312,11 @@ class MCPServer:
         try:
             if method == "tools/call":
                 return RequestOutcome._of_tool(await self._execute_tool(request, context))
+            if method == LISTEN_METHOD:
+                # Returns when the stream ends; what the client gets went
+                # through context.push.
+                await self._handle_listen(request, context)
+                return RequestOutcome._create(result={})
             if request.stateless:
                 result: Any = self._dispatch_modern(method, context)
             elif method == "initialize":
@@ -1256,7 +1371,39 @@ class MCPServer:
         return response
 
     def _capabilities(self) -> dict[str, Any]:
-        return {"tools": {"listChanged": False}}
+        """What ``initialize`` and ``server/discover`` advertise (a copy)."""
+        with self._advertised_lock:
+            return {kind: dict(capability) for kind, capability in self._advertised.items()}
+
+    def _advertise(self, kind: str, capability: dict[str, Any]) -> None:
+        """Advertise the *kind* capability from now on, for the life of the process.
+
+        Each feature calls it once its first item is registered; tools are
+        advertised from the start.  A capability is never withdrawn, so a
+        client that cached ``server/discover`` (for up to an hour) is never
+        told something that stopped being true.  One added once serving has
+        begun is logged: such clients learn of it only when their copy
+        expires.
+        """
+        with self._advertised_lock:
+            if kind in self._advertised:
+                return
+            self._advertised[kind] = dict(capability)
+        if self._started:
+            self._logger.warning(
+                "capability %r added after serving began: clients that cached server/discover "
+                "may not see it for up to an hour",
+                kind,
+            )
+
+    def _list_kinds(self) -> tuple[str, ...]:
+        """The list kinds whose changes are announced: those advertised with ``listChanged``."""
+        with self._advertised_lock:
+            return tuple(
+                kind
+                for kind in LIST_KINDS
+                if self._advertised.get(kind, {}).get("listChanged") is True
+            )
 
     def _server_info(self) -> dict[str, Any]:
         return {"name": self.name, "version": self.version}
@@ -1321,15 +1468,221 @@ class MCPServer:
         return {**result, "resultType": "complete", "_meta": meta}
 
     def _handle_tools_list(self, context: ClientContext) -> dict[str, Any]:
+        _, tools = self._list_entries("tools", context.identity)
+        return {"tools": tools}
+
+    # -------------------------------------------------- change notifications
+
+    def _list_entries(
+        self, kind: str, identity: ClientIdentity | None
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """The *kind* list as *identity* gets it, and the registry version it was read at.
+
+        The one source of both the list a client fetches and the digest it
+        is told about changes of, so the two never disagree.
+        """
+        if kind != "tools":
+            raise KeyError(kind)
+        version, definitions = self._registry.snapshot()
         # Protected tools are omitted for callers who could not invoke them
         # (a token with step-up sees them all, and is challenged on a call).
-        return {
-            "tools": [
-                definition.to_mcp()
-                for definition in self._registry.list()
-                if self._visible(context.identity, definition)
-            ]
-        }
+        return version, [
+            definition.to_mcp()
+            for definition in definitions
+            if self._visible(identity, definition)
+        ]
+
+    def _list_version(self, kind: str) -> int:
+        """How many changes the registry behind the *kind* list has seen."""
+        if kind != "tools":
+            raise KeyError(kind)
+        return self._registry.version
+
+    def _visibility_class(self, identity: ClientIdentity | None) -> Hashable:
+        """What decides which items *identity* sees, and nothing else.
+
+        Anonymous; a token that sees everything (step-up); or a scope set.
+        Every kind's visibility must stay a function of this alone, or the
+        digests below would be shared by callers that see different lists.
+        """
+        if identity is None:
+            return None
+        if self._steps_up(identity):
+            return "step-up"
+        return identity.scopes
+
+    def _list_digest(self, kind: str, identity: ClientIdentity | None) -> str:
+        """A digest of the *kind* list *identity* sees.
+
+        Kept per visibility class and registry version, so the hundreds of
+        clients told about one change share a handful of computations.
+        """
+        key = (kind, self._visibility_class(identity))
+        current = self._list_version(kind)
+        with self._digests_lock:
+            cached = self._digests.get(key)
+            if cached is not None and cached[0] == current:
+                self._digests.move_to_end(key)
+                return cached[1]
+        version, entries = self._list_entries(kind, identity)
+        # The list as its clients read it: encoded as tools/list is (str()
+        # for what JSON has no type for, every key a string, so keys of
+        # mixed types can be sorted), then in canonical form.
+        parsed = json.loads(json.dumps(entries, default=str))
+        canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        with self._digests_lock:
+            self._digests[key] = (version, digest)
+            self._digests.move_to_end(key)
+            while len(self._digests) > _DIGESTS_MAX:
+                self._digests.popitem(last=False)
+        return digest
+
+    def _list_baselines(self, identity: ClientIdentity | None) -> dict[str, str]:
+        """The digest of every announced list as *identity* sees it now.
+
+        A list whose digest cannot be computed is left out, and logged: its
+        recipient is not told about that list, rather than the handshake or
+        stream that asked failing.
+        """
+        return self._notifier.baselines(self._list_kinds(), identity)
+
+    def _watch_session(
+        self,
+        key: str,
+        *,
+        push: Push,
+        identity: ClientIdentity | None,
+        client_id: str,
+        multiplexed: bool = False,
+        baselines: dict[str, str] | None = None,
+        anchor: object | None = None,
+    ) -> _Sink:
+        """Announce list changes to the session *key* through *push* from now on.
+
+        On the loop that delivers to it.  *baselines* is what its client was
+        last told the lists hold; by default the lists as they are now, which
+        is right just before its ``initialize`` result is sent (its client
+        lists after that).  A list that differs from its baseline is
+        announced at once.  A list whose digest cannot be computed is not
+        watched (:meth:`_list_baselines`).
+        """
+        current = self._list_baselines(identity)
+        sink = self._notifier.watch_session(
+            key,
+            push=push,
+            identity=identity,
+            client_id=client_id,
+            kinds=current,
+            baselines=current if baselines is None else baselines,
+            multiplexed=multiplexed,
+            anchor=anchor,
+        )
+        if baselines is not None:
+            sink.deliver(sorted(current))
+        return sink
+
+    def _listen_final(self, subscription_id: Any) -> dict[str, Any]:
+        """The completion result of a listen stream the server ends."""
+        result = self._modern_result({"_meta": {META_SUBSCRIPTION_ID: subscription_id}})
+        return _result_response(subscription_id, result)
+
+    @staticmethod
+    def _stream_deadline(identity: ClientIdentity | None) -> float | None:
+        """When a stream opened with *identity* must end: its token's expiry (epoch seconds).
+
+        ``None`` for an API key or an anonymous caller.  The token is
+        accepted until its expiry plus the clock-skew leeway, and so is the
+        stream.
+        """
+        if identity is None or identity.issuer is None or identity.expires_at is None:
+            return None
+        return float(identity.expires_at + LEEWAY_SECONDS)
+
+    async def _handle_listen(self, request: RequestInfo, context: ClientContext) -> None:
+        """Serve ``subscriptions/listen``: acknowledge it, then wait until the stream ends.
+
+        The acknowledgment and every notification go through
+        ``context.push``; so does the completion result when the server ends
+        the stream (:meth:`close_subscriptions`, or the token's expiry).
+
+        Raises:
+            ProtocolError: ``-32600`` for an id that is no string or number,
+                or one open on this channel already; ``-32602`` for a
+                malformed filter.
+            SubscriptionLimitError: Too many streams are open.
+        """
+        msg_id = request.request_id
+        push = context.push
+        if push is None:  # the method table refuses it first
+            raise ProtocolError(f"Method not found: {LISTEN_METHOD}", code=METHOD_NOT_FOUND)
+        if not valid_subscription_id(msg_id):
+            raise ProtocolError(
+                "Invalid request: subscriptions/listen needs a string or number id",
+                code=INVALID_REQUEST,
+            )
+        requested, _ = parse_filter(request._params.get("notifications"))
+        # Kinds the server does not announce, and resourceSubscriptions, are
+        # left out of the acknowledgment and never sent; so is a list whose
+        # digest cannot be computed (the sink's kinds).
+        kinds = requested & frozenset(self._list_kinds())
+        sink = self._notifier.open(
+            channel=push,
+            client_id=context.client_id,
+            identity=context.identity,
+            subscription_id=msg_id,
+            kinds=kinds,
+            push=push,
+            multiplexed=context.multiplexed,
+            max_total=self.max_sessions,
+        )
+        request._subscription = sink
+        # In the same step as the registration, and flushes run only from
+        # loop callbacks: the acknowledgment is the stream's first frame.
+        try:
+            push(ack_message(msg_id, sink.kinds))
+        except Exception:
+            self._notifier.drop(sink, "undeliverable")
+            raise
+        audit(
+            "subscription_open",
+            client_id=context.client_id,
+            subscription_id=msg_id,
+            kinds=sorted(sink.kinds),
+        )
+        timer: asyncio.TimerHandle | None = None
+        deadline = self._stream_deadline(context.identity)
+        if deadline is not None:
+            timer = asyncio.get_running_loop().call_later(
+                max(0.0, deadline - time.time()), self._notifier.end, sink, "token_expired"
+            )
+        try:
+            await sink.wait_ended()
+        finally:
+            if timer is not None:
+                timer.cancel()
+
+    def close_subscriptions(self, context: ClientContext, *, reason: str = "closed") -> int:
+        """End every subscription opened through *context*, gracefully.
+
+        Each open ``subscriptions/listen`` stream on *context*'s channel gets
+        its completion result (and, on a multiplexed channel,
+        ``notifications/cancelled``) through ``context.push`` before this
+        returns; then its ``dispatch`` returns ``None``.  The session the
+        context carries stops receiving list changes.  Transports call this,
+        on the event loop, when a channel ends or the server shuts down, and
+        again once the channel's requests still running have finished (an
+        ``initialize`` answered meanwhile starts the session's notifications
+        anew); *reason* is audited.  Idempotent.
+
+        Returns:
+            How many subscriptions ended.
+        """
+        return self._notifier.close(context.push, context.session_id, reason=reason)
+
+    def _cancel_subscription(self, context: ClientContext, request_id: object) -> bool:
+        """End the listen stream *request_id* names on *context*'s channel, as its client asked."""
+        return self._notifier.cancel(context.push, request_id)
 
     async def _handle_notification(
         self, method: str, params: dict[str, Any], context: ClientContext
@@ -1338,6 +1691,12 @@ class MCPServer:
             self._logger.debug("client initialized (session %s)", context.session_id)
         elif method == "notifications/cancelled":
             request_id = params.get("requestId")
+            # A listen stream ends at once: nothing more is written for it,
+            # not even a change already pending.  Its request then returns
+            # by itself, unanswered; no other request is looked up, since
+            # 1 and 1.0 name two subscriptions but one in_flight entry.
+            if self._cancel_subscription(context, request_id):
+                return
             # A list or an object is no request id this server handed out.
             task = context.in_flight.get(request_id) if isinstance(request_id, Hashable) else None
             if task is not None:
@@ -1913,7 +2272,7 @@ class MCPServer:
         try:
             if self.oauth is not None:
                 await self.oauth.warm_up()
-            self._serving = True
+            self._serving = self._started = True
             yield
         finally:
             self._serving = False
