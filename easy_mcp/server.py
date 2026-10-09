@@ -31,13 +31,16 @@ from collections.abc import (
     Hashable,
     Iterable,
     Mapping,
+    Sequence,
 )
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from ._version import __version__
 from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
+from .completion import CompletionSource, collect, empty, filter_static, shape
+from .content import NotFound, to_prompt_messages, to_resource_contents
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     AUTHENTICATION_REQUIRED,
@@ -46,10 +49,14 @@ from .exceptions import (
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    RESOURCE_NOT_FOUND_LEGACY,
     TOOL_TIMEOUT,
     AuthenticationError,
+    AuthorizationError,
     InsufficientScopeError,
     ProtocolError,
+    RegistrationError,
+    ResourceNotFoundError,
     ServerBusyError,
     SessionLimitError,
     StoreUnavailableError,
@@ -80,6 +87,8 @@ from .middleware import (
     describe,
     run_chain,
 )
+from .pagination import paginate
+from .prompts import PromptDefinition, PromptRegistry, build_prompt
 from .protocol import (
     DISCOVER_METHOD,
     LATEST_PROTOCOL_VERSION,
@@ -94,6 +103,12 @@ from .protocol import (
     is_modern_request,
     is_reserved_error_code,
     negotiate_protocol_version,
+)
+from .resources import (
+    ResourceDefinition,
+    ResourceRegistry,
+    ResourceTemplateDefinition,
+    build_resource,
 )
 from .schema import build_param_models, dump_model, validate_arguments, validate_result
 from .security.auth import (
@@ -127,6 +142,8 @@ from .transport.streamable_http import StreamableHTTPTransport
 # The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
 PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
 # Cache hints (ttlMs) on stateless results.  What server/discover reports
 # only ever grows (a capability, once advertised, stays), so clients may keep
 # it for an hour.  The tool list is not fixed: tools can be registered at
@@ -135,6 +152,24 @@ PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 # cached copy is stale immediately.
 DISCOVER_TTL_MS = 3_600_000
 TOOLS_LIST_TTL_MS = 0
+# The same holds for the resources, templates and prompts lists.
+RESOURCES_LIST_TTL_MS = RESOURCE_TEMPLATES_LIST_TTL_MS = PROMPTS_LIST_TTL_MS = 0
+
+# The paginated list methods: (the kind their cursor names, the result
+# field, the change kind whose digest covers them).
+_LISTS: dict[str, tuple[str, str]] = {
+    "resources/list": ("resources", "resources"),
+    "resources/templates/list": ("templates", "resourceTemplates"),
+    "prompts/list": ("prompts", "prompts"),
+}
+
+# A resource URI is echoed in data.uri only up to this length, and audited
+# (logs, never responses) up to the second, so a hostile one-megabyte URI
+# doubles neither a response nor a log line.
+_ECHO_URI_MAX = 2048
+_AUDIT_URI_MAX = 512
+# Messages name a URI by at most this many characters.
+_LABEL_MAX = 256
 
 # Digests of lists as one visibility class sees them, kept for this many
 # (kind, class) pairs: enough for every scope set a deployment uses.
@@ -177,6 +212,12 @@ _METHODS: dict[str, _Method] = {
     "ping": _Method(legacy=True, modern=False),
     "tools/list": _Method(legacy=True, modern=True, capability="tools"),
     "tools/call": _Method(legacy=True, modern=True, capability="tools"),
+    "resources/list": _Method(legacy=True, modern=True, capability="resources"),
+    "resources/templates/list": _Method(legacy=True, modern=True, capability="resources"),
+    "resources/read": _Method(legacy=True, modern=True, capability="resources"),
+    "prompts/list": _Method(legacy=True, modern=True, capability="prompts"),
+    "prompts/get": _Method(legacy=True, modern=True, capability="prompts"),
+    "completion/complete": _Method(legacy=True, modern=True, capability="completions"),
     # Refusing server/discover would make a dual-era client take this server
     # for a legacy one.
     DISCOVER_METHOD: _Method(legacy=False, modern=True, observe_only=True),
@@ -259,6 +300,37 @@ def _drop_unreported_error(awaitable: Any) -> None:
             error.__traceback__ = None
 
 
+def _gather(produced: Any) -> tuple[list[str], int | None]:
+    """What a completer returned, read as :func:`~easy_mcp.completion.collect` reads it."""
+    if isinstance(produced, str | bytes) or not isinstance(produced, Iterable):
+        raise TypeError(f"a completer result of type {type(produced).__name__}")
+    return collect(produced, sized=isinstance(produced, Sequence))
+
+
+def _completer_call(
+    source: CompletionSource, value: str, known: Mapping[str, str]
+) -> tuple[Callable[[], Any], bool]:
+    """A function of no arguments running *source*'s completer, and whether it is async.
+
+    The completer's result is read inside it: on its worker thread for a
+    sync completer, so even a slow generator never holds the event loop.
+    """
+    fn = source.fn
+    assert fn is not None
+    arguments = dict(known)
+    if source.is_async:
+
+        async def run_async() -> tuple[list[str], int | None]:
+            return _gather(await fn(value, arguments))
+
+        return run_async, True
+
+    def run() -> tuple[list[str], int | None]:
+        return _gather(fn(value, arguments))
+
+    return run, False
+
+
 def _tool_failure(text: str) -> dict[str, Any]:
     """An MCP CallToolResult marking a tool-level (not protocol-level) error."""
     return {"content": [{"type": "text", "text": text}], "isError": True}
@@ -311,7 +383,8 @@ def _render_result(definition: ToolDefinition, result: Any) -> tuple[str, Any | 
 
 
 class MCPServer:
-    """A secure-by-default MCP server exposing Python functions as tools.
+    """A secure-by-default MCP server exposing Python functions as tools,
+    resources and prompts.
 
     Example::
 
@@ -323,6 +396,11 @@ class MCPServer:
         def add(a: int, b: int) -> int:
             \"\"\"Add two numbers.\"\"\"
             return a + b
+
+        @server.resource("config://app")
+        def app_config() -> dict[str, str]:
+            \"\"\"The application's configuration.\"\"\"
+            return {"region": "eu-west-1"}
 
         server.run()
 
@@ -347,13 +425,15 @@ class MCPServer:
             to the same budget.
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
-            overrides it; ``None`` disables.
+            overrides it; ``None`` disables.  Resources, prompts and
+            completers get it too.
         max_sync_workers: Cap on sync tools running at once.  Each runs in a
             thread of its own, and a cancelled or timed-out call keeps its
             thread until the tool returns, so the cap also bounds threads
             left behind by tools that ignore their cancel token.  A call
             beyond it is refused with ``-32008`` rather than queued.
-            ``None`` removes the cap.
+            ``None`` removes the cap.  Sync resources, prompts and
+            completers share the same workers.
         max_sessions: Cap on concurrent handshake-era sessions, counted
             separately for Streamable HTTP and legacy SSE; stdio has exactly
             one.  With a shared ``store`` it counts the sessions of every
@@ -438,6 +518,8 @@ class MCPServer:
         )
         self.instructions = instructions
         self._registry = ToolRegistry()
+        self._resources = ResourceRegistry()
+        self._prompts = PromptRegistry()
         self._limiter = (
             SlidingWindowRateLimiter(rate_limit_per_minute)
             if rate_limit_per_minute
@@ -561,15 +643,236 @@ class MCPServer:
         self._notifier.changed("tools")
         return removed
 
-    def _warn_if_shared(self, change: str, name: str) -> None:
-        """Warn that a tool changed in this worker only, when workers share a store."""
+    def _warn_if_shared(self, change: str, name: str, noun: str = "tool") -> None:
+        """Warn that a tool (or other *noun*) changed in this worker only, with a shared store."""
         if self._serving and self._store.shared:
             self._logger.warning(
-                "tool %r %s while serving with a shared store: only this worker sees the "
-                "change; every worker must register the same tools",
+                "%s %r %s while serving with a shared store: only this worker sees the "
+                "change; every worker must register the same %ss",
+                noun,
                 name,
                 change,
+                noun,
             )
+
+    def _check_oauth_scopes(self, scopes: Iterable[str], what: str) -> None:
+        """Refuse a scope no ``WWW-Authenticate`` challenge could name, with ``oauth``.
+
+        Raises:
+            RegistrationError: Naming *what* and the scope.
+        """
+        if self.oauth is None:
+            return
+        for scope in scopes:
+            if not is_scope_token(scope) or scope == "offline_access":
+                raise RegistrationError(
+                    f"cannot register {what}: scope {scope!r} cannot be used with OAuth (a "
+                    "scope is printable ASCII without spaces, quotes or backslashes, and "
+                    "offline_access is no resource scope)"
+                )
+
+    # ------------------------------------------------------- resources, prompts
+
+    def resource(
+        self,
+        uri: str,
+        /,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        mime_type: str | None = None,
+        size: int | None = None,
+        annotations: Mapping[str, Any] | None = None,
+        requires_auth: bool = False,
+        scopes: Iterable[str] = (),
+        timeout: float | None = None,
+        cache_ttl: float = 0.0,
+        complete: Mapping[str, Any] | None = None,
+    ) -> Callable[[_F], _F]:
+        """Register a function as an MCP resource at *uri*.
+
+        The function's return value is the content: ``str`` is text,
+        ``bytes`` a base64 ``blob``, dicts, lists and Pydantic models JSON,
+        :class:`~easy_mcp.ResourceContent` items as given.  Returning
+        ``None`` means the resource does not exist.  A *uri* containing
+        ``{name}`` (one path segment) or ``{+name}`` (several) is a template
+        whose variables become the function's parameters (``str``, ``int``,
+        ``float``, ``bool`` or a ``Literal``)::
+
+            @server.resource("users://{user_id}/profile", scopes=("users",))
+            def profile(user_id: int) -> dict[str, Any] | None:
+                \"\"\"A user's profile.\"\"\"
+                return load_profile(user_id)
+
+        The function is returned unchanged.  *mime_type* defaults from the
+        return annotation, *description* from the docstring.  *cache_ttl* is
+        how many seconds a stateless client may cache a read (default 0).
+        *complete* maps a template variable to a completer: a list of
+        strings, or ``fn(value, arguments)``.  The other options are the
+        tools' own.
+
+        Raises:
+            RegistrationError: The resource cannot be served safely.
+        """
+        if not isinstance(uri, str):
+            raise RegistrationError(
+                "@server.resource needs the URI first: @server.resource('scheme://...')"
+            )
+
+        def decorate(target: _F) -> _F:
+            self.register_resource(
+                target,
+                uri,
+                name=name,
+                title=title,
+                description=description,
+                mime_type=mime_type,
+                size=size,
+                annotations=annotations,
+                requires_auth=requires_auth,
+                scopes=scopes,
+                timeout=timeout,
+                cache_ttl=cache_ttl,
+                complete=complete,
+            )
+            return target
+
+        return decorate
+
+    def register_resource(
+        self, fn: Callable[..., Any], uri: str, /, **options: Any
+    ) -> ResourceDefinition | ResourceTemplateDefinition:
+        """Register a resource dynamically at runtime (same options as :meth:`resource`).
+
+        Works from any thread.  Clients that asked to hear of resource list
+        changes, and may see it, are told the list changed.
+
+        Raises:
+            RegistrationError: The resource cannot be served safely, or (with
+                ``oauth``) a scope could not appear in a challenge.
+        """
+        definition = build_resource(fn, uri, **options)
+        key = (
+            definition.uri_template
+            if isinstance(definition, ResourceTemplateDefinition)
+            else definition.uri
+        )
+        self._check_oauth_scopes(definition.declared_scopes, f"resource {key!r}")
+        self._resources.register(definition)
+        self._logger.debug("registered resource %r", key)
+        self._advertise("resources", {"subscribe": True, "listChanged": True})
+        if isinstance(definition, ResourceTemplateDefinition) and definition.completers:
+            self._advertise("completions", {})
+        self._warn_if_shared("registered", key, "resource")
+        self._notifier.changed("resources")
+        return definition
+
+    def unregister_resource(self, uri: str) -> ResourceDefinition | ResourceTemplateDefinition:
+        """Remove a resource or template at runtime (by its URI or template); returns it.
+
+        The ``resources`` capability stays advertised: clients may have
+        cached it.
+
+        Raises:
+            RegistrationError: Nothing is registered under *uri*.
+        """
+        removed = self._resources.unregister(uri)
+        self._logger.debug("unregistered resource %r", uri)
+        self._warn_if_shared("unregistered", uri, "resource")
+        self._notifier.changed("resources")
+        return removed
+
+    @property
+    def resources(self) -> list[ResourceDefinition]:
+        """All registered concrete resources, sorted by URI."""
+        return self._resources.list_resources()
+
+    @property
+    def resource_templates(self) -> list[ResourceTemplateDefinition]:
+        """All registered resource templates, sorted by template."""
+        return self._resources.list_templates()
+
+    def prompt(
+        self,
+        fn: Callable[..., Any] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        requires_auth: bool = False,
+        scopes: Iterable[str] = (),
+        timeout: float | None = None,
+        complete: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Register a function as an MCP prompt.
+
+        Works bare (``@server.prompt``) or with options, as :meth:`tool`
+        does; the function is returned unchanged.  Its parameters are the
+        prompt's arguments, which arrive as strings and are converted to
+        ``str``, ``int``, ``float``, ``bool`` or a ``Literal``.  It returns a
+        string (one user message), a :class:`~easy_mcp.Message`, or a list
+        of strings and messages.  ``Literal`` and ``bool`` arguments complete
+        automatically; *complete* adds completers for the others.
+
+        Raises:
+            RegistrationError: The prompt cannot be served safely.
+        """
+
+        def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_prompt(
+                target,
+                name=name,
+                title=title,
+                description=description,
+                requires_auth=requires_auth,
+                scopes=scopes,
+                timeout=timeout,
+                complete=complete,
+            )
+            return target
+
+        if fn is not None:
+            return decorate(fn)
+        return decorate
+
+    def register_prompt(self, fn: Callable[..., Any], **options: Any) -> PromptDefinition:
+        """Register a prompt dynamically at runtime (same options as :meth:`prompt`).
+
+        Works from any thread; clients that asked to hear of prompt list
+        changes, and may see it, are told the list changed.
+
+        Raises:
+            RegistrationError: The prompt cannot be served safely.
+        """
+        definition = build_prompt(fn, **options)
+        self._check_oauth_scopes(definition.declared_scopes, f"prompt {definition.name!r}")
+        self._prompts.register(definition)
+        self._logger.debug("registered prompt %r", definition.name)
+        self._advertise("prompts", {"listChanged": True})
+        if definition.completers:
+            self._advertise("completions", {})
+        self._warn_if_shared("registered", definition.name, "prompt")
+        self._notifier.changed("prompts")
+        return definition
+
+    def unregister_prompt(self, name: str) -> PromptDefinition:
+        """Remove a prompt at runtime; returns its definition.
+
+        Raises:
+            RegistrationError: No prompt has that name.
+        """
+        removed = self._prompts.unregister(name)
+        self._logger.debug("unregistered prompt %r", name)
+        self._warn_if_shared("unregistered", name, "prompt")
+        self._notifier.changed("prompts")
+        return removed
+
+    @property
+    def prompts(self) -> list[PromptDefinition]:
+        """All registered prompts, sorted by name."""
+        return self._prompts.list()
 
     def middleware(self, fn: RequestMiddlewareT, /) -> RequestMiddlewareT:
         """Register request middleware: your async code around every request.
@@ -803,16 +1106,26 @@ class MCPServer:
             return None
         return item.declared_scopes[0] if item.declared_scopes else min(item.scopes)
 
-    def _check_step_up(self, identity: ClientIdentity | None, item: Guarded) -> None:
+    def _check_step_up(
+        self,
+        identity: ClientIdentity | None,
+        item: Guarded,
+        kind: str = "tool",
+        label: str | None = None,
+    ) -> None:
         """Refuse a token that holds none of *item*'s scopes, naming the one to ask for.
+
+        *kind* and *label* name the item in the message (by default a tool
+        and its name).
 
         Raises:
             InsufficientScopeError: With the narrowest declared scope.
         """
         first = self._step_up_scope(identity, item)
         if identity is not None and first is not None:
+            named = label if label is not None else item.name
             raise InsufficientScopeError(
-                (first,), f"Insufficient scope for tool '{item.name}'", granted=identity.scopes
+                (first,), f"Insufficient scope for {kind} '{named}'", granted=identity.scopes
             )
 
     def _initial_scopes(self) -> tuple[str, ...]:
@@ -826,17 +1139,21 @@ class MCPServer:
             return ()
         scopes = list(self.oauth.required_scopes)
         if not self.oauth.step_up:
-            tool_scopes = {scope for definition in self.tools for scope in definition.scopes}
-            scopes.extend(sorted(tool_scopes - set(scopes)))
+            item_scopes = {scope for item in self._guarded() for scope in item.scopes}
+            scopes.extend(sorted(item_scopes - set(scopes)))
         return tuple(scope for scope in scopes if scope != "offline_access")
 
     def _known_scopes(self) -> frozenset[str]:
-        """Every scope this server checks: ``required_scopes`` and every tool scope."""
+        """Every scope this server checks: ``required_scopes`` and every item's scopes."""
         scopes = set(self.oauth.required_scopes) if self.oauth is not None else set()
-        for definition in self.tools:
-            scopes.update(definition.scopes)
+        for item in self._guarded():
+            scopes.update(item.scopes)
         scopes.discard("offline_access")
         return frozenset(scopes)
+
+    def _guarded(self) -> list[Guarded]:
+        """Every registered item that scopes can guard: tools, resources, templates, prompts."""
+        return [*self.tools, *self.resources, *self.resource_templates, *self.prompts]
 
     @staticmethod
     def _request_context(
@@ -1330,6 +1647,7 @@ class MCPServer:
         Never raises but ``CancelledError``: errors become outcomes.
         """
         method = request.method
+        result: Any
         try:
             if method == "tools/call":
                 return RequestOutcome._of_tool(await self._execute_tool(request, context))
@@ -1338,14 +1656,22 @@ class MCPServer:
                 # through context.push.
                 await self._handle_listen(request, context)
                 return RequestOutcome._create(result={})
-            if request.stateless:
-                result: Any = self._dispatch_modern(method, context)
+            if method == "resources/read":
+                result = await self._read_resource(request, context)
+            elif method == "prompts/get":
+                result = await self._get_prompt(request, context)
+            elif method == "completion/complete":
+                result = await self._complete(request, context)
+            elif request.stateless:
+                result = self._dispatch_modern(method, context, request._params)
             elif method == "initialize":
                 result = self._handle_initialize(request._params, context)
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
                 result = self._handle_tools_list(context)
+            elif method in _LISTS:
+                result = self._handle_list(method, request._params, context)
             else:  # the method table and this routing disagree
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
         except ProtocolError as exc:
@@ -1442,8 +1768,10 @@ class MCPServer:
             result["instructions"] = self.instructions
         return result
 
-    def _dispatch_modern(self, method: str, context: ClientContext) -> dict[str, Any]:
-        """Serve a stateless request other than ``tools/call``.
+    def _dispatch_modern(
+        self, method: str, context: ClientContext, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Serve a stateless request that runs no user code: discovery and the lists.
 
         ``initialize``, ``ping`` and ``notifications/initialized`` do not
         exist in this era, so they are unknown methods here.
@@ -1463,20 +1791,37 @@ class MCPServer:
             result["ttlMs"] = TOOLS_LIST_TTL_MS
             result["cacheScope"] = self._cache_scope(method)
             return result
+        if method in _LISTS:
+            result = self._handle_list(method, params or {}, context)
+            # The same scope on every page, as the caching spec requires.
+            result["ttlMs"] = (
+                PROMPTS_LIST_TTL_MS if method == "prompts/list" else RESOURCES_LIST_TTL_MS
+            )
+            result["cacheScope"] = self._cache_scope(method)
+            return result
         raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
 
-    def _cache_scope(self, method: str) -> str:
+    def _cache_scope(self, method: str, item: Guarded | None = None, *, retry: bool = False) -> str:
         """The ``cacheScope`` of a stateless result.
 
         ``"public"`` only when an anonymous request would get the same bytes.
         ``server/discover`` is the same for everyone (with ``oauth`` it needs
         a token, but its answer does not depend on which).  A list is not once
-        auth is configured (protected tools are hidden from callers who cannot
+        auth is configured (protected items are hidden from callers who cannot
         use them, and API keys and tokens may see different lists) or request
         middleware is registered (it may answer each caller differently), and
-        a shared cache must not hand one caller's list to another.
+        a shared cache must not hand one caller's list to another.  A
+        ``resources/read`` of *item* is not when the resource is protected,
+        ``oauth`` is set, request middleware is registered, or it is a retry
+        carrying ``inputResponses``/``requestState`` (*retry*), whose result
+        must not be cached at all.
         """
         if method == DISCOVER_METHOD:
+            return "public"
+        if method == "resources/read":
+            protected = item is not None and item.requires_auth
+            if retry or protected or self.oauth is not None or self._request_middleware:
+                return "private"
             return "public"
         if self.auth_configured or self._request_middleware:
             return "private"
@@ -1492,6 +1837,465 @@ class MCPServer:
         _, tools = self._list_entries("tools", context.identity)
         return {"tools": tools}
 
+    def _handle_list(
+        self, method: str, params: dict[str, Any], context: ClientContext
+    ) -> dict[str, Any]:
+        """One page of ``resources/list``, ``resources/templates/list`` or ``prompts/list``.
+
+        Items the caller cannot see are left out before paging, so they are
+        neither shown nor counted.
+
+        Raises:
+            ProtocolError: ``-32602`` for an invalid cursor.
+        """
+        kind, field = _LISTS[method]
+        identity = context.identity
+        cursor = params.get("cursor")
+        entries: list[dict[str, Any]]
+        next_cursor: str | None
+        if kind == "resources":
+            resources = [r for r in self.resources if self._visible(identity, r)]
+            page, next_cursor = paginate(resources, key=lambda r: r.uri, kind=kind, cursor=cursor)
+            entries = [r.to_mcp() for r in page]
+        elif kind == "templates":
+            templates = [t for t in self.resource_templates if self._visible(identity, t)]
+            pages, next_cursor = paginate(
+                templates, key=lambda t: t.uri_template, kind=kind, cursor=cursor
+            )
+            entries = [t.to_mcp() for t in pages]
+        else:
+            prompts = [p for p in self.prompts if self._visible(identity, p)]
+            found, next_cursor = paginate(prompts, key=lambda p: p.name, kind=kind, cursor=cursor)
+            entries = [p.to_mcp() for p in found]
+        result: dict[str, Any] = {field: entries}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
+
+    # ------------------------------------------------- resources and prompts
+
+    def _resolve_resource(
+        self, uri: str, identity: ClientIdentity | None
+    ) -> tuple[ResourceDefinition | ResourceTemplateDefinition | None, dict[str, Any], bool]:
+        """What a read of *uri* by *identity* runs: ``(definition, arguments, hidden)``.
+
+        A concrete resource with exactly that URI first, then the templates,
+        most specific first, whose pattern matches and whose variables
+        convert.  Items *identity* cannot see are skipped as if they did not
+        exist; *hidden* says one of them matched (for the audit log only).
+        """
+        hidden = False
+        concrete = self._resources.get(uri)
+        if concrete is not None:
+            if self._visible(identity, concrete):
+                return concrete, {}, False
+            hidden = True
+        for template in self._resources.templates_by_specificity():
+            arguments = template.bind(uri)
+            if arguments is None:
+                continue
+            if self._visible(identity, template):
+                return template, arguments, False
+            hidden = True
+        return None, {}, hidden
+
+    @staticmethod
+    def _resource_not_found(
+        uri: str | None, stateless: bool, message: str = "Resource not found"
+    ) -> ProtocolError:
+        """The error for a missing resource: ``-32602`` statelessly, ``-32002`` before."""
+        data = {"uri": uri} if uri is not None and len(uri) <= _ECHO_URI_MAX else None
+        code = INVALID_PARAMS if stateless else RESOURCE_NOT_FOUND_LEGACY
+        return ProtocolError(message, code=code, data=data)
+
+    @staticmethod
+    def _label(uri: str) -> str:
+        """*uri* as messages and thread names name it: cut short when long."""
+        return uri if len(uri) <= _LABEL_MAX else uri[: _LABEL_MAX - 3] + "..."
+
+    def _user_code_failed(
+        self, kind: str, label: str, exc: BaseException, *, unsupported: bool = False
+    ) -> tuple[str, ProtocolError]:
+        """Log what a resource, prompt or completer raised; the sanitized error for the client.
+
+        *unsupported* marks a return value the server cannot send, which is
+        logged by its type only, never by its value.
+        """
+        error_id = uuid.uuid4().hex[:12]
+        try:
+            if unsupported:
+                self._logger.error(
+                    "%s %r returned something it cannot return (%s) error_id=%s",
+                    kind,
+                    label,
+                    exc,
+                    error_id,
+                )
+            else:
+                self._logger.error("%s %r failed error_id=%s", kind, label, error_id, exc_info=exc)
+            message = f"Internal server error (error_id={error_id})"
+            if self.debug:
+                trace = "".join(traceback.format_exception(exc))
+                message = f"{message}: {type(exc).__name__}: {exc}\n{trace}"
+            return error_id, ProtocolError(message, code=INTERNAL_ERROR)
+        finally:
+            exc.__traceback__ = None  # see _tool_failed
+
+    async def _call_user_code(
+        self,
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
+        *,
+        is_async: bool,
+        timeout: float | None,
+        target: _Target,
+        context: ClientContext,
+    ) -> Any:
+        """Run a resource, prompt or completer the way tools run: token, deadline, caller.
+
+        Raises what :meth:`_run_user_code` raises.  ``current_cancel_token()``
+        and ``current_identity()`` work inside the function.
+        """
+        token = CancelToken()
+        token._on_error = self._callback_failed(target.label, context, target.kind)
+        with cancel_scope(token), _identity_scope(context.identity):
+            return await self._run_user_code(
+                fn,
+                arguments,
+                is_async=is_async,
+                timeout=timeout,
+                token=token,
+                target=target,
+                context=context,
+            )
+
+    async def _read_resource(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/read``: resolve the URI, run the resource, render its contents.
+
+        Raises:
+            ProtocolError: Not found (``-32602`` statelessly, ``-32002``
+                before), ``-32005`` past its timeout, ``-32008`` with no free
+                worker, ``-32603`` for a failure (a ``ToolError`` keeps its
+                message), or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            raise ProtocolError("resources/read requires a string 'uri'", code=INVALID_PARAMS)
+        stateless = request.stateless
+        identity = context.identity
+        started = time.perf_counter()
+        fields: dict[str, Any] = {"uri": uri[:_AUDIT_URI_MAX]}
+
+        def done(status: str, **extra: Any) -> None:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            audit(
+                "resource_read",
+                **fields,
+                client_id=context.client_id,
+                duration_ms=duration_ms,
+                status=status,
+                **extra,
+            )
+
+        definition, arguments, hidden = self._resolve_resource(uri, identity)
+        if definition is None:
+            done("not_found", **({"hidden": True} if hidden else {}))
+            raise self._resource_not_found(uri, stateless)
+        if isinstance(definition, ResourceTemplateDefinition):
+            fields["template"] = definition.uri_template
+        label = self._label(uri)
+        try:
+            self._check_step_up(identity, definition, "resource", label)
+        except InsufficientScopeError:
+            done("denied")
+            raise
+        try:
+            authorize(identity, definition, "Resource")
+        except (AuthenticationError, AuthorizationError):
+            # Cannot happen while visibility and authorization agree.
+            done("not_found", hidden=True)
+            raise self._resource_not_found(uri, stateless) from None
+        timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        try:
+            result = await self._call_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                target=_Target("resource", label, "uri"),
+                context=context,
+            )
+        except ServerBusyError:
+            done("busy")
+            raise
+        except _DeadlineExceeded:
+            done("timeout")
+            raise ProtocolError(
+                f"Resource '{label}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except ResourceNotFoundError as exc:
+            done("not_found")
+            missing = exc.uri if exc.uri is not None else uri
+            error = self._resource_not_found(missing, stateless, str(exc))
+            exc.__traceback__ = None
+            raise error from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            error_id, error = self._user_code_failed("resource", label, cause)
+            done("error", error_id=error_id)
+            raise error from None
+        except ToolError as exc:
+            done("tool_error")
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            error_id, error = self._user_code_failed("resource", label, exc)
+            done("error", error_id=error_id)
+            raise error from None
+        try:
+            contents = to_resource_contents(result, uri=uri, mime_type=definition.mime_type)
+        except NotFound:
+            done("not_found")
+            raise self._resource_not_found(uri, stateless) from None
+        except TypeError as exc:
+            error_id, error = self._user_code_failed("resource", label, exc, unsupported=True)
+            done("error", error_id=error_id)
+            raise error from None
+        done("ok")
+        read: dict[str, Any] = {"contents": contents}
+        if stateless:
+            # A retry this server never asked for (it does not implement
+            # input requests) is served, and must not be cached.
+            retry = "inputResponses" in params or "requestState" in params
+            read["ttlMs"] = 0 if retry else definition.cache_ttl_ms
+            read["cacheScope"] = self._cache_scope("resources/read", definition, retry=retry)
+        return read
+
+    def _find_prompt(self, name: object, identity: ClientIdentity | None) -> PromptDefinition:
+        """The prompt *name* names, if *identity* may see it and use it.
+
+        Raises:
+            ProtocolError: ``-32602 "Unknown prompt"`` for a missing or hidden
+                one, alike; a step-up ``InsufficientScopeError``.
+        """
+        definition = self._prompts.get(name) if isinstance(name, str) else None
+        if definition is None or not self._visible(identity, definition):
+            raise ProtocolError(f"Unknown prompt: {name}", code=INVALID_PARAMS)
+        self._check_step_up(identity, definition, "prompt")
+        try:
+            authorize(identity, definition, "Prompt")
+        except (AuthenticationError, AuthorizationError):
+            raise ProtocolError(f"Unknown prompt: {name}", code=INVALID_PARAMS) from None
+        return definition
+
+    async def _get_prompt(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``prompts/get``: check and convert the arguments, run the prompt.
+
+        Raises:
+            ProtocolError: ``-32602`` for an unknown prompt or invalid
+                arguments (every violation listed), ``-32005``, ``-32008``,
+                ``-32603``, or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        name = params.get("name")
+        if not isinstance(name, str):
+            raise ProtocolError("prompts/get requires a string 'name'", code=INVALID_PARAMS)
+        definition = self._find_prompt(name, context.identity)
+        started = time.perf_counter()
+
+        def done(status: str, **extra: Any) -> None:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            audit(
+                "prompt_get",
+                prompt=name,
+                client_id=context.client_id,
+                duration_ms=duration_ms,
+                status=status,
+                **extra,
+            )
+
+        raw = params.get("arguments")
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            done("denied")
+            raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
+        try:
+            arguments = definition.bind(raw)
+        except ValidationError:
+            done("denied")
+            raise
+        timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        try:
+            result = await self._call_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                target=_Target("prompt", name, "prompt"),
+                context=context,
+            )
+        except ServerBusyError:
+            done("busy")
+            raise
+        except _DeadlineExceeded:
+            done("timeout")
+            raise ProtocolError(
+                f"Prompt '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            error_id, error = self._user_code_failed("prompt", name, cause)
+            done("error", error_id=error_id)
+            raise error from None
+        except ToolError as exc:
+            done("tool_error")
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            error_id, error = self._user_code_failed("prompt", name, exc)
+            done("error", error_id=error_id)
+            raise error from None
+        try:
+            messages = to_prompt_messages(result)
+        except TypeError as exc:
+            error_id, error = self._user_code_failed("prompt", name, exc, unsupported=True)
+            done("error", error_id=error_id)
+            raise error from None
+        done("ok")
+        answer: dict[str, Any] = {}
+        if definition.description:
+            answer["description"] = definition.description
+        answer["messages"] = messages
+        return answer
+
+    async def _complete(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``completion/complete`` for a prompt argument or a template variable.
+
+        Completions are not audited per request (they arrive per keystroke);
+        failures are logged with an ``error_id``.
+
+        Raises:
+            ProtocolError: ``-32602`` for a malformed request or an unknown
+                (or hidden) prompt, template or argument, ``-32005``,
+                ``-32008``, ``-32603``, or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        identity = context.identity
+        ref = params.get("ref")
+        argument = params.get("argument")
+        if not isinstance(ref, dict):
+            raise ProtocolError("completion/complete requires a 'ref' object", code=INVALID_PARAMS)
+        if (
+            not isinstance(argument, dict)
+            or not isinstance(argument.get("name"), str)
+            or not isinstance(argument.get("value"), str)
+        ):
+            raise ProtocolError(
+                "completion/complete requires 'argument' with a string name and value",
+                code=INVALID_PARAMS,
+            )
+        given = params.get("context")
+        given_arguments: Any = None
+        if given is not None:
+            if not isinstance(given, dict):
+                raise ProtocolError("'context' must be an object", code=INVALID_PARAMS)
+            given_arguments = given.get("arguments")
+        if given_arguments is None:
+            given_arguments = {}
+        if not isinstance(given_arguments, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in given_arguments.items()
+        ):
+            raise ProtocolError(
+                "'context.arguments' must map argument names to strings", code=INVALID_PARAMS
+            )
+        name: str = argument["name"]
+        value: str = argument["value"]
+        ref_type = ref.get("type")
+        names: tuple[str, ...]
+        completers: Mapping[str, CompletionSource]
+        if ref_type == "ref/prompt":
+            prompt_name = ref.get("name")
+            if not isinstance(prompt_name, str):
+                raise ProtocolError("ref/prompt requires a string 'name'", code=INVALID_PARAMS)
+            prompt = self._find_prompt(prompt_name, identity)
+            names = tuple(param.name for param in prompt.arguments)
+            completers = prompt.completers
+            timeout = prompt.timeout
+            label, field = f"{prompt.name}.{name}", "prompt"
+        elif ref_type == "ref/resource":
+            uri = ref.get("uri")
+            if not isinstance(uri, str):
+                raise ProtocolError("ref/resource requires a string 'uri'", code=INVALID_PARAMS)
+            template = self._resources.get_template(uri)
+            if template is None or not self._visible(identity, template):
+                concrete = self._resources.get(uri)
+                if concrete is not None and self._visible(identity, concrete):
+                    return {"completion": empty()}  # a concrete URI has no arguments
+                raise ProtocolError(
+                    f"Unknown resource template: {self._label(uri)}", code=INVALID_PARAMS
+                )
+            self._check_step_up(identity, template, "resource template", self._label(uri))
+            try:
+                authorize(identity, template, "Resource template")
+            except (AuthenticationError, AuthorizationError):
+                raise ProtocolError(
+                    f"Unknown resource template: {self._label(uri)}", code=INVALID_PARAMS
+                ) from None
+            names = template.template.variables
+            completers = template.completers
+            timeout = template.timeout
+            label, field = f"{self._label(uri)}.{name}", "uri"
+        else:
+            raise ProtocolError(
+                "ref.type must be 'ref/prompt' or 'ref/resource'", code=INVALID_PARAMS
+            )
+        if name not in names:
+            raise ProtocolError(f"Unknown argument: {name}", code=INVALID_PARAMS)
+        source = completers.get(name)
+        if source is None:
+            return {"completion": empty()}
+        if source.values is not None:
+            found, total = collect(filter_static(source.values, value), sized=True)
+            return {"completion": shape(found, total)}
+        # Only the other arguments of the same prompt or template.
+        known = {key: text for key, text in given_arguments.items() if key in names}
+        work, is_async = _completer_call(source, value, known)
+        if timeout is None:
+            timeout = self.default_timeout
+        try:
+            found, total = await self._call_user_code(
+                work,
+                {},
+                is_async=is_async,
+                timeout=timeout,
+                target=_Target("completion", label, field),
+                context=context,
+            )
+        except ServerBusyError:
+            raise
+        except _DeadlineExceeded:
+            raise ProtocolError(
+                f"Completion for '{label}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            raise self._user_code_failed("completer", label, cause)[1] from None
+        except ToolError as exc:
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            raise self._user_code_failed("completer", label, exc)[1] from None
+        return {"completion": shape(found, total)}
+
     # -------------------------------------------------- change notifications
 
     def _list_entries(
@@ -1502,11 +2306,22 @@ class MCPServer:
         The one source of both the list a client fetches and the digest it
         is told about changes of, so the two never disagree.
         """
-        if kind != "tools":
+        if kind == "resources":
+            # One list, as one notification covers both: resources/list and
+            # resources/templates/list.
+            version, resources, templates = self._resources.snapshot()
+            entries = [r.to_mcp() for r in resources if self._visible(identity, r)]
+            entries.extend(t.to_mcp() for t in templates if self._visible(identity, t))
+            return version, entries
+        definitions: list[ToolDefinition] | list[PromptDefinition]
+        if kind == "tools":
+            version, definitions = self._registry.snapshot()
+        elif kind == "prompts":
+            version, definitions = self._prompts.snapshot()
+        else:
             raise KeyError(kind)
-        version, definitions = self._registry.snapshot()
-        # Protected tools are omitted for callers who could not invoke them
-        # (a token with step-up sees them all, and is challenged on a call).
+        # Protected items are omitted for callers who could not use them (a
+        # token with step-up sees them all, and is challenged on a call).
         return version, [
             definition.to_mcp()
             for definition in definitions
@@ -1515,9 +2330,13 @@ class MCPServer:
 
     def _list_version(self, kind: str) -> int:
         """How many changes the registry behind the *kind* list has seen."""
-        if kind != "tools":
-            raise KeyError(kind)
-        return self._registry.version
+        if kind == "tools":
+            return self._registry.version
+        if kind == "prompts":
+            return self._prompts.version
+        if kind == "resources":
+            return self._resources.version
+        raise KeyError(kind)
 
     def _visibility_class(self, identity: ClientIdentity | None) -> Hashable:
         """What decides which items *identity* sees, and nothing else.
@@ -2402,6 +3221,11 @@ class MCPServer:
                     "type": "startup",
                     "transport": self._transport.describe(),
                     "tools": [definition.name for definition in self.tools],
+                    "resources": [definition.uri for definition in self.resources],
+                    "resource_templates": [
+                        definition.uri_template for definition in self.resource_templates
+                    ],
+                    "prompts": [definition.name for definition in self.prompts],
                     "middleware": [describe(fn) for fn in self._request_middleware],
                     "tool_middleware": [describe(fn) for fn in self._tool_middleware],
                     "auth": self.auth is not None,
@@ -2444,6 +3268,17 @@ class MCPServer:
                     "tools %s require authentication but no auth is configured; "
                     "they will be unreachable",
                     protected,
+                )
+            others = [
+                *(f"resource {d.uri}" for d in self.resources if d.requires_auth),
+                *(f"template {d.uri_template}" for d in self.resource_templates if d.requires_auth),
+                *(f"prompt {d.name}" for d in self.prompts if d.requires_auth),
+            ]
+            if others:
+                self._logger.warning(
+                    "%s require authentication but no auth is configured; "
+                    "they will be unreachable",
+                    others,
                 )
             if self.host not in ("127.0.0.1", "localhost", "::1") and not isinstance(
                 self._transport, StdioTransport
@@ -2493,4 +3328,12 @@ class MCPServer:
                     "%d tool(s) are hidden from tokens that lack their scope; clients are "
                     "asked for these scopes up front",
                     len(hidden),
+                )
+            items: list[Guarded] = [*self.resources, *self.resource_templates, *self.prompts]
+            others = [item for item in items if item.scopes]
+            if others:
+                self._logger.info(
+                    "%d resource(s), template(s) or prompt(s) are hidden from tokens that lack "
+                    "their scope; clients are asked for these scopes up front",
+                    len(others),
                 )

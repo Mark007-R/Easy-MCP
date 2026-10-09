@@ -17,6 +17,7 @@ Quickstart::
 
 from ._version import __version__
 from .cancellation import CancelToken, cancel_scope, current_cancel_token
+from .content import Audio, Image, Message, ResourceContent, ResourceLink
 from .decorators import ToolDefinition
 from .exceptions import (
     AuthenticationError,
@@ -48,7 +49,9 @@ from .middleware import (
     TransportInfo,
     current_tool_call,
 )
+from .prompts import PromptDefinition
 from .protocol import SUPPORTED_PROTOCOL_VERSIONS
+from .resources import ResourceDefinition, ResourceTemplateDefinition, safe_path
 from .security.auth import APIKeyAuth, ClientIdentity, current_identity
 from .security.oauth import Introspection, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
@@ -61,6 +64,7 @@ from .transport.streamable_http import StreamableHTTPTransport
 
 __all__ = [
     "APIKeyAuth",
+    "Audio",
     "AuthServerUnavailableError",
     "AuthenticationError",
     "AuthorizationError",
@@ -68,21 +72,28 @@ __all__ = [
     "ClientContext",
     "ClientIdentity",
     "EasyMCPError",
+    "Image",
     "InsufficientScopeError",
     "Introspection",
     "InvalidTokenError",
     "MCPServer",
     "MemoryStore",
+    "Message",
     "OAuthResourceServer",
     "PROTOCOL_VERSION",
     "PayloadTooLargeError",
+    "PromptDefinition",
     "ProtocolError",
     "RateLimitError",
     "RedisStore",
     "RegistrationError",
     "RequestInfo",
     "RequestOutcome",
+    "ResourceContent",
+    "ResourceDefinition",
+    "ResourceLink",
     "ResourceNotFoundError",
+    "ResourceTemplateDefinition",
     "SSETransport",
     "SUPPORTED_PROTOCOL_VERSIONS",
     "SchemaError",
@@ -108,4 +119,5 @@ __all__ = [
     "current_cancel_token",
     "current_identity",
     "current_tool_call",
+    "safe_path",
 ]
