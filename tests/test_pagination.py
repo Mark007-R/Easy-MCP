@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from typing import Any
 
 import pytest
-from conftest import make_context, modern, rpc
+from conftest import LogCapture, make_context, modern, rpc
 
 from easy_mcp import APIKeyAuth, ClientIdentity, MCPServer
 from easy_mcp.exceptions import INVALID_PARAMS, ProtocolError
@@ -15,6 +16,8 @@ from easy_mcp.pagination import PAGE_SIZE, decode_cursor, encode_cursor, paginat
 from easy_mcp.uritemplate import MAX_URI_LENGTH
 
 SEE_KEY = "pagination-see-key-" + "s" * 13
+# Under the length cap, but JSON nested too deeply for the parser to recurse into.
+NESTED = base64.urlsafe_b64encode(b"[" * 6000).decode().rstrip("=")
 
 
 def keys(count: int) -> list[str]:
@@ -81,6 +84,7 @@ def test_cursor_is_stable_across_inserts_and_removals_unit() -> None:
         "a" * 9000,
         # Well formed, but longer than any cursor this server hands out.
         encode_cursor("prompts", "p" * 20000),
+        pytest.param(NESTED, id="nested"),
     ],
 )
 def test_invalid_cursor_is_minus_32602_unit(cursor: Any) -> None:
@@ -200,6 +204,18 @@ async def test_invalid_cursor_is_minus_32602() -> None:
             response = await server.dispatch(message, make_context())
             assert response is not None
             assert response["error"] == {"code": INVALID_PARAMS, "message": "Invalid cursor"}
+
+
+async def test_deeply_nested_cursor_is_minus_32602(logs: LogCapture) -> None:
+    assert len(NESTED) < 4 * MAX_URI_LENGTH  # well under the cap: the parser sees it
+    server = prompt_server(3)
+    server.register_resource(lambda: "x", "r://a", name="r")
+    for method in ("prompts/list", "resources/list", "resources/templates/list"):
+        for message in (rpc(method, {"cursor": NESTED}), modern(method, {"cursor": NESTED})):
+            response = await server.dispatch(message, make_context())
+            assert response is not None
+            assert response["error"] == {"code": INVALID_PARAMS, "message": "Invalid cursor"}
+    assert not [record for record in logs.records if record.levelno >= logging.ERROR]
 
 
 async def test_pages_count_only_visible_items() -> None:

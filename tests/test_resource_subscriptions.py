@@ -27,6 +27,7 @@ from easy_mcp.exceptions import (
 )
 from easy_mcp.subscriptions import MAX_RESOURCE_SUBSCRIPTIONS, _Sink
 from easy_mcp.transport.base import ClientContext
+from easy_mcp.uritemplate import MAX_URI_LENGTH
 
 SEE_KEY = "subs-see-key-" + "k" * 18
 TAG = "io.modelcontextprotocol/subscriptionId"
@@ -258,6 +259,25 @@ async def test_listen_ack_is_first_and_honors_only_visible_uris(logs: LogCapture
     assert await asyncio.wait_for(task, 5) is None
 
 
+async def test_a_uri_over_2048_characters_cannot_be_watched() -> None:
+    server = make_server()
+    longest = "items://" + "a" * (MAX_URI_LENGTH - len("items://"))
+    too_long = longest + "a"
+    context = await initialized(server, Pushed())
+    assert (await subscribe(server, context, longest))["result"] == {}
+    refused = await subscribe(server, context, too_long)
+    assert refused["error"]["code"] == INVALID_PARAMS and "data" not in refused["error"]
+    assert server._notifier.subscriptions(context.session_id) == {longest}
+    pushed = Pushed()
+    listening = make_context(push=pushed)
+    task = await open_listen(server, listening, pushed, resourceSubscriptions=[too_long, longest])
+    assert pushed.frames[0]["params"]["notifications"] == {"resourceSubscriptions": [longest]}
+    assert server.notify_resource_updated(too_long) == 0
+    assert server.notify_resource_updated(longest) == 2  # the session's and the listen's
+    server.close_subscriptions(listening, reason="shutdown")
+    await asyncio.wait_for(task, 5)
+
+
 async def test_listen_without_resources_omits_resource_subscriptions() -> None:
     server = MCPServer(port=0, rate_limit_per_minute=None)
     # However many it names: a server without resources ignores the field.
@@ -415,6 +435,88 @@ async def test_an_update_queued_on_a_closing_sink_waits_for_the_next() -> None:
     )
     assert await second.wait_for(1) == [updated("config://app")]
     assert first.frames == []
+
+
+class ClosedChannel(Pushed):
+    """A channel that has closed while its sink is still the session's (a GET /mcp
+    stream whose token expired, before its end is handled): it refuses every
+    frame, and *late* is published while it refuses the first.
+    """
+
+    def __init__(self, server: MCPServer, late: str) -> None:
+        super().__init__(explode=True)
+        self.server = server
+        self.late: str | None = late
+        self.queued: int | None = None
+
+    def __call__(self, message: dict[str, Any]) -> None:
+        if self.late is not None:
+            late, self.late = self.late, None
+            self.queued = self.server.notify_resource_updated(late)
+        super().__call__(message)
+
+
+async def test_updates_a_closed_channel_refuses_wait_for_the_next_sink() -> None:
+    server = make_server()
+    first = Pushed()
+    context = await initialized(server, first)
+    for uri in ("config://app", "config://other", "items://42"):
+        await subscribe(server, context, uri)
+    closed = ClosedChannel(server, late="items://42")
+    sink = server._watch_session(
+        context.session_id, push=closed, identity=None, client_id=context.client_id
+    )
+    # Both in one batch: the first is refused, and the second is never tried.
+    assert server.notify_resource_updated("config://app") == 1
+    assert server.notify_resource_updated("config://other") == 1
+    await asyncio.sleep(0.1)
+    assert closed.calls == 1 and closed.frames == [] and closed.queued == 1
+    # The stream's end is handled after its sink has gone.
+    assert not server._notifier.end_session(context.session_id, sink)
+    second = Pushed()
+    server._watch_session(
+        context.session_id, push=second, identity=None, client_id=context.client_id
+    )
+    assert await second.wait_for(3) == [
+        updated("config://app"),
+        updated("config://other"),
+        updated("items://42"),
+    ]
+    await quiet(second, 3)
+    assert first.frames == []
+
+
+async def test_an_update_queued_on_a_replaced_sink_reaches_the_new_one() -> None:
+    server = make_server()
+    first = Pushed()
+    context = await initialized(server, first)
+    await subscribe(server, context, "config://app")
+    # Queued on the first sink; a new stream takes over before the loop writes it.
+    assert server.notify_resource_updated("config://app") == 1
+    assert first.frames == []
+    second = Pushed()
+    server._watch_session(
+        context.session_id, push=second, identity=None, client_id=context.client_id
+    )
+    assert await second.wait_for(1) == [updated("config://app")]
+    await quiet(second, 1)
+    assert first.frames == []
+
+
+async def test_an_update_queued_before_unsubscribe_is_not_sent() -> None:
+    server = make_server()
+    pushed = Pushed()
+    context = await initialized(server, pushed)
+    await subscribe(server, context, "config://app")
+    await subscribe(server, context, "config://other")
+    assert server.notify_resource_updated("config://app") == 1
+    assert pushed.frames == []
+    # Before the loop writes it.  Not through dispatch, which would yield to
+    # the loop first and let the update be written before the unsubscribe.
+    server._notifier.unsubscribe(context.session_id, "config://app")
+    await quiet(pushed, 0)
+    assert server.notify_resource_updated("config://other") == 1
+    assert await pushed.wait_for(1) == [updated("config://other")]
 
 
 def test_notify_needs_a_string() -> None:

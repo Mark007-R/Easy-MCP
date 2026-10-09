@@ -361,7 +361,7 @@ class _Sink:
             uris = list(self._updates)
             self._updates.clear()
             self._updates_scheduled = False
-        for uri in uris:
+        for index, uri in enumerate(uris):
             if self.closed:
                 return
             if not self._notifier._watches(self, uri):
@@ -369,7 +369,9 @@ class _Sink:
             try:
                 self.push(resource_updated_message(uri, self.subscription_id))
             except Exception:
-                self._notifier.drop(self, "undeliverable")
+                # Its channel closed before the sink ended (a stream whose
+                # token expired): this update and the rest go on (drop).
+                self._notifier.drop(self, "undeliverable", unsent=uris[index:])
                 return
             logger.debug("told client %s that a resource changed", self.client_id)
 
@@ -837,11 +839,16 @@ class ChangeNotifier:
         sink.settled = True  # a cancelled request gets no answer
         return True
 
-    def drop(self, sink: _Sink, reason: str) -> bool:
-        """Remove *sink* without a word to its client.  Idempotent; whether this call removed it."""
+    def drop(self, sink: _Sink, reason: str, *, unsent: Iterable[str] = ()) -> bool:
+        """Remove *sink* without a word to its client.  Idempotent; whether this call removed it.
+
+        A session sink's resource updates it never wrote (*unsent*, which its
+        channel refused, then those still waiting) go to the session's next
+        sink, or wait for one, as with :meth:`end_session`.
+        """
         if not self._unregister(sink):
             return False
-        sink._close()
+        waiting = sink._close()
         if sink.listen:
             audit(
                 "subscription_close",
@@ -851,6 +858,8 @@ class ChangeNotifier:
             )
             sink._set_ended()
         else:
+            for uri in dict.fromkeys([*unsent, *waiting]):
+                self._redeliver(sink.key, uri)
             logger.debug(
                 "session of client %s stops receiving list changes (%s)", sink.client_id, reason
             )

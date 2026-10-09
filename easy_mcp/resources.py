@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import math
 import threading
+import types
 import typing
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .completion import CompletionSource, choices_source, source_from
-from .content import is_mime_type
+from .content import ResourceContent, is_mime_type
 from .exceptions import RegistrationError, ResourceNotFoundError, SchemaError
 from .schema import (
     StringParameter,
@@ -68,6 +69,17 @@ def _check_annotations(annotations: Mapping[str, Any] | None, what: str) -> dict
     return checked or None
 
 
+def _names_content(annotation: Any) -> bool:
+    """Whether *annotation* is ``ResourceContent`` or a union holding it."""
+    annotation, _ = _unwrap_annotated(annotation)
+    if annotation is ResourceContent:
+        return True
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union or origin is types.UnionType:
+        return any(_names_content(arg) for arg in typing.get_args(annotation))
+    return False
+
+
 def _default_mime_type(fn: Callable[..., Any]) -> str | None:
     """The MIME type the return annotation implies: never guessed from anything else."""
     try:
@@ -80,6 +92,8 @@ def _default_mime_type(fn: Callable[..., Any]) -> str | None:
         return "text/plain"
     if origin in (bytes, bytearray, memoryview):
         return "application/octet-stream"
+    if origin is list and any(_names_content(arg) for arg in typing.get_args(annotation)):
+        return None  # each ResourceContent item carries its own, as a single one does
     if origin in (dict, list) or is_pydantic_model(annotation):
         return "application/json"
     return None

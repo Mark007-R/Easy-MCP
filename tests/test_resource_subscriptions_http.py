@@ -19,13 +19,14 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import headers_for, listen, notification, rpc
+from conftest import LogCapture, headers_for, listen, notification, rpc
 from shared_store_fake import FakeHub, FakeSharedStore, records
 
 import easy_mcp.server
-from easy_mcp import MCPServer
+from easy_mcp import MCPServer, StreamableHTTPTransport
 from easy_mcp.exceptions import TOO_MANY_SESSIONS
 from easy_mcp.store.base import ExpiredSession, SessionKind, SessionRecord
+from easy_mcp.transport.streamable_http import _NotifyStream
 
 LiveServer = Callable[[Any], str]
 
@@ -178,6 +179,42 @@ async def test_second_get_replaces_the_first(live_server: LiveServer) -> None:
         assert await second.next() == updated("config://app")
         await second.aclose()
         await first.aclose()
+
+
+async def test_an_update_published_as_the_token_expires_is_sent_on_the_next_stream(
+    live_server: LiveServer, logs: LogCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = make_server()
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    deadlines = [time.time() + 0.5]  # the first stream's token expires; later ones hold none
+    monkeypatch.setattr(
+        server, "_stream_deadline", lambda _: deadlines.pop() if deadlines else None
+    )
+    queued: list[int] = []
+    close = _NotifyStream.close
+
+    def expire(stream: _NotifyStream, reason: str) -> None:
+        close(stream, reason)
+        if reason == "token_expired":
+            # Published after the stream's channel closed, before its end is handled.
+            queued.append(server.notify_resource_updated("config://app"))
+
+    monkeypatch.setattr(_NotifyStream, "close", expire)
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base)
+        await post(client, base, session, "resources/subscribe", "config://app")
+        first = await get_stream(client, base, session)
+        await first.end()
+        await first.aclose()
+        local = transport._sessions[session]
+        await until(lambda: bool(logs.events("stream_close")) and local.active == 0)
+        assert logs.events("stream_close")[0]["reason"] == "token_expired"
+        assert queued == [1]
+        second = await get_stream(client, base, session)
+        assert await second.next() == updated("config://app")
+        await second.quiet()
+        await second.aclose()
 
 
 async def test_delete_ends_the_get_stream_and_the_subscriptions(live_server: LiveServer) -> None:
@@ -423,6 +460,10 @@ class GatedStore(SubscribingStore):
     reply to the next read of a session that does not extend it (as a
     worker reading a session's subscriptions again does).  ``held`` is set
     once one is waiting.
+
+    ``hold_next_read`` is a second gate, with its own ``read_held`` and
+    ``read_release``: it holds the reply to the next such read that starts
+    after it is set, so a read the first gate holds already is not caught.
     """
 
     def __init__(self, hub: FakeHub, worker: str) -> None:
@@ -432,6 +473,9 @@ class GatedStore(SubscribingStore):
         self.hold_read = False
         self.held = threading.Event()
         self.release = threading.Event()
+        self.hold_next_read = False
+        self.read_held = threading.Event()
+        self.read_release = threading.Event()
 
     async def _wait(self) -> None:
         self.held.set()
@@ -467,10 +511,18 @@ class GatedStore(SubscribingStore):
         ttl: float | None,
         binding: tuple[str | None, str | None] | None = None,
     ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
+        # Decided before the read starts: one under way when it is set is not held.
+        gated = ttl is None and self.hold_next_read
+        if gated:
+            self.hold_next_read = False
         found = await super().acquire_session(kind, ref, ttl=ttl, binding=binding)
         if ttl is None and self.hold_read:
             self.hold_read = False
             await self._wait()
+        if gated:
+            self.read_held.set()
+            while not self.read_release.is_set():
+                await asyncio.sleep(0.01)
         return found
 
 
@@ -501,10 +553,18 @@ async def test_concurrent_subscribes_leave_the_stream_watching_every_uri(
         assert await asyncio.to_thread(store.held.wait, 10)
         second = await post(client, base, session, "resources/subscribe", "config://other", 6)
         assert second.status_code == 200 and second.json()["result"] == {}
+        # The two overlapped, so the worker reads the subscriptions again
+        # once both are answered; that read is held until checked below.
+        store.hold_next_read = True
         store.release.set()
         assert (await first).json()["result"] == {}
         assert [set(r.subscriptions or ()) for r in records(hub)] == [both]
-        await until(lambda: server._notifier.subscriptions(session) == both)
+        assert await asyncio.to_thread(store.read_held.wait, 10)
+        # Before that read is in: the late answer left the stream watching both.
+        assert server._notifier.subscriptions(session) == both
+        assert await asyncio.to_thread(server.notify_resource_updated, "config://other") == 1
+        assert await stream.next() == updated("config://other")
+        store.read_release.set()
         await asyncio.sleep(0.3)  # and it stays so once every reply is in
         assert server._notifier.subscriptions(session) == both
         await asyncio.to_thread(server.notify_resource_updated, "config://app")
@@ -542,6 +602,40 @@ async def test_reads_of_the_subscriptions_answered_out_of_order_leave_the_newest
         assert server_a._notifier.subscriptions(session) == both
         await asyncio.to_thread(server_a.notify_resource_updated, "config://other")
         assert await stream.next() == updated("config://other")
+        await stream.aclose()
+
+
+async def test_a_read_of_the_subscriptions_overlapping_a_subscribe_is_not_applied(
+    live_server: LiveServer,
+) -> None:
+    # Worker B subscribes, and worker A, holding the stream, reads the
+    # session's subscriptions again; before that read is answered (with the
+    # older set), A serves a subscribe of its own.
+    hub = FakeHub()
+    server_a, store_a, base_a = gated_worker(live_server, hub, "a" * 16)
+    _, _, base_b = gated_worker(live_server, hub, "b" * 16)
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base_a)
+        stream = await get_stream(client, base_a, session)
+        await asyncio.sleep(0.3)  # any read of the subscriptions the stream makes is in
+        store_a.hold_read = True
+        first = await post(client, base_b, session, "resources/subscribe", "config://app")
+        assert first.status_code == 200
+        assert await asyncio.to_thread(store_a.held.wait, 10)
+        second = await post(client, base_a, session, "resources/subscribe", "config://other", 6)
+        assert second.status_code == 200 and second.json()["result"] == {}
+        store_a.hold_next_read = True  # the read that follows once none is under way
+        store_a.release.set()
+        assert await asyncio.to_thread(store_a.read_held.wait, 10)
+        # The older read was not applied: A still watches what it added itself.
+        assert "config://other" in server_a._notifier.subscriptions(session)
+        assert await asyncio.to_thread(server_a.notify_resource_updated, "config://other") == 1
+        assert await stream.next() == updated("config://other")
+        store_a.read_release.set()
+        both = {"config://app", "config://other"}
+        await until(lambda: server_a._notifier.subscriptions(session) == both)
+        await asyncio.to_thread(server_a.notify_resource_updated, "config://app")
+        assert await stream.next() == updated("config://app")
         await stream.aclose()
 
 

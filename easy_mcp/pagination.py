@@ -57,7 +57,7 @@ def decode_cursor(kind: str, cursor: object) -> str:
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
         data = json.loads(raw.decode("utf-8"))
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, RecursionError):  # RecursionError: nested too deep
         raise _invalid() from None
     if not isinstance(data, dict) or data.get("k") != kind or not isinstance(data.get("a"), str):
         raise _invalid()

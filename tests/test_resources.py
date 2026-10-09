@@ -38,6 +38,7 @@ from easy_mcp.exceptions import (
     SERVER_BUSY,
     TOOL_TIMEOUT,
 )
+from easy_mcp.uritemplate import MAX_URI_LENGTH
 
 # Built, not written out, so secret scanners do not take the fixtures for credentials.
 READER_KEY = "resources-reader-key-" + "r" * 12
@@ -383,6 +384,19 @@ def test_mime_type_defaults_from_the_return_annotation() -> None:
     def as_optional() -> str | None:
         return None
 
+    def as_content() -> ResourceContent:
+        return ResourceContent(text="")
+
+    # Each item carries its own type, as a single ResourceContent does.
+    def as_contents() -> list[ResourceContent]:
+        return []
+
+    def as_annotated_contents() -> list[Annotated[ResourceContent, "item"]]:
+        return []
+
+    def as_contents_or_text() -> list[ResourceContent | str]:
+        return []
+
     def unannotated():  # type: ignore[no-untyped-def]
         return ""
 
@@ -393,6 +407,10 @@ def test_mime_type_defaults_from_the_return_annotation() -> None:
         as_list: "application/json",
         as_model: "application/json",
         as_optional: None,
+        as_content: None,
+        as_contents: None,
+        as_annotated_contents: None,
+        as_contents_or_text: None,
         unannotated: None,
     }
     for fn, mime in expected.items():
@@ -462,6 +480,38 @@ async def test_read_multiple_contents() -> None:
         {"uri": "logs://today/a", "mimeType": "text/plain", "text": "one"},
         {"uri": "logs://today", "mimeType": "application/octet-stream", "blob": "AAE="},
     ]
+
+
+async def test_items_without_a_mime_type_are_read_without_one() -> None:
+    server = make_server()
+
+    @server.resource("logs://today")
+    def todays_logs() -> list[ResourceContent]:
+        return [
+            ResourceContent(text="line 1\nline 2", uri="logs://today/app.log"),
+            ResourceContent(blob=b"\x00\x01", uri="logs://today/raw.bin"),
+            ResourceContent(text="{}", uri="logs://today/a.json", mime_type="application/json"),
+        ]
+
+    @server.resource("files://{name}")
+    def file(name: str) -> list[ResourceContent]:
+        return [ResourceContent(text=name)]
+
+    listed = await call(server, rpc("resources/list"))
+    assert listed["result"]["resources"] == [{"uri": "logs://today", "name": "todays_logs"}]
+    templates = await call(server, rpc("resources/templates/list"))
+    assert templates["result"]["resourceTemplates"] == [
+        {"uriTemplate": "files://{name}", "name": "file"}
+    ]
+    for message in (read("logs://today"), modern_read("logs://today")):
+        response = await call(server, message)
+        assert response["result"]["contents"] == [
+            {"uri": "logs://today/app.log", "text": "line 1\nline 2"},
+            {"uri": "logs://today/raw.bin", "blob": "AAE="},
+            {"uri": "logs://today/a.json", "mimeType": "application/json", "text": "{}"},
+        ]
+    response = await call(server, read("files://notes"))
+    assert response["result"]["contents"] == [{"uri": "files://notes", "text": "notes"}]
 
 
 async def test_empty_list_is_json_text() -> None:
@@ -580,6 +630,28 @@ async def test_long_uris_are_not_echoed() -> None:
     response = await call(server, read(long_uri))
     assert response["error"]["code"] == LEGACY_NOT_FOUND
     assert "data" not in response["error"]
+
+
+async def test_a_uri_over_2048_characters_matches_no_template() -> None:
+    server = make_server()
+    seen: list[int] = []
+
+    @server.resource("docs://{+path}")
+    def docs(path: str) -> str:
+        seen.append(len(path))
+        return "doc"
+
+    longest = "docs://" + "a" * (MAX_URI_LENGTH - len("docs://"))
+    assert len(longest) == MAX_URI_LENGTH
+    for message in (read(longest), modern_read(longest)):
+        assert text_of(await call(server, message)) == "doc"
+    too_long = longest + "a"
+    for make, code in ((read, LEGACY_NOT_FOUND), (modern_read, INVALID_PARAMS)):
+        response = await call(server, make(too_long))
+        assert response["error"]["code"] == code
+        assert "data" not in response["error"]
+    # The function never sees the longer one.
+    assert seen == [MAX_URI_LENGTH - len("docs://")] * 2
 
 
 async def test_hostile_uris_read_as_missing_quickly(logs: LogCapture) -> None:
