@@ -192,6 +192,27 @@ _METHODS: dict[str, _Method] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """What a call of user code runs, for thread names and audit events."""
+
+    kind: str  # "tool", "resource", "prompt" or "completion"
+    label: str  # the tool or prompt name, the URI, or "<prompt or template>.<argument>"
+    field: str  # the audit field the label goes in: "tool", "uri" or "prompt"
+
+
+class _DeadlineExceeded(Exception):
+    """The server's deadline for one call of user code passed; its token fired."""
+
+
+class _UserCancelled(Exception):
+    """User code raised ``CancelledError`` although nothing cancelled its call."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error: BaseException | None = error
+
+
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
@@ -1857,45 +1878,32 @@ class MCPServer:
             raise asyncio.CancelledError
         definition = call.tool
         name = definition.name
-        token = call.cancel_token
         timeout = call.timeout
         started = time.perf_counter()
 
         def _duration_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
 
-        deadline: asyncio.Timeout | None = None
-        awaitable: Any = None
-        # Every cancel of the call (the request's, its caller's, a
-        # middleware's timeout) is a cancel of the task this runs in.
-        cancels = _task_cancels()
-        try:
-            if definition.is_async:
-                # A task of its own, as asyncio.wait_for gave it on 3.11:
-                # a cancel request the tool leaves on its task (an old
-                # async-timeout, say) must not turn this call's timeout
-                # into a cancellation that answers nobody.
-                awaitable = asyncio.ensure_future(definition.fn(**arguments))
-            else:
-                # Sync tools run in a worker thread so they cannot block
-                # the event loop.  Python cannot kill that thread, so a
-                # cancel or timeout reaches the tool through the token.
-                awaitable = self._start_sync_tool(definition, arguments, token, context)
+        def _started() -> None:
             call._started = call.request._tool_started = True
-            async with asyncio.timeout(timeout) as deadline:
-                result = await awaitable
+
+        try:
+            result = await self._run_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                token=call.cancel_token,
+                target=_Target("tool", name, "tool"),
+                context=context,
+                started=_started,
+            )
         except ServerBusyError as exc:
             audit("tool_call", tool=name, client_id=context.client_id, status="busy")
             return ToolOutcome._create(
                 "busy", message=str(exc), started=call._started, error_code=exc.code
             )
-        except TimeoutError as exc:
-            if deadline is None or not deadline.expired():
-                # The tool raised it (a socket read timing out, say): a tool
-                # failure like any other, not the server's deadline.
-                return self._tool_failed(name, context, exc, _duration_ms())
-            _drop_unreported_error(awaitable)
-            self._stop_tool(token, TIMEOUT, name, context)
+        except _DeadlineExceeded:
             duration_ms = _duration_ms()
             audit(
                 "tool_call",
@@ -1911,15 +1919,12 @@ class MCPServer:
                 error_code=TOOL_TIMEOUT,
                 duration_ms=duration_ms,
             )
-        except asyncio.CancelledError as exc:
-            if _task_cancels() == cancels:
-                # Nothing cancelled the call: the tool raised CancelledError
-                # on its own (awaiting a shared future another waiter
-                # cancelled, say).  It failed, and the client is told so.
-                return self._tool_failed(name, context, exc, _duration_ms())
-            _drop_unreported_error(awaitable)
-            self._stop_tool(token, CANCELLED, name, context)
-            raise
+        except _UserCancelled as wrapped:
+            # The tool raised CancelledError on its own: it failed, and the
+            # client is told so.
+            error, wrapped.error = wrapped.error, None
+            assert error is not None
+            return self._tool_failed(name, context, error, _duration_ms())
         except ToolError as exc:
             # Intentional, safe-to-show tool error raised by the tool author.
             try:
@@ -1995,6 +2000,85 @@ class MCPServer:
             "ok", message=text, started=True, payload=payload, duration_ms=duration_ms
         )
 
+    async def _run_user_code(
+        self,
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
+        *,
+        is_async: bool,
+        timeout: float | None,
+        token: CancelToken,
+        target: _Target,
+        context: ClientContext,
+        started: Callable[[], None] | None = None,
+    ) -> Any:
+        """Run one registered function (a tool, resource, prompt or completer) and return its value.
+
+        The machinery every call of user code gets: an async function runs
+        as a task of its own, a sync one on a thread of its own (counted
+        against ``max_sync_workers``), under *timeout*; a cancel or the
+        deadline triggers *token* and abandons the call.  *started* is
+        called once the function has been started.  The caller sets the
+        context variables the function reads (the cancel token, the caller's
+        identity) before calling this, so a sync function's thread gets them.
+
+        Raises:
+            ServerBusyError: No sync worker was free; the function never started.
+            _DeadlineExceeded: *timeout* passed; *token* fired with ``TIMEOUT``.
+            asyncio.CancelledError: The call was cancelled; *token* fired with
+                ``CANCELLED``.
+            _UserCancelled: The function raised ``CancelledError`` although
+                nothing cancelled the call (awaiting a shared future another
+                waiter cancelled, say): a failure like any other.
+            Exception: Whatever the function raised, ``TimeoutError``
+                included when it was not the server's deadline.
+        """
+        deadline: asyncio.Timeout | None = None
+        awaitable: Any = None
+        # Every cancel of the call (the request's, its caller's, a
+        # middleware's timeout) is a cancel of the task this runs in.
+        cancels = _task_cancels()
+        try:
+            if is_async:
+                # A task of its own, as asyncio.wait_for gave it on 3.11:
+                # a cancel request the function leaves on its task (an old
+                # async-timeout, say) must not turn this call's timeout
+                # into a cancellation that answers nobody.
+                awaitable = asyncio.ensure_future(fn(**arguments))
+            else:
+                # Sync functions run in a worker thread so they cannot block
+                # the event loop.  Python cannot kill that thread, so a
+                # cancel or timeout reaches the function through the token.
+                awaitable = self._start_sync_call(fn, arguments, token, context, target)
+            if started is not None:
+                started()
+            async with asyncio.timeout(timeout) as deadline:
+                return await awaitable
+        except TimeoutError:
+            if deadline is None or not deadline.expired():
+                # The function raised it (a socket read timing out, say): a
+                # failure like any other, not the server's deadline.
+                raise
+            _drop_unreported_error(awaitable)
+            self._stop_call(token, TIMEOUT, target, context)
+            raise _DeadlineExceeded from None
+        except asyncio.CancelledError as exc:
+            if _task_cancels() == cancels:
+                raise _UserCancelled(exc) from None
+            _drop_unreported_error(awaitable)
+            self._stop_call(token, CANCELLED, target, context)
+            raise
+
+    def _stop_call(
+        self, token: CancelToken, reason: str, target: _Target, context: ClientContext
+    ) -> None:
+        if target.kind == "tool":
+            # As tools always called it (a test of the late-finish audit
+            # replaces it with one taking exactly these).
+            self._stop_tool(token, reason, target.label, context)
+        else:
+            self._stop_tool(token, reason, target.label, context, kind=target.kind)
+
     def _tool_failed(
         self, name: str, context: ClientContext, exc: BaseException, duration_ms: float
     ) -> ToolOutcome:
@@ -2033,41 +2117,44 @@ class MCPServer:
             exc.__traceback__ = None
 
     def _callback_failed(
-        self, name: str, context: ClientContext
+        self, name: str, context: ClientContext, kind: str = "tool"
     ) -> Callable[[BaseException], None]:
-        """How a failing cancel callback of tool *name* is reported."""
+        """How a failing cancel callback of the tool (or other *kind*) *name* is reported."""
+        fields: dict[str, Any] = {"tool": name} if kind == "tool" else {"kind": kind, "name": name}
 
         def failed(exc: BaseException) -> None:
             error_id = uuid.uuid4().hex[:12]
             self._logger.warning(
-                "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
+                "cancel callback of %s %r failed error_id=%s", kind, name, error_id, exc_info=exc
             )
             audit(
                 "cancel_callback_failed",
-                tool=name,
+                **fields,
                 client_id=context.client_id,
                 error_id=error_id,
             )
 
         return failed
 
-    def _start_sync_tool(
+    def _start_sync_call(
         self,
-        definition: ToolDefinition,
-        arguments: dict[str, Any],
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
         token: CancelToken,
         context: ClientContext,
+        target: _Target,
     ) -> asyncio.Future[Any]:
-        """Run a sync tool on a thread of its own; returns its future.
+        """Run a sync function (a tool, resource, prompt or completer) on a thread of its own.
 
-        A daemon thread rather than a shared pool: a tool that ignores its
-        token keeps its thread after the call is abandoned, and in a pool
-        that thread would hold up unrelated calls queued behind it (and, at
-        exit, the interpreter).  ``max_sync_workers`` bounds them instead,
-        and :meth:`wait_for_tool_threads` gives them time at shutdown.
+        Returns its future.  A daemon thread rather than a shared pool: a
+        function that ignores its token keeps its thread after the call is
+        abandoned, and in a pool that thread would hold up unrelated calls
+        queued behind it (and, at exit, the interpreter).
+        ``max_sync_workers`` bounds them instead, and
+        :meth:`wait_for_tool_threads` gives them time at shutdown.
 
         Raises:
-            ServerBusyError: ``max_sync_workers`` tools are already running.
+            ServerBusyError: ``max_sync_workers`` sync calls are already running.
         """
         slots = self._sync_slots
         if slots is not None and not slots.acquire(blocking=False):
@@ -2079,11 +2166,11 @@ class MCPServer:
         # Carries the cancel token (and any other context) into the thread,
         # as asyncio.to_thread does.
         run_in_context = contextvars.copy_context().run
-        name = definition.name
+        kind, label, field = target.kind, target.label, target.field
 
         def work() -> None:
             try:
-                outcome: tuple[bool, Any] = (True, run_in_context(definition.fn, **arguments))
+                outcome: tuple[bool, Any] = (True, run_in_context(fn, **arguments))
             except BaseException as exc:
                 outcome = (False, exc)
             finally:
@@ -2096,12 +2183,12 @@ class MCPServer:
 
             def finished_late() -> None:
                 # The client was told the call was cancelled or timed out; a
-                # tool that acts (a write, say) may have done so anyway, and
-                # this is the record of it.
+                # function that acts (a write, say) may have done so anyway,
+                # and this is the record of it.
                 fired = token_ref()
                 audit(
-                    "tool_finished_after_cancel",
-                    tool=name,
+                    f"{kind}_finished_after_cancel",
+                    **{field: label},
                     client_id=context.client_id,
                     reason=fired.reason if fired is not None else None,
                     status=status,
@@ -2123,7 +2210,7 @@ class MCPServer:
                 del outcome
 
         try:
-            self._spawn(f"easy-mcp-tool:{name}", work)
+            self._spawn(f"easy-mcp-{kind}:{label}", work)
         except BaseException:
             if slots is not None:
                 slots.release()
@@ -2131,19 +2218,25 @@ class MCPServer:
         return future
 
     def _stop_tool(
-        self, token: CancelToken, reason: str, name: str, context: ClientContext
+        self,
+        token: CancelToken,
+        reason: str,
+        name: str,
+        context: ClientContext,
+        kind: str = "tool",
     ) -> None:
         """Trigger *token* and run its callbacks off the event loop.
 
-        The flag is set at once, so a tool polling ``token.cancelled`` sees
-        it immediately; callbacks may block (a MySQL ``KILL QUERY`` opens a
-        connection), so they get a thread of their own.  Never raises: it
-        runs while a cancellation or timeout is propagating.
+        The flag is set at once, so a function polling ``token.cancelled``
+        sees it immediately; callbacks may block (a MySQL ``KILL QUERY``
+        opens a connection), so they get a thread of their own.  Never
+        raises: it runs while a cancellation or timeout is propagating.
+        *kind* is what was called, ``"tool"`` or another kind of call.
         """
         callbacks = token._trigger(reason)
         if not callbacks:
             return
-        failed = token._on_error or self._callback_failed(name, context)
+        failed = token._on_error or self._callback_failed(name, context, kind)
 
         def run() -> None:
             # The token stays alive while its callbacks run (the call may be
