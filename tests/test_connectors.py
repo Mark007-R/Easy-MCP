@@ -552,3 +552,15 @@ def test_github_allow_write_over_stdio_needs_api_keys(monkeypatch: pytest.Monkey
     )
     assert keyed.instructions is not None
     assert "Write tools need an API key holding" in keyed.instructions
+
+
+def test_connector_metrics_flag() -> None:
+    from easy_mcp.connectors import _cli
+
+    parser = _cli.build_parser("test")
+    assert _cli.server_kwargs(parser.parse_args(["--metrics"]))["metrics"] is True
+    assert _cli.server_kwargs(parser.parse_args([]))["metrics"] is False
+    server = postgres.build_server(
+        connector=lambda: None, **_cli.server_kwargs(parser.parse_args(["--metrics"]))
+    )
+    assert "easy_mcp_tool_calls_total" in server.render_metrics()

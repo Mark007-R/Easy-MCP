@@ -175,6 +175,16 @@ def test_run_overrides_only_what_was_asked_for(
     assert server.host == "10.0.0.1"  # not asked for, so not changed
 
 
+def test_cli_metrics_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: list[Any]
+) -> None:
+    name = write_module(tmp_path, monkeypatch, SERVER_MODULE)
+    main(["run", name])
+    assert captured[-1][0].metrics is False  # the module's own setting stands
+    main(["run", name, "--metrics"])
+    assert captured[-1][0].metrics is True
+
+
 def test_run_reports_a_bad_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit) as excinfo:

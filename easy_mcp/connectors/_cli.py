@@ -39,6 +39,12 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--debug", action="store_true", help="send tracebacks to clients (development only)"
     )
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="serve GET /metrics (http/sse); needs a key with the metrics:read scope when "
+        "EASY_MCP_API_KEYS is set",
+    )
     return parser
 
 
@@ -77,6 +83,7 @@ def server_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "host": args.host,
         "port": args.port,
         "debug": args.debug,
+        "metrics": args.metrics,
         "rate_limit_per_minute": args.rate_limit or None,
         "auth": auth_from_env(),
         "oauth": oauth_from_env(),
