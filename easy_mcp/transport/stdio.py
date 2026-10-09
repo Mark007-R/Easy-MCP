@@ -23,6 +23,8 @@ Security handled here (before anything reaches the dispatcher):
 
 The dispatcher is shared with every other transport, so validation, auth
 decisions, rate limits, timeouts, and error sanitization apply unchanged.
+State stays in this process even when the server has a shared store: one
+client, one process, and no network dependency for a desktop host.
 """
 
 from __future__ import annotations
@@ -33,11 +35,13 @@ import os
 import secrets
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
 from ..logging import audit
 from ..middleware import TransportInfo
+from ..store.base import session_ref
 from .base import ClientContext, Transport
 
 if TYPE_CHECKING:
@@ -158,7 +162,17 @@ class StdioTransport(Transport):
             daemon=True,
         )
         in_flight: set[asyncio.Task[None]] = set()
-        audit("session_open", session_id=session_id, client_id=client_id, transport="stdio")
+        ref = session_ref(session_id)
+        t0 = int(time.time() * 1000)
+        server._session_event(
+            True,
+            kind="stdio",
+            transport="stdio",
+            session_id=session_id,
+            ref=ref,
+            client_id=client_id,
+            t0=t0,
+        )
         reader.start()
         try:
             while True:
@@ -176,7 +190,15 @@ class StdioTransport(Transport):
                 sys.stdout = real_stdout
             self._loop = None
             self._queue = None
-            audit("session_close", session_id=session_id, client_id=client_id, transport="stdio")
+            server._session_event(
+                False,
+                kind="stdio",
+                transport="stdio",
+                session_id=session_id,
+                ref=ref,
+                client_id=client_id,
+                t0=t0,
+            )
 
     def stop(self) -> None:
         """Stop serving after in-flight calls finish (thread-safe)."""

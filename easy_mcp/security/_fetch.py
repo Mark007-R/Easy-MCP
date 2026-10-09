@@ -45,6 +45,7 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 _USER_AGENT = f"easy-mcp-kit/{__version__}"
 _CHUNK = 65536
+_TIMED_OUT = (TimeoutError, ssl.SSLWantReadError, ssl.SSLWantWriteError)
 
 # Objects and arrays nested in any JSON this package reads from the network.
 # The parser's own recursion limit is no bound: it differs between platforms
@@ -131,6 +132,10 @@ class _Deadline:
 
     def __init__(self, seconds: float) -> None:
         self._at = time.monotonic() + seconds
+
+    def passed(self) -> bool:
+        """Whether the time is up."""
+        return time.monotonic() >= self._at
 
     def left(self) -> float:
         """Seconds left.
@@ -338,7 +343,9 @@ def _exchange(
         raise FetchError(f"{url} timed out") from None
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as exc:
         reason = getattr(exc, "reason", None) or type(exc).__name__
-        if isinstance(reason, TimeoutError):  # while connecting or sending
+        # A TLS socket that runs out of time can say so as "want read/write"
+        # rather than as a timeout, depending on where the handshake was.
+        if isinstance(reason, _TIMED_OUT) or isinstance(exc, _TIMED_OUT) or deadline.passed():
             raise FetchError(f"{url} timed out") from None
         raise FetchError(f"{url} unreachable: {reason}") from None
     # The server answered: these keep its status, so a caller can tell an

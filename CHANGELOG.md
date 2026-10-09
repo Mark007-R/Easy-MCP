@@ -165,6 +165,67 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - Exceptions `TokenRequiredError`, `InvalidTokenError` (`-32001`, `401`),
   `InsufficientScopeError` (`-32001`, `403`) and `AuthServerUnavailableError`
   (`-32008`, `503`). No new error codes.
+- Several worker processes can now serve one endpoint without sticky routing.
+  `MCPServer(store=RedisStore.from_env())` keeps the state that outlives a
+  request in Redis instead of process memory: handshake-era sessions of
+  Streamable HTTP and legacy SSE, `max_calls_per_session` counts (per session,
+  and per client for stateless requests), and rate-limit windows. Any worker
+  answers any request of a session, `DELETE` ends it on every worker,
+  `notifications/cancelled` reaches a call running on another worker (its
+  cancel token and a connector's `KILL QUERY` included), a legacy SSE message
+  posted to another worker is answered on the stream, and sessions survive a
+  worker restart. Install it with `pip install "easy-mcp-kit[redis]"`
+  (redis-py 5.0.1 or later). It needs Redis 7.0 or later, and the
+  least-privilege ACL in SECURITY.md, as written, Redis 7.2 or later. The URL
+  comes from `EASY_MCP_REDIS_URL`, and the server's `name` is the namespace
+  unless `namespace=` says otherwise.
+  `RedisStore.from_client()` takes a client you configured yourself; Redis
+  Cluster is not supported.
+
+  The store never holds an API key, a token or a session id: sessions are
+  filed under a SHA-256 digest of their id and identities under key
+  fingerprints, and every worker re-checks the presented credential on every
+  request. Messages between workers are authenticated with a key derived
+  from the session id, so access to Redis is not enough to cancel, end or
+  answer someone else's call. When the store cannot be reached, requests
+  that depend on it are refused with the new `StoreUnavailableError`
+  (`-32008` with `data.reason = "store_unavailable"`, HTTP `503` with
+  `Retry-After: 1`) rather than served without their limits. No new error
+  code: the stateless revision allows none in `-32000..-32019`.
+
+  `MemoryStore` is the default and behaves as 0.3.1 did, bar two changes for
+  a server served at several endpoints: `max_sessions` and stateless call
+  counts (see Changed). The stdio transport keeps its state in process
+  whatever store is configured.
+- `MCPServer.acheck_rate_limit(client_id)`, the async counterpart of
+  `check_rate_limit()` that charges the store's budget, shared between
+  workers with `RedisStore`. The HTTP transports now charge every request
+  through it (see Changed); `check_rate_limit()` still spends the in-process
+  budget, for stdio and direct `dispatch` calls. `MCPServer.store` is the
+  configured store.
+- `Store`, the interface a store implements, is public and provisional until
+  1.0 (`easy_mcp.store`). `ClientContext.store_handle` gives a request's
+  dispatch the session's (or stateless client's) state in the store; the HTTP
+  transports set it, and a context without one (stdio, a direct `dispatch`)
+  counts and cancels in the context itself, as before.
+- Audit events for sessions carry `session_ref`, a digest of the session id,
+  and `transport` on legacy SSE events; with a shared store they also carry
+  `worker`. On Streamable HTTP, `session_open` carries the negotiated
+  `protocol_version` (legacy SSE and stdio sessions are audited as open
+  before their `initialize` arrives). New events:
+  `bus_message_rejected` and `sse_relay_failed`. Legacy SSE `session_close`
+  events now carry a `reason` (`stream_closed`, `shutdown`, `lease_lost`),
+  and Streamable HTTP ones have a new reason, `store_lost`. Each session's
+  close is audited once, by the worker that removes it from the store: one
+  that ends while the store is out of reach is audited when its worker
+  reaches the store again, or as `lease_lost` or `idle_timeout` by the worker
+  that finds it expired first. One the store loses (a failover to a replica
+  that missed it, a restart without persistence) is audited by the worker
+  serving it, if any: when it ends there, or as `lease_lost` (legacy SSE) or
+  `store_lost` (Streamable HTTP) when that worker finds it gone. A worker cut
+  off from Redis for more than ten minutes may audit a close a second time.
+- `MCPServer.lifespan()` also connects the store at startup and closes it
+  last at shutdown.
 
 ### Changed
 
@@ -228,6 +289,41 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   needs `EASY_MCP_API_KEYS`.
 - `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`,
   where metadata is served.
+- `max_sessions` caps the sessions of a server, still separately for
+  Streamable HTTP and legacy SSE: those of every endpoint serving it count
+  together (in 0.3.1 each transport counted its own), and with a shared
+  store those of all workers. With the default `MemoryStore` a session is
+  still known only to the endpoint that opened it; with a shared store every
+  endpoint of the same kind (Streamable HTTP or legacy SSE), on every
+  worker, serves it.
+- With several Streamable HTTP endpoints serving one server, a stateless
+  client's `max_calls_per_session` counts are shared between them (in 0.3.1
+  each transport kept its own), as they are between workers with a shared
+  store. They lapse after the `session_idle_timeout` of whichever endpoint
+  the client reached last.
+- The HTTP transports charge each request, and the opening of a legacy SSE
+  session, through `acheck_rate_limit()`, which spends the store's budget
+  (the same in-process one with `MemoryStore`), rather than through
+  `check_rate_limit()`. A subclass that overrides `check_rate_limit()` to
+  customise HTTP rate limiting must override `acheck_rate_limit()` instead.
+- With a shared store, `session_idle_timeout=None` is refused, because
+  sessions in a shared store must expire. Stopping a worker no longer ends
+  the sessions it served, except those whose legacy SSE stream it held; the
+  legacy SSE messages it serves for a stream another worker holds get the
+  same 5 s as its Streamable HTTP requests, then a `-32008` answer
+  (`data.reason: "shutdown"`) on that stream.
+- With a shared store, `/healthz` reports `"store"` and answers 503 when the
+  store cannot be reached. Its response is unchanged with the default store.
+- With `RedisStore`, a stateless client's call counts lapse after
+  `session_idle_timeout` without a counted (or refused) call, rather than
+  without any request.
+- Registering or removing a tool while serving with a shared store logs a
+  warning: only that worker sees the change.
+
+### Deprecated
+
+- The raw `session_id` in audit events. It stays in 0.3.x and is removed in
+  0.4; key log processing on the new `session_ref`.
 
 ### Fixed
 

@@ -51,6 +51,7 @@ from .exceptions import (
     ProtocolError,
     ServerBusyError,
     SessionLimitError,
+    StoreUnavailableError,
     TokenRequiredError,
     ToolError,
     ToolRegistrationError,
@@ -102,7 +103,10 @@ from .security.auth import (
 )
 from .security.oauth import OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
+from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle
+from .store.memory import MemoryStore
 from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
+from .transport._sessions import SessionManager
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -124,6 +128,9 @@ DEFAULT_MAX_SYNC_WORKERS = 32
 
 # OAuth principals remembered for the once-per-principal principal_seen audit.
 _PRINCIPALS_SEEN_MAX = 4096
+
+# How long /healthz trusts a ping of a shared store, so probes cannot hammer it.
+_STORE_PING_CACHE_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,14 +310,22 @@ class MCPServer:
             left behind by tools that ignore their cancel token.  A call
             beyond it is refused with ``-32008`` rather than queued.
             ``None`` removes the cap.
-        max_sessions: Cap on concurrent sessions, enforced by each HTTP
-            endpoint (Streamable HTTP, legacy SSE); stdio has exactly one.
+        max_sessions: Cap on concurrent handshake-era sessions, counted
+            separately for Streamable HTTP and legacy SSE; stdio has exactly
+            one.  With a shared ``store`` it counts the sessions of every
+            worker together.
         allowed_origins: Browser origins allowed to call the HTTP endpoints,
             e.g. ``["https://app.example.com"]``; ``"*"`` allows any.  The
             default (``None``) allows loopback origins only.  Requests that
             carry no ``Origin`` header (non-browser clients) are unaffected.
         instructions: Optional usage hints sent to clients at initialize and
             in server/discover.
+        store: Where state that outlives one request is kept: handshake-era
+            sessions, ``max_calls_per_session`` counts and rate-limit
+            windows.  The default :class:`~easy_mcp.MemoryStore` keeps it in
+            this process.  Pass a :class:`~easy_mcp.RedisStore` to share it
+            between worker processes, so that any worker can serve any
+            request.  The stdio transport always keeps its state in process.
         json_logs: Emit structured JSON logs (recommended) or plain text.
     """
 
@@ -331,6 +346,7 @@ class MCPServer:
         max_sessions: int = 256,
         allowed_origins: Iterable[str] | None = None,
         instructions: str | None = None,
+        store: Store | None = None,
         json_logs: bool = True,
     ) -> None:
         if default_timeout is not None and default_timeout <= 0:
@@ -341,6 +357,8 @@ class MCPServer:
             raise ValueError("max_sync_workers must be >= 1 or None")
         if oauth is not None and not isinstance(oauth, OAuthResourceServer):
             raise TypeError("oauth must be an OAuthResourceServer")
+        if store is not None and not isinstance(store, Store):
+            raise TypeError("store must be a Store, such as MemoryStore or RedisStore")
         self.host = host
         self.port = port
         self.name = name
@@ -378,6 +396,20 @@ class MCPServer:
             if rate_limit_per_minute
             else None
         )
+        self._store: Store = store if store is not None else MemoryStore()
+        self._store.bind(name)
+        # What HTTP requests are charged to: the in-process limiter itself
+        # with MemoryStore, the store's own with a shared store.
+        self._store_limiter: AsyncRateLimiter | None = (
+            self._store.rate_limiter(self._limiter) if self._limiter is not None else None
+        )
+        # The last ping of a shared store, for /healthz: (when, reachable).
+        self._store_ping: tuple[float, bool] | None = None
+        # The session managers of every HTTP endpoint serving this server: a
+        # session the store removes ends on whichever endpoint holds it.
+        self._session_managers: weakref.WeakSet[SessionManager] = weakref.WeakSet()
+        # Set while an HTTP app of this server is serving (its lifespan runs).
+        self._serving = False
         self._transport: Transport | None = None
         self._logger: logging.Logger = configure_logging(debug=debug, json_logs=json_logs)
 
@@ -446,13 +478,25 @@ class MCPServer:
                     )
         self._registry.register(definition)
         self._logger.debug("registered tool %r", definition.name)
+        self._warn_if_shared("registered", definition.name)
         return definition
 
     def unregister_tool(self, name: str) -> ToolDefinition:
         """Remove a tool at runtime; returns its definition."""
         removed = self._registry.unregister(name)
         self._logger.debug("unregistered tool %r", name)
+        self._warn_if_shared("unregistered", name)
         return removed
+
+    def _warn_if_shared(self, change: str, name: str) -> None:
+        """Warn that a tool changed in this worker only, when workers share a store."""
+        if self._serving and self._store.shared:
+            self._logger.warning(
+                "tool %r %s while serving with a shared store: only this worker sees the "
+                "change; every worker must register the same tools",
+                name,
+                change,
+            )
 
     def middleware(self, fn: RequestMiddlewareT, /) -> RequestMiddlewareT:
         """Register request middleware: your async code around every request.
@@ -742,11 +786,14 @@ class MCPServer:
         return context if same else dataclasses.replace(context, identity=identity)
 
     def check_rate_limit(self, client_id: str) -> None:
-        """Consume one unit of *client_id*'s request budget.
+        """Consume one unit of *client_id*'s request budget, in this process.
 
-        ``dispatch`` calls this for every message; transports call it for
-        work that happens before any message exists (opening an SSE session)
-        so that path cannot sidestep the budget.
+        ``dispatch`` calls this for every message whose context has no
+        ``store_handle``: stdio, and a direct ``dispatch`` call.  The HTTP
+        transports charge their messages, and the opening of a legacy SSE
+        session, through :meth:`acheck_rate_limit` instead, which spends the
+        store's budget (with :class:`~easy_mcp.MemoryStore`, this same one):
+        override that one to change how HTTP requests are limited.
 
         Raises:
             RateLimitError: If the client is over budget.  A no-op when rate
@@ -754,6 +801,89 @@ class MCPServer:
         """
         if self._limiter is not None:
             self._limiter.check(client_id)
+
+    @property
+    def store(self) -> Store:
+        """Where sessions, call counts and rate-limit windows are kept (see ``store=``)."""
+        return self._store
+
+    async def acheck_rate_limit(self, client_id: str) -> None:
+        """Consume one unit of *client_id*'s request budget in the store.
+
+        The async counterpart of :meth:`check_rate_limit`, which the HTTP
+        transports use for every message and every legacy SSE session they
+        open.  With :class:`~easy_mcp.MemoryStore` both spend the same
+        in-process budget; with a shared store this one is shared between the
+        workers and :meth:`check_rate_limit` stays per process.
+
+        Raises:
+            RateLimitError: If the client is over budget.  A no-op when rate
+                limiting is disabled.
+            StoreUnavailableError: The shared store cannot be reached.
+        """
+        if self._store_limiter is not None:
+            await self._store_limiter.acheck(client_id)
+
+    async def _charge(self, context: ClientContext) -> None:
+        """Charge one message to its client's budget.
+
+        A context from an HTTP transport (with a ``store_handle``) is charged
+        to the store's budget, shared between workers with a shared store;
+        any other (stdio, a direct ``dispatch``) to the in-process one.
+        """
+        if context.store_handle is not None:
+            await self.acheck_rate_limit(context.client_id)
+        else:
+            self.check_rate_limit(context.client_id)
+
+    async def _store_reachable(self) -> bool:
+        """Whether the store answers a ping; the answer is kept for a second."""
+        now = time.monotonic()
+        cached = self._store_ping
+        if cached is not None and now - cached[0] < _STORE_PING_CACHE_SECONDS:
+            return cached[1]
+        try:
+            reachable = await self._store.ping()
+        except Exception:
+            reachable = False
+        self._store_ping = (time.monotonic(), reachable)
+        return reachable
+
+    def _session_event(
+        self,
+        opened: bool,
+        *,
+        kind: str,
+        transport: str,
+        session_id: str | None,
+        ref: str,
+        client_id: str | None,
+        protocol_version: str | None = None,
+        t0: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Every session opening or closing goes through here: HTTP, SSE and stdio.
+
+        Audited as ``session_open`` or ``session_close``.  *ref* is the
+        session's ``session_ref``; the raw *session_id* is audited too, when
+        this process knows it (it is dropped from audit events in 0.4).
+        *t0* is when the session opened (epoch milliseconds) and *kind* is
+        ``"http"``, ``"sse"`` or ``"stdio"``.
+        """
+        fields: dict[str, Any] = {}
+        if session_id is not None:
+            fields["session_id"] = session_id
+        fields["session_ref"] = ref
+        fields["client_id"] = client_id
+        fields["transport"] = transport
+        if opened:
+            if protocol_version is not None:
+                fields["protocol_version"] = protocol_version
+        elif reason is not None:
+            fields["reason"] = reason
+        if self._store.shared and kind != "stdio":
+            fields["worker"] = self._store.worker_id
+        audit("session_open" if opened else "session_close", **fields)
 
     # --------------------------------------------------------------- dispatch
 
@@ -805,10 +935,24 @@ class MCPServer:
         # Rate limiting applies to every method, so discovery endpoints cannot
         # be used to bypass the budget.
         try:
-            self.check_rate_limit(context.client_id)
+            await self._charge(context)
+        except StoreUnavailableError as exc:
+            # The budget cannot be checked, so the message is not served
+            # (the store logs the outage).
+            return None if is_notification else _protocol_error_response(msg_id, exc)
         except ProtocolError as exc:
             audit("rate_limited", client_id=context.client_id, method=method)
             return None if is_notification else _protocol_error_response(msg_id, exc)
+        except Exception:
+            # A store that failed in a way it does not report as an outage:
+            # still not served, and answered rather than raised.
+            error_id = uuid.uuid4().hex[:12]
+            self._logger.error("rate limit check failed error_id=%s", error_id, exc_info=True)
+            if is_notification:
+                return None
+            return _error_response(
+                msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
+            )
 
         if is_notification and not method.startswith("notifications/"):
             # Only requests invoke methods.  A tools/call without an id would
@@ -1187,7 +1331,7 @@ class MCPServer:
             ]
         }
 
-    def _handle_notification(
+    async def _handle_notification(
         self, method: str, params: dict[str, Any], context: ClientContext
     ) -> None:
         if method == "notifications/initialized":
@@ -1198,11 +1342,15 @@ class MCPServer:
             task = context.in_flight.get(request_id) if isinstance(request_id, Hashable) else None
             if task is not None:
                 task.cancel()
+            elif context.store_handle is not None and isinstance(request_id, str | int):
+                # Not running here: with a shared store it may run on another
+                # worker (which ignores an unknown id too).
+                await context.store_handle.cancel_elsewhere(request_id)
 
     async def _handle_notification_outcome(
         self, request: RequestInfo, context: ClientContext
     ) -> RequestOutcome:
-        self._handle_notification(request.method, request._params, context)
+        await self._handle_notification(request.method, request._params, context)
         return RequestOutcome._create()
 
     async def _execute_tool(self, request: RequestInfo, context: ClientContext) -> ToolOutcome:
@@ -1226,18 +1374,34 @@ class MCPServer:
         if definition is None or not self._visible(context.identity, definition):
             raise ProtocolError(f"Unknown tool: {name}", code=INVALID_PARAMS)
 
+        handle = context.store_handle
+        limit = definition.max_calls_per_session
+        call_count = 0
+        # Whether a unit of the store's count is held for this call.
+        reserved = False
         try:
             self._check_step_up(context.identity, definition)
             authorize(context.identity, definition)
-            call_count = context.tool_calls.get(name, 0)
-            if (
-                definition.max_calls_per_session is not None
-                and call_count >= definition.max_calls_per_session
-            ):
-                raise SessionLimitError(
-                    f"Session limit reached for tool '{name}' "
-                    f"({definition.max_calls_per_session} calls)"
-                )
+            if handle is None:
+                call_count = context.tool_calls.get(name, 0)
+                if limit is not None and call_count >= limit:
+                    raise SessionLimitError(
+                        f"Session limit reached for tool '{name}' ({limit} calls)"
+                    )
+            elif limit is not None:
+                # Taken where the count above is checked, so the errors keep
+                # their order.  The store's count is shared between workers,
+                # and taking a unit is atomic there.
+                reservation = await handle.reserve_call(name, limit)
+                if reservation is Reservation.LIMIT:
+                    raise SessionLimitError(
+                        f"Session limit reached for tool '{name}' ({limit} calls)"
+                    )
+                if reservation is Reservation.GONE:
+                    raise ProtocolError(
+                        "Session not found; send a new initialize request", code=INVALID_REQUEST
+                    )
+                reserved = True
             arguments = params.get("arguments")
             if arguments is None:
                 arguments = {}
@@ -1251,6 +1415,8 @@ class MCPServer:
             plain = validate_arguments(arguments, definition.arguments_schema)
             built = build_param_models(definition.param_models, _copy(plain))
         except ProtocolError as exc:
+            if reserved and handle is not None:
+                await self._release_call(handle, name)
             # A step-up denial names the scope the client was asked for.
             scope = {}
             if isinstance(exc, InsufficientScopeError):
@@ -1264,10 +1430,11 @@ class MCPServer:
             )
             raise
 
-        # No await since the cap check, so concurrent calls cannot overshoot
-        # it while a middleware awaits; the finally below refunds a call
-        # whose tool never started.
-        context.tool_calls[name] = call_count + 1
+        # No await since the cap check (a store reserves atomically), so
+        # concurrent calls cannot overshoot it while a middleware awaits; the
+        # finally below refunds a call whose tool never started.
+        if handle is None:
+            context.tool_calls[name] = call_count + 1
         # The tool (and, for a sync tool, its thread) finds this through
         # current_cancel_token(); a cancel or timeout triggers it.
         token = CancelToken()
@@ -1298,7 +1465,23 @@ class MCPServer:
             if not call._started:
                 # Refused, busy, a middleware failure or an early cancel: it
                 # never ran, so it does not count against the session cap.
-                context.tool_calls[name] -= 1
+                if handle is None:
+                    context.tool_calls[name] -= 1
+                elif reserved:
+                    await self._release_call(handle, name)
+
+    async def _release_call(self, handle: StoreHandle, name: str) -> None:
+        """Give back a unit of the store's count.  Never raises but ``CancelledError``.
+
+        A unit the store cannot take back now stays spent: that fails safe
+        (the cap is reached early), and a session's counts end with it.
+        """
+        try:
+            await handle.release_call(name)
+        except Exception:
+            self._logger.warning(
+                "could not give back a call of tool %r to the store", name, exc_info=True
+            )
 
     async def _run_tool(
         self, call: ToolCall, arguments: dict[str, Any], context: ClientContext
@@ -1704,11 +1887,17 @@ class MCPServer:
             mcp_app = server.build_app()
             app = Starlette(routes=[Mount("/", mcp_app)], lifespan=lifespan)
 
-        At startup it fetches the OAuth authorization servers' metadata and
-        keys (best effort).  At shutdown it closes the streams and sessions,
-        cancels the requests still running after their grace, gives sync
-        tool threads and cancel callbacks 5 s, and releases the OAuth fetch
-        threads.  ``build_app()``'s own lifespan does exactly this.
+        At startup it warns about a misconfigured store (plaintext to a
+        remote Redis, say) and connects it (a shared store that refuses the
+        credentials stops the startup; one out of reach is retried, and
+        ``/healthz`` answers 503 meanwhile), then fetches the OAuth
+        authorization servers' metadata and keys (best effort).  At shutdown
+        it closes the streams, cancels the requests still running after
+        their grace, ends the sessions (with a shared store, only those
+        whose stream this worker holds: other workers serve the rest), gives
+        sync tool threads and cancel callbacks 5 s, releases the OAuth fetch
+        threads and closes the store.  ``build_app()``'s own lifespan does
+        exactly this.
         """
         transport = self._transport if isinstance(self._transport, BaseHTTPTransport) else None
         return self._lifespan(transport)
@@ -1717,16 +1906,26 @@ class MCPServer:
     async def _lifespan(self, transport: BaseHTTPTransport | None) -> AsyncIterator[None]:
         if transport is not None:
             transport._reopen()  # an app started again serves anew
-        if self.oauth is not None:
-            await self.oauth.warm_up()
+        # Here rather than in run(): an app uvicorn serves itself, or one
+        # mounted in another app, never calls run().
+        self._warn_about_store()
+        await self._store.start()
         try:
+            if self.oauth is not None:
+                await self.oauth.warm_up()
+            self._serving = True
             yield
         finally:
-            if transport is not None:
-                await transport.close_streams()
-            await self.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
-            if self.oauth is not None:
-                self.oauth.close()
+            self._serving = False
+            try:
+                if transport is not None:
+                    # The streams, the requests still running, then the sessions.
+                    await transport.close_streams()
+                await self.wait_for_tool_threads(THREAD_SHUTDOWN_GRACE)
+                if self.oauth is not None:
+                    self.oauth.close()
+            finally:
+                await self._store.aclose()
 
     def run(self, transport: Transport | str | None = None) -> None:
         """Start the server (blocking).  Ctrl-C shuts down gracefully.
@@ -1756,6 +1955,7 @@ class MCPServer:
                     "auth": self.auth is not None,
                     "oauth": self.oauth is not None,
                     "rate_limit": self._limiter is not None,
+                    "store": self._store.describe(),
                     "debug": self.debug,
                 }
             },
@@ -1803,8 +2003,15 @@ class MCPServer:
                 )
         if self.oauth is not None:
             self._warn_about_oauth(self.oauth)
+        # An HTTP transport's app warns about the store as its lifespan starts.
+        if not isinstance(self._transport, StdioTransport | BaseHTTPTransport):
+            self._warn_about_store()
         if self.debug:
             self._logger.warning("debug mode is ON: clients will receive tracebacks")
+
+    def _warn_about_store(self) -> None:
+        for warning in self._store.warnings():
+            self._logger.warning("store: %s", warning)
 
     def _warn_about_oauth(self, oauth: OAuthResourceServer) -> None:
         transport = self._transport

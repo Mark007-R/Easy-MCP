@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import abc
+import asyncio
 import json
 import math
 from collections.abc import Iterable
@@ -37,6 +38,7 @@ from ..exceptions import (
     InsufficientScopeError,
     InvalidTokenError,
     RateLimitError,
+    StoreUnavailableError,
     TokenRequiredError,
 )
 from ..logging import audit
@@ -107,6 +109,37 @@ def rpc_error(
     )
 
 
+# How soon a client refused because the store is out of reach may retry.
+STORE_RETRY_SECONDS = 1
+
+
+def store_unavailable(msg_id: Any = None) -> JSONResponse:
+    """The answer to a request that needs the store while it cannot be reached.
+
+    ``503`` with ``Retry-After``, and a JSON-RPC body carrying ``-32008``
+    with ``data.reason = "store_unavailable"``.
+    """
+    exc = StoreUnavailableError()
+    body = {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "error": {"code": exc.code, "message": str(exc), "data": exc.data},
+    }
+    return JSONResponse(body, status_code=503, headers={"Retry-After": str(STORE_RETRY_SECONDS)})
+
+
+def is_store_unavailable(response: dict[str, Any]) -> bool:
+    """Whether a dispatched *response* refuses its request because the store is out of reach."""
+    error = response.get("error")
+    data = error.get("data") if isinstance(error, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == StoreUnavailableError.code
+        and isinstance(data, dict)
+        and data.get("reason") == "store_unavailable"
+    )
+
+
 def bearer_challenge(
     metadata_url: str,
     *,
@@ -131,20 +164,6 @@ def bearer_challenge(
     value = "Bearer " + ", ".join(params)
     assert '\\' not in value and value.count('"') == 2 * len(params), "unsafe challenge"
     return value
-
-
-def token_principal(
-    identity: ClientIdentity | None,
-) -> tuple[str, str | None, str | None] | None:
-    """The whole principal of a token identity: issuer, subject and client.
-
-    ``None`` for an API key or anonymous caller.  A session compares it as
-    well as the fingerprint, so no principal can use another's session even
-    if their fingerprints matched.
-    """
-    if identity is None or identity.issuer is None:
-        return None
-    return (identity.issuer, identity.subject, identity.client_id)
 
 
 def _header(scope: Scope, name: bytes) -> str | None:
@@ -227,6 +246,22 @@ class BaseHTTPTransport(Transport):
     def _forced_exit(self) -> bool:
         """Whether uvicorn was told to quit without waiting (a second Ctrl-C)."""
         return self._uvicorn is not None and bool(self._uvicorn.force_exit)
+
+    async def _grace(self, tasks: set[asyncio.Task[Any]], seconds: float) -> set[asyncio.Task[Any]]:
+        """Give *tasks* up to *seconds* to finish at shutdown; returns those still running.
+
+        A forced quit (a second Ctrl-C) ends the grace at once; uvicorn
+        checks for one as often while it waits for connections.
+        """
+        running = set(tasks)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while running and not self._forced_exit():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            _, running = await asyncio.wait(running, timeout=min(0.1, remaining))
+        return running
 
     def stop(self) -> None:
         """Ask the running uvicorn server to exit gracefully."""
@@ -497,4 +532,13 @@ class BaseHTTPTransport(Transport):
             # Still 200 when unavailable: every worker shares the cause, so
             # draining this one would not help; this says why tokens get 503.
             health["oauth"] = "ok" if oauth._ready() else "unavailable"
+        if self._server.store.shared:
+            # 503 when this worker cannot reach the store, so a load balancer
+            # takes it out: its requests would be refused anyway.
+            if await self._server._store_reachable():
+                health["store"] = "ok"
+            else:
+                health["store"] = "unreachable"
+                health["status"] = "unavailable"
+                return JSONResponse(health, status_code=503)
         return JSONResponse(health)

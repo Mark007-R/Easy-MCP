@@ -783,10 +783,10 @@ async def test_sse_shutdown_cancels_session_calls_right_away() -> None:
     transport = SSETransport(server)
     app = transport.build_app()
     async with app.router.lifespan_context(app):
-        from easy_mcp.transport.sse import _Session
-
-        session = _Session(id="s1", context=make_context(), identity_fp=None)
-        transport._sessions[session.id] = session
+        session = await transport._manager.open(
+            "s1", client_id="ip:test", identity=None, owned=True
+        )
+        assert session is not None
         task = asyncio.create_task(
             transport._deliver(session, rpc("tools/call", {"name": "slow"}, 1))
         )

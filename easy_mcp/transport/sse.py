@@ -32,6 +32,13 @@ Security handled here (before anything reaches the dispatcher):
 * Opening a session (``GET /sse``) spends the client's rate-limit budget like
   any message (429 when exhausted), so an anonymous client cannot fill
   ``max_sessions`` and lock everyone else out.
+
+With a shared store (``MCPServer(store=RedisStore(...))``) a message may be
+posted to a worker other than the one holding the stream.  That worker
+checks the session in the store, answers ``202``, dispatches the message and
+relays the answer to the stream's worker, which sends it (each answer goes
+to exactly one stream).  Closing the stream ends the session on every
+worker.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ import contextlib
 import json
 import math
 import secrets
-from dataclasses import dataclass, field
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
@@ -49,10 +56,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from ..exceptions import PARSE_ERROR, RateLimitError
+from ..exceptions import (
+    INTERNAL_ERROR,
+    PARSE_ERROR,
+    SERVER_BUSY,
+    RateLimitError,
+    StoreUnavailableError,
+)
 from ..logging import audit
 from ..middleware import TransportInfo
-from ._http import BaseHTTPTransport, token_principal
+from ._http import BaseHTTPTransport, store_unavailable
+from ._sessions import CLOSE_STREAM, LocalSession, Rejection, SessionManager
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -60,7 +74,11 @@ if TYPE_CHECKING:
 
 KEEPALIVE_SECONDS = 15.0
 
-_CLOSE = object()  # sentinel pushed into session queues on shutdown
+# How long shutdown lets the messages relayed here for a stream another
+# worker holds finish, as Streamable HTTP does the requests it serves; and
+# how long it then waits for those it stopped to answer on their stream.
+_SHUTDOWN_GRACE_SECONDS = 5.0
+_STOPPED_ANSWER_SECONDS = 2.0
 
 
 def _shutting_down() -> Response:
@@ -72,17 +90,16 @@ def _shutting_down() -> Response:
     )
 
 
-@dataclass(slots=True)
-class _Session:
-    """One live SSE connection and its outbound message queue."""
-
-    id: str
-    context: ClientContext
-    identity_fp: str | None
-    queue: asyncio.Queue[Any] = field(default_factory=asyncio.Queue)
-    tasks: set[asyncio.Task[None]] = field(default_factory=set)
-    # The token principal it is bound to, compared in full (token_principal).
-    principal: tuple[str, str | None, str | None] | None = None
+def _stopped(message: Any) -> dict[str, Any] | None:
+    """The answer to a request shutdown stopped: retry shortly (``None``: no request)."""
+    if not isinstance(message, dict) or "id" not in message:
+        return None
+    error = {
+        "code": SERVER_BUSY,
+        "message": "Server is shutting down; retry shortly",
+        "data": {"reason": "shutdown"},
+    }
+    return {"jsonrpc": "2.0", "id": message["id"], "error": error}
 
 
 class SSETransport(BaseHTTPTransport):
@@ -98,11 +115,18 @@ class SSETransport(BaseHTTPTransport):
         super().__init__(server)
         self._sse_path = sse_path
         self._messages_path = messages_path
-        self._sessions: dict[str, _Session] = {}
+        # Sessions live as long as their stream: in a shared store, on a
+        # lease the worker holding the stream renews.
+        self._manager = SessionManager(server, "sse", ttl=None, transport="sse")
         # Set once shutdown closes the streams: nothing new is served after.
         self._closing = False
 
     _audit_transport = "sse"
+
+    @property
+    def _sessions(self) -> dict[str, LocalSession]:
+        """The sessions whose stream this worker holds, by id."""
+        return {local.session_id: local for local in self._manager.local_sessions() if local.owned}
 
     def describe(self) -> str:
         return f"sse on {self._server.host}:{self._server.port}"
@@ -151,22 +175,53 @@ class SSETransport(BaseHTTPTransport):
 
     async def close_streams(self) -> None:
         await self.close_all_sessions()
+        await self._stop_relays(await self._grace(self._relays(), _SHUTDOWN_GRACE_SECONDS))
+        await self._manager.shutdown()
 
     async def close_all_sessions(self) -> None:
-        """Unblock every open SSE stream so its connection can close.
+        """Unblock every SSE stream this worker holds so its connection can close.
 
-        Calls still running have nobody left to answer; they are cancelled
-        now rather than when each stream winds down, so shutdown can wait
-        for their cancel callbacks.  From now on new streams and messages
-        are refused (``503``): uvicorn may still be accepting connections,
-        and a stream opened now would never be closed, so shutdown would
-        wait for it forever.
+        The calls still running for those streams have nobody left to
+        answer; they are cancelled now rather than when each stream winds
+        down, so shutdown can wait for their cancel callbacks.  Messages
+        relayed here for a stream another worker holds (a shared store) are
+        left running: their client still listens, so shutdown gives them a
+        grace and then answers them on that stream (:meth:`_stop_relays`).
+        From now on new streams and messages are refused (``503``): uvicorn
+        may still be accepting connections, and a stream opened now would
+        never be closed, so shutdown would wait for it forever.
         """
         self._closing = True
-        for session in list(self._sessions.values()):
+        for session in self._manager.local_sessions():
+            if not session.owned:
+                continue  # its stream is on another worker
             for task in list(session.tasks):
                 task.cancel()
-            await session.queue.put(_CLOSE)
+            if session.stream is not None:
+                await session.stream.put(CLOSE_STREAM)
+
+    def _relays(self) -> set[asyncio.Task[Any]]:
+        """The messages being served here for streams other workers hold."""
+        return {
+            task
+            for session in self._manager.local_sessions()
+            if not session.owned
+            for task in session.tasks
+        }
+
+    async def _stop_relays(self, running: set[asyncio.Task[Any]]) -> None:
+        """Stop the relays still *running* once their grace is over.
+
+        Only their dispatch is cancelled: each then tells its stream to
+        retry shortly, which is waited for, briefly, before the store closes.
+        """
+        if not running:
+            return
+        for session in self._manager.local_sessions():
+            if not session.owned:
+                for task in list(session.dispatches):
+                    task.cancel()
+        await asyncio.wait(running, timeout=_STOPPED_ANSWER_SECONDS)
 
     # ------------------------------------------------------------- endpoints
 
@@ -187,7 +242,7 @@ class SSETransport(BaseHTTPTransport):
         # Opening a session costs one request, so session slots cannot be
         # exhausted faster than the rate limit allows.
         try:
-            self._server.check_rate_limit(client_id)
+            await self._server.acheck_rate_limit(client_id)
         except RateLimitError as exc:
             audit("rate_limited", client_id=client_id, method="GET " + self._sse_path)
             return JSONResponse(
@@ -195,45 +250,49 @@ class SSETransport(BaseHTTPTransport):
                 status_code=429,
                 headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
             )
-
-        if len(self._sessions) >= self._server.max_sessions:
-            return JSONResponse({"error": "too many concurrent sessions"}, status_code=503)
+        except StoreUnavailableError:
+            return store_unavailable()
 
         # 192-bit random token: the session id is a bearer capability, it
         # must be unguessable.
         session_id = secrets.token_urlsafe(24)
-        context = ClientContext(client_id=client_id, session_id=session_id, identity=identity)
-        session = _Session(
-            id=session_id,
-            context=context,
-            identity_fp=identity.fingerprint if identity else None,
-            principal=token_principal(identity),
-        )
-        self._sessions[session_id] = session
-        audit("session_open", session_id=session_id, client_id=client_id)
+        try:
+            session = await self._manager.open(
+                session_id, client_id=client_id, identity=identity, owned=True
+            )
+        except StoreUnavailableError:
+            return store_unavailable()
+        if session is None:
+            return JSONResponse({"error": "too many concurrent sessions"}, status_code=503)
+        if self._closing:
+            # Shutdown began meanwhile: a stream opened now would never be closed.
+            await self._manager.end(session, reason=None)
+            return _shutting_down()
+        await self._manager.finish(session)
+        self._manager.opened(session)
         endpoint = f"{self._messages_path}?session_id={session_id}"
+        queue = session.stream
+        assert queue is not None
 
         async def stream() -> Any:
             try:
                 yield f"event: endpoint\ndata: {endpoint}\n\n"
                 while True:
                     try:
-                        item = await asyncio.wait_for(
-                            session.queue.get(), timeout=KEEPALIVE_SECONDS
-                        )
+                        item = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
                     except TimeoutError:
                         yield ": keep-alive\n\n"
                         continue
-                    if item is _CLOSE:
+                    if item is CLOSE_STREAM:
                         break
                     payload = json.dumps(item, ensure_ascii=False, default=str)
                     yield f"event: message\ndata: {payload}\n\n"
             finally:
-                self._sessions.pop(session_id, None)
-                # Calls still running for this session have nobody left to answer.
-                for task in list(session.tasks):
-                    task.cancel()
-                audit("session_close", session_id=session_id, client_id=client_id)
+                # Calls still running for this session have nobody left to
+                # answer, on any worker.  Detached: this stream's task may be
+                # cancelled at every await from now on.
+                reason = "shutdown" if self._closing else "stream_closed"
+                await self._manager.end(session, reason=reason, detach=True)
 
         return StreamingResponse(
             stream(),
@@ -249,78 +308,86 @@ class SSETransport(BaseHTTPTransport):
         if content_length and content_length.isdigit() and int(content_length) > max_bytes:
             return JSONResponse({"error": f"request exceeds {max_bytes} bytes"}, status_code=413)
 
-        session_id = request.query_params.get("session_id", "")
-        session = self._sessions.get(session_id)
-        if session is None:
+        # The stream's own worker knows the session; any other asks the store.
+        session = await self._manager.acquire(request.query_params.get("session_id", ""))
+        if session is Rejection.UNAVAILABLE:
+            return store_unavailable()
+        if isinstance(session, Rejection):
             return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
+        relaying = False
+        try:
+            # ... then enforce the cap while reading, since Content-Length can lie.
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    return JSONResponse(
+                        {"error": f"request exceeds {max_bytes} bytes"}, status_code=413
+                    )
 
-        # ... then enforce the cap while reading, since Content-Length can lie.
-        body = bytearray()
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > max_bytes:
+            # Re-authenticate every POST: the session must not be usable with a
+            # different (or missing) credential than it was opened with.
+            resolved = await self._resolve_identity(request, modern=False)
+            if isinstance(resolved, Response):
+                return resolved
+            identity = resolved
+            if not self._manager.binds(session, identity):
+                self._manager.credential_mismatch(session)
+                return JSONResponse({"error": "credential does not match session"}, status_code=403)
+
+            try:
+                message = json.loads(bytes(body).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 return JSONResponse(
-                    {"error": f"request exceeds {max_bytes} bytes"}, status_code=413
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": PARSE_ERROR, "message": "Parse error: invalid JSON"},
+                    },
+                    status_code=400,
                 )
 
-        # Re-authenticate every POST: the session must not be usable with a
-        # different (or missing) credential than it was opened with.
-        resolved = await self._resolve_identity(request, modern=False)
-        if isinstance(resolved, Response):
-            return resolved
-        identity = resolved
-        presented_fp = identity.fingerprint if identity else None
-        if presented_fp != session.identity_fp or token_principal(identity) != session.principal:
-            audit(
-                "session_credential_mismatch",
-                session_id=session_id,
-                client_id=session.context.client_id,
-            )
-            return JSONResponse({"error": "credential does not match session"}, status_code=403)
+            if self._closing:
+                # Checked after the last await: its stream may have closed
+                # already, and nothing would cancel the call.
+                return _shutting_down()
+            if session.ended:
+                # Its stream closed while the body was read: nothing would
+                # cancel the call (nor could a notifications/cancelled reach it).
+                return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
 
-        try:
-            message = json.loads(bytes(body).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return JSONResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": PARSE_ERROR, "message": "Parse error: invalid JSON"},
-                },
-                status_code=400,
-            )
-
-        if self._closing:
-            # Checked after the last await: its stream may have closed
-            # already, and nothing would cancel the call.
-            return _shutting_down()
-        if self._sessions.get(session_id) is not session:
-            # Its stream closed while the body was read: nothing would
-            # cancel the call (nor could a notifications/cancelled reach it).
-            return JSONResponse({"error": "unknown or expired session_id"}, status_code=404)
-
-        # Dispatch in the background and answer 202 now: the JSON-RPC response
-        # travels over the SSE stream, and holding this POST open would stall
-        # clients that send one message at a time (a notifications/cancelled
-        # could never overtake the slow call it targets).
-        info = self._transport_info(request, "sse")
-        # This POST's own identity: a refreshed or broader token takes effect
-        # at once, on the same stream.
-        context = self._server._request_context(session.context, identity)
-        task = asyncio.create_task(self._deliver(session, message, info, context=context))
-        session.tasks.add(task)
-        task.add_done_callback(session.tasks.discard)
-        return Response(status_code=202)
+            # Dispatch in the background and answer 202 now: the JSON-RPC
+            # response travels over the SSE stream, and holding this POST open
+            # would stall clients that send one message at a time (a
+            # notifications/cancelled could never overtake the slow call it
+            # targets).
+            info = self._transport_info(request, "sse")
+            # This POST's own identity: a refreshed or broader token takes
+            # effect at once, on the same stream.
+            context = self._manager.context(session, identity)
+            if session.owned:
+                work = self._deliver(session, message, info, context=context)
+            else:
+                # The stream is on another worker: the answer is relayed there.
+                work = self._relay(session, message, info, context=context)
+                relaying = True
+            task = asyncio.create_task(work)
+            session.tasks.add(task)
+            task.add_done_callback(session.tasks.discard)
+            return Response(status_code=202)
+        finally:
+            if not relaying:
+                await self._manager.finish(session)
 
     async def _deliver(
         self,
-        session: _Session,
+        session: LocalSession,
         message: Any,
         info: TransportInfo | None = None,
         *,
         context: ClientContext | None = None,
     ) -> None:
-        """Dispatch one message and queue its answer on the session's stream.
+        """Dispatch one message and queue its answer on the session's stream, held here.
 
         *context* is the message's own (the session's, with the identity its
         POST presented); by default the session's.
@@ -333,5 +400,75 @@ class SSETransport(BaseHTTPTransport):
             # copy: the session speaks that version from now on.
             if context.protocol_version != session.context.protocol_version:
                 session.context.protocol_version = context.protocol_version
-        if response is not None:
-            await session.queue.put(response)
+        version = _negotiated(message, response, context)
+        if version is not None:
+            # Other workers serving its messages read it from the store.
+            await self._manager.record_version(session, version)
+        if response is not None and session.stream is not None:
+            await session.stream.put(response)
+
+    async def _relay(
+        self,
+        session: LocalSession,
+        message: Any,
+        info: TransportInfo | None,
+        *,
+        context: ClientContext,
+    ) -> None:
+        """Dispatch one message here and send its answer to the worker holding the stream.
+
+        The session stays held until the answer is sent.  A request whose
+        dispatch shutdown stops is answered ``-32008`` (retry shortly), as
+        Streamable HTTP answers one: its client still listens on the stream.
+        A session's end, or a cancel from its client, leaves it unanswered.
+        """
+        version: str | None = None
+        # A task of its own, so shutdown can stop the dispatch alone.
+        work = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
+        session.dispatches.add(work)
+        try:
+            try:
+                response = await work
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if (task is not None and task.cancelling()) or not self._closing or session.ended:
+                    raise  # this relay was cancelled, not just its dispatch
+                response = _stopped(message)
+            version = _negotiated(message, response, context)
+            if response is not None:
+                await self._manager.relay(session, response, protocol_version=version)
+        except Exception:
+            # Nothing may be lost in this background task: the client waits for an answer.
+            error_id = uuid.uuid4().hex[:12]
+            self._server._logger.error(
+                "could not relay an answer error_id=%s", error_id, exc_info=True
+            )
+            if isinstance(message, dict) and "id" in message:
+                failed = {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "error": {
+                        "code": INTERNAL_ERROR,
+                        "message": f"Internal server error (error_id={error_id})",
+                    },
+                }
+                await self._manager.relay(session, failed, protocol_version=None)
+        finally:
+            session.dispatches.discard(work)
+            if not work.done():
+                work.cancel()  # the call must not outlive its relay
+            await self._manager.finish(session, protocol_version=version)
+
+
+def _negotiated(
+    message: Any, response: dict[str, Any] | None, context: ClientContext
+) -> str | None:
+    """The version a successful ``initialize`` negotiated; ``None`` for any other message."""
+    if (
+        isinstance(message, dict)
+        and message.get("method") == "initialize"
+        and response is not None
+        and "result" in response
+    ):
+        return context.protocol_version
+    return None
