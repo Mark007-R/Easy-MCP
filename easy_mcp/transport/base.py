@@ -48,11 +48,11 @@ class ClientContext:
     contexts of one channel share the same ``push`` (it is how the server
     tells channels apart), and ``session_id`` names the session the channel
     carries, uniquely.  ``None``: this channel cannot carry server-initiated
-    messages, so ``subscriptions/listen`` is unknown on it (``-32601``) and
-    it is never told that a list changed.  With ``push`` set and no
-    ``store_handle``, a successful ``initialize`` starts the session's
-    list-change notifications as ``dispatch`` returns its result, so send
-    that result before awaiting anything else.
+    messages, so a well-formed ``subscriptions/listen`` is unknown on it
+    (``-32601``) and it is never told that a list changed.  With ``push``
+    set and no ``store_handle``, a successful ``initialize`` starts the
+    session's list-change notifications as ``dispatch`` returns its result,
+    so send that result before awaiting anything else.
 
     ``multiplexed`` is true when every subscription of the context shares one
     channel (stdio, the legacy SSE stream): a subscription the server ends

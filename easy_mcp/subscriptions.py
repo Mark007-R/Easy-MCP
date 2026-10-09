@@ -112,6 +112,16 @@ def parse_filter(value: object) -> tuple[frozenset[str], bool]:
     return frozenset(kinds), bool(resources)
 
 
+def _digest_failed(kind: str) -> None:
+    error_id = uuid.uuid4().hex[:12]
+    logger.error(
+        "could not compute the %s list for a change notification error_id=%s",
+        kind,
+        error_id,
+        exc_info=True,
+    )
+
+
 def _tag(subscription_id: Any) -> dict[str, Any]:
     return {META_SUBSCRIPTION_ID: subscription_id}
 
@@ -255,23 +265,19 @@ class _Sink:
             try:
                 digest = self._notifier._digest(kind, self.identity)
             except Exception:
-                error_id = uuid.uuid4().hex[:12]
-                logger.error(
-                    "could not compute the %s list for a change notification error_id=%s",
-                    kind,
-                    error_id,
-                    exc_info=True,
-                )
+                _digest_failed(kind)
                 self._notifier.drop(self, "undeliverable")
                 return
             if self.baselines.get(kind) == digest:
                 continue
-            self.baselines[kind] = digest
             try:
                 self.push(list_changed_message(kind, self.subscription_id))
             except Exception:
+                # Not told: a stream that takes over from it (whose start the
+                # baselines are kept for) must still announce this change.
                 self._notifier.drop(self, "undeliverable")
                 return
+            self.baselines[kind] = digest
             logger.debug("told client %s that the %s list changed", self.client_id, kind)
 
     def _close(self) -> None:
@@ -327,6 +333,21 @@ class ChangeNotifier:
         self._channels: dict[Hashable, dict[tuple[str, Any], _Sink]] = {}
         self._per_client: collections.Counter[str] = collections.Counter()
         self._listens = 0
+
+    def baselines(self, kinds: Iterable[str], identity: ClientIdentity | None) -> dict[str, str]:
+        """The digest of each of *kinds* as *identity* sees it now.
+
+        A kind whose list cannot be computed is left out, and logged: its
+        recipient is not told about that list, rather than the handshake,
+        stream or listen that asked failing.
+        """
+        digests: dict[str, str] = {}
+        for kind in kinds:
+            try:
+                digests[kind] = self._digest(kind, identity)
+            except Exception:
+                _digest_failed(kind)
+        return digests
 
     # ------------------------------------------------------------ sessions
 
@@ -412,6 +433,9 @@ class ChangeNotifier:
     ) -> _Sink:
         """Register one listen stream; on its loop.
 
+        The sink's ``kinds`` are *kinds* less any whose list cannot be
+        computed (:meth:`baselines`): those it is never told about.
+
         Raises:
             ProtocolError: ``-32600``: *subscription_id* is open on *channel*
                 already.
@@ -421,7 +445,8 @@ class ChangeNotifier:
         """
         key = _subscription_key(subscription_id)
         # What the client is told about from now on is measured from here.
-        baselines = {kind: self._digest(kind, identity) for kind in kinds}
+        baselines = self.baselines(kinds, identity)
+        kinds = frozenset(baselines)
         sink = _Sink(
             self,
             key=key,

@@ -368,15 +368,19 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   since clients may cache `server/discover` for an hour.
 - `GET /mcp` without a session id, or with a `2026-07-28`
   `MCP-Protocol-Version`, still answers `405`; its `Allow` header now lists
-  `GET`.
+  `GET`. `HEAD /mcp` still answers `405`, with or without a session id.
 - Clients that open a `GET /mcp` or `subscriptions/listen` stream hold a
   long-lived connection. `server.run()` closes these streams as shutdown
   begins, as it does legacy SSE streams. Serving `build_app()` with your own
   uvicorn needs `--timeout-graceful-shutdown`, as with legacy SSE clients.
+  A client that stops reading any of these streams still holds shutdown up
+  once its connection's buffers are full, and list changes can now fill
+  them; a second Ctrl-C ends the wait.
 - `subscriptions/listen` without the stateless `_meta` is answered `-32602`
-  instead of `-32601`, as `server/discover` is: the method exists only in the
-  stateless revision. On a channel that cannot carry server-initiated
-  messages (`ClientContext.push` unset) it is still `-32601`.
+  instead of `-32601` on every channel, as `server/discover` is: the method
+  exists only in the stateless revision. A listen that carries the stateless
+  `_meta` on a channel that cannot carry server-initiated messages
+  (`ClientContext.push` unset) is still `-32601`.
 - `ClientContext` compares and hashes by identity, and can be weakly
   referenced.
 

@@ -29,7 +29,7 @@ import json
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -48,6 +48,7 @@ from ..store.base import (
     session_ref,
 )
 from . import _bus
+from ._outbox import coalesce_key
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -116,7 +117,8 @@ class LocalSession:
     requests of the session this worker is serving.  ``opened`` is set once
     its handshake has succeeded here.  ``owned`` marks the session whose
     stream this worker holds, and ``stream`` is the queue of what that
-    stream sends.  ``notify_stream`` is a Streamable HTTP session's
+    stream sends; the server's own messages go there through :meth:`push`.
+    ``notify_stream`` is a Streamable HTTP session's
     ``GET /mcp`` stream, when this worker holds it; it holds one of
     ``active`` while open, so the session neither expires nor is forgotten
     here meanwhile.
@@ -136,12 +138,37 @@ class LocalSession:
     # Background work for it: legacy SSE dispatches and relays.
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     stream: asyncio.Queue[Any] | None = None
+    # The change notifications waiting in stream, by what they coalesce by.
+    waiting: set[Hashable] = field(default_factory=set)
     # The transport's own object, with a close(reason) method.
     notify_stream: Any = None
 
     @property
     def in_flight(self) -> _InFlight:
         return cast(_InFlight, self.context.in_flight)
+
+    def push(self, message: dict[str, Any]) -> None:
+        """Queue a message of the server's own on the stream held here.
+
+        A change notification already waiting there (the same list, for the
+        same subscription) is not queued again: each only tells the client
+        to fetch the list, so a client that stops reading cannot grow a
+        backlog of them.
+        """
+        assert self.stream is not None
+        key = coalesce_key(message)
+        if key is not None:
+            if key in self.waiting:
+                return
+            self.waiting.add(key)
+        self.stream.put_nowait(message)
+
+    def taken(self, item: Any) -> None:
+        """The stream took *item* from its queue, to write it."""
+        if isinstance(item, dict):
+            key = coalesce_key(item)
+            if key is not None:
+                self.waiting.discard(key)
 
     def stop_work(self) -> None:
         """Cancel every call of the session on this worker, those yet to start included."""
@@ -486,7 +513,7 @@ class SessionManager:
             return
         self._server._watch_session(
             local.session_id,
-            push=local.stream.put_nowait,
+            push=local.push,
             identity=identity,
             client_id=local.record.client_id,
             multiplexed=True,

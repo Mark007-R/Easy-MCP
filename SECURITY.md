@@ -56,7 +56,7 @@ Consequences:
 | Protocol-stream corruption (stdio) | `sys.stdout` is redirected to stderr while serving, so tool `print()` calls cannot inject bytes into the JSON-RPC stream; oversized input lines are discarded unbuffered |
 | Silent auth downgrade (stdio) | An invalid `EASY_MCP_STDIO_API_KEY` aborts startup instead of falling back to anonymous access |
 | Change notifications revealing hidden tools | A client is told about a list change only when the list it may see changed: each recipient compares a digest of exactly what `tools/list` returns to its credential (on a session, its latest request's) with what it was last told. Notifications carry no names, so even a visible change reveals only "your list changed", which the next `tools/list` shows anyway |
-| Stream exhaustion | `subscriptions/listen`: 8 streams per client and `max_sessions` per process, each opening one rate-limit unit, refused with `-32007` (HTTP 503) beyond; `GET /mcp`: one stream per session (a new one replaces the old) and one rate-limit unit per open, with sessions capped by `max_sessions`. Queued notifications coalesce, so a client that stops reading cannot grow a backlog; keep-alives every 15 s find dead peers, and a stream opened with an OAuth token ends when the token expires |
+| Stream exhaustion | `subscriptions/listen`: 8 streams per client and `max_sessions` per process, each opening one rate-limit unit, refused with `-32007` (HTTP 503) beyond; `GET /mcp`: one stream per session (a new one replaces the old) and one rate-limit unit per open, with sessions capped by `max_sessions`. Change notifications waiting to be written coalesce on every stream (`GET /mcp`, listen streams, legacy `/sse`), so a client that stops reading cannot grow a backlog of them (on `/sse`, answers to its own requests still queue); keep-alives every 15 s find dead peers, and a stream opened with an OAuth token ends when the token expires |
 | Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
 
@@ -279,6 +279,14 @@ the client is untrusted, the credential in the environment is trusted.
   pipe buffer is full, as it always has: responses and notifications share
   the pipe. Notifications are rate-bounded (one per list per 0.1 s at most)
   and do not make this worse in practice.
+- **An HTTP client that stops reading its stream holds up `server.run()`'s
+  shutdown** once the connection's buffers are full: what the server has yet
+  to send keeps the connection open, and uvicorn waits for every connection
+  to close, until the client reads or disconnects. This holds for legacy
+  `/sse`, `GET /mcp` and listen streams alike, and list changes can fill the
+  buffers without the client sending anything. A second Ctrl-C (a forced
+  exit) ends the wait; under your own uvicorn, `--timeout-graceful-shutdown`
+  bounds it.
 - **API keys are static bearer secrets.** Rotate them by redeploying with new
   values; for rotating, audience-bound credentials use `oauth=`.
 - **A JWT access token stays valid until it expires, even if it is revoked.**

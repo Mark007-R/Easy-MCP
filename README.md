@@ -312,8 +312,9 @@ Open the stream before listing tools, so no change falls in between:
 Notifications carry no tool names and respect permissions: a change to a tool
 a client cannot see is not announced to it, and neither is a tool added and
 removed again. Changes within 0.1 s are combined. A client may hold 8 listen
-streams at once, and `max_sessions` caps them across the server (`-32007`,
-HTTP `503`, beyond either). Opening a listen or `GET` stream costs one request
+streams at once in each process (each worker), and `max_sessions` caps them
+in each process, even with a shared store (`-32007`, HTTP `503`, beyond
+either). Opening a listen or `GET` stream costs one request
 of the rate-limit budget; what the server sends on it costs nothing.
 
 A custom transport takes part by setting `ClientContext.push` (how the server
@@ -384,7 +385,8 @@ No sticky routing is needed. With the store in place:
   worker holds;
 - `max_calls_per_session`, rate limits and `max_sessions` count across all
   workers together (`max_sessions` still separately for Streamable HTTP and
-  legacy SSE).
+  legacy SSE; as the cap on `subscriptions/listen` streams it counts per
+  worker).
 
 Some things stay with one worker: a running call, an open stream,
 `max_sync_workers`, timeouts, and tools registered at runtime (registering

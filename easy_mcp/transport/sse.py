@@ -16,7 +16,9 @@ Flow:
    client ends a listen with ``notifications/cancelled``, and the server
    ends one with its result followed by ``notifications/cancelled``.  With
    a shared store, only the worker holding the stream serves such a listen;
-   another answers ``-32601``.
+   another answers ``-32601``.  A change notification still waiting to be
+   written is not queued again, so a client that stops reading cannot grow
+   a backlog of them.
 
 Security handled here (before anything reaches the dispatcher):
 
@@ -284,7 +286,7 @@ class SSETransport(BaseHTTPTransport):
         assert queue is not None
         # The stream is the session's channel for the server's own messages
         # too: list changes, and subscriptions/listen streams.
-        session.context.push = queue.put_nowait
+        session.context.push = session.push
         session.context.multiplexed = True
 
         async def stream() -> Any:
@@ -298,6 +300,7 @@ class SSETransport(BaseHTTPTransport):
                         continue
                     if item is CLOSE_STREAM:
                         break
+                    session.taken(item)
                     yield sse_event(item)
             finally:
                 # Calls still running for this session have nobody left to

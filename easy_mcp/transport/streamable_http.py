@@ -438,7 +438,17 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return await self._handle_post(request)
         if request.method == "DELETE":
             return await self._handle_delete(request)
-        return await self._handle_get(request)
+        if request.method == "GET":
+            return await self._handle_get(request)
+        # HEAD, which Starlette routes wherever GET goes: a stream opened for
+        # it would replace the session's own, and its body is never sent.
+        return rpc_error(
+            405,
+            INVALID_REQUEST,
+            f"Method Not Allowed: {request.method}; GET opens a session's stream, "
+            "POST sends JSON-RPC messages",
+            headers={"Allow": "GET, POST, DELETE"},
+        )
 
     async def _handle_get(self, request: Request) -> Response:
         """Open a session's notification stream.
@@ -972,13 +982,17 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 await self._manager.end(session, reason=None)
                 session.active -= 1
             else:
-                # What its client is about to see, which the session's GET
-                # stream, on whichever worker it opens, compares lists with.
-                baselines = self._server._list_baselines(session.context.identity)
-                await self._manager.save_baselines(session, baselines)
-                await self._manager.finish(
-                    session, protocol_version=session.context.protocol_version
-                )
+                try:
+                    # What its client is about to see, which the session's GET
+                    # stream, on whichever worker it opens, compares lists with.
+                    baselines = self._server._list_baselines(session.context.identity)
+                    await self._manager.save_baselines(session, baselines)
+                finally:
+                    # Whatever became of that, the handshake's hold ends, or
+                    # the session could never expire.
+                    await self._manager.finish(
+                        session, protocol_version=session.context.protocol_version
+                    )
         if response is None:
             return Response(status_code=202)
         if "error" in response:

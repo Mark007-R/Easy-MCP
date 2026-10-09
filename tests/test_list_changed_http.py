@@ -232,6 +232,40 @@ def test_get_with_stateless_version_header_is_405(live_server: LiveServer) -> No
         assert "GET" in response.headers["allow"]
 
 
+def test_head_is_405(live_server: LiveServer) -> None:
+    base = live_server(make_server())
+    with httpx.Client(base_url=base, timeout=10) as client:
+        response = client.head("/mcp", headers=STREAM)
+        assert response.status_code == 405
+        assert response.headers["allow"] == "GET, POST, DELETE"
+
+
+async def test_head_with_a_session_opens_no_stream(
+    live_server: LiveServer, fast_debounce: float, logs: LogCapture
+) -> None:
+    server = make_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        stream = await get_stream(client, session)
+        # One connection, kept alive: what follows the HEAD is served on it.
+        limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
+        async with httpx.AsyncClient(base_url=base, timeout=3, limits=limits) as other:
+            head = await other.head("/mcp", headers={**STREAM, "MCP-Session-Id": session})
+            assert head.status_code == 405
+            assert head.headers["allow"] == "GET, POST, DELETE"
+            ping = await other.post(
+                "/mcp", json=rpc("ping", msg_id=2), headers={**ACCEPT, "MCP-Session-Id": session}
+            )
+            assert ping.status_code == 200
+        # The session's stream is still the one its client opened.
+        register(server)
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.aclose()
+    await until(lambda: bool(logs.events("stream_close")))
+    assert [event["reason"] for event in logs.events("stream_close")] == ["client_closed"]
+
+
 async def test_get_needs_event_stream_accept(live_server: LiveServer) -> None:
     base = live_server(make_server())
     async with httpx.AsyncClient(base_url=base, timeout=10) as client:
@@ -369,6 +403,86 @@ async def test_get_is_rate_limited(live_server: LiveServer, logs: LogCapture) ->
         assert refused.json()["error"]["code"] == RATE_LIMITED
         await stream.aclose()
     assert [event["method"] for event in logs.events("rate_limited")] == ["GET /mcp"]
+
+
+async def test_a_change_a_closing_stream_could_not_send_is_told_on_the_next(
+    live_server: LiveServer, logs: LogCapture
+) -> None:
+    server = make_server()
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        first = await get_stream(client, session)
+        local = transport._sessions[session]
+        notify = local.notify_stream
+        sink = notify.sink
+        done = threading.Event()
+
+        def expire_with_a_change_due() -> None:
+            # The token's timer closes the stream, and a change's flush runs
+            # before the stream's end is handled.
+            notify.close("token_expired")
+            register(server)
+            sink.deliver(["tools"])
+            done.set()
+
+        sink.loop.call_soon_threadsafe(expire_with_a_change_due)
+        assert await asyncio.to_thread(done.wait, 5)
+        await first.end()
+        await first.aclose()
+        # Its end recorded what it told, then let the session go.
+        await until(lambda: bool(logs.events("stream_close")) and local.active == 0)
+        second = await get_stream(client, session)
+        assert await second.next() == TOOLS_CHANGED
+        await second.aclose()
+
+
+async def test_http_handshake_with_keys_of_mixed_types(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    server = make_server(max_sessions=1)
+
+    # JSON keys are strings: a client reads this example's 0 as "0".
+    @server.tool(examples=[{"arguments": {"weights": {0: 0.5, "default": 1.0}}}])
+    def weigh(weights: dict[str, float]) -> float:
+        """Weigh things."""
+        return sum(weights.values())
+
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        stream = await get_stream(client, session)
+        register(server)
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.aclose()
+
+
+async def test_a_list_that_cannot_be_digested_holds_no_session_slot(
+    live_server: LiveServer, monkeypatch: pytest.MonkeyPatch, logs: LogCapture
+) -> None:
+    def undigestible(self: MCPServer, kind: str, identity: Any) -> str:
+        raise TypeError("cannot digest this list")
+
+    # Before the server exists, so its notifier digests with it too.
+    monkeypatch.setattr(MCPServer, "_list_digest", undigestible)
+    server = make_server(max_sessions=1)
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        for _ in range(2):  # the one slot is free again each time
+            session = await initialize(client)
+            assert transport._sessions[session].active == 0
+            # Its stream opens, though no change can be told on it, and a
+            # new one still replaces it.
+            first = await get_stream(client, session)
+            second = await get_stream(client, session)
+            await first.end()
+            await first.aclose()
+            await second.aclose()
+            deleted = await client.delete("/mcp", headers={"MCP-Session-Id": session})
+            assert deleted.status_code == 204
+    assert "could not compute the tools list" in logs.text
 
 
 async def test_post_responses_stay_json(live_server: LiveServer, fast_debounce: float) -> None:
@@ -570,6 +684,47 @@ async def test_sse_session_receives_list_changed_after_initialize(
         await opened.quiet(0.1)
         register(server)
         assert await opened.next() == TOOLS_CHANGED
+        await opened.aclose()
+
+
+async def test_sse_change_notifications_coalesce_until_written(live_server: LiveServer) -> None:
+    server = make_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        opened = await open_stream(client, "GET", "/sse")
+        assert isinstance(opened, Stream)
+        endpoint = await opened.next()
+        await client.post(endpoint, json=rpc("initialize", INIT))
+        await opened.next()
+        # Three subscriptions on the session's stream: 1 and 1.0 are two.
+        for msg_id in ("a", 1, 1.0):
+            await client.post(endpoint, json=listen(msg_id, toolsListChanged=True))
+            await opened.next()
+        notifier = server._notifier
+        sinks = [*notifier._sessions.values()]
+        sinks += [sink for streams in notifier._channels.values() for sink in streams.values()]
+        assert len(sinks) == 4
+        done = threading.Event()
+
+        def two_changes_before_the_stream_writes() -> None:
+            for name in ("one", "two"):
+                register(server, name)
+                for sink in sinks:
+                    sink.deliver(["tools"])
+            done.set()
+
+        sinks[0].loop.call_soon_threadsafe(two_changes_before_the_stream_writes)
+        assert await asyncio.to_thread(done.wait, 5)
+        frames = [await opened.next() for _ in range(4)]
+        await opened.quiet()
+        assert {frame["method"] for frame in frames} == {"notifications/tools/list_changed"}
+        tags = [frame.get("params", {}).get("_meta", {}).get(TAG) for frame in frames]
+        assert [(type(tag), tag) for tag in tags] == [
+            (type(None), None),
+            (str, "a"),
+            (int, 1),
+            (float, 1.0),
+        ]
         await opened.aclose()
 
 

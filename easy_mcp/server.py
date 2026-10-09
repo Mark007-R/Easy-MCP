@@ -1510,7 +1510,11 @@ class MCPServer:
                 self._digests.move_to_end(key)
                 return cached[1]
         version, entries = self._list_entries(kind, identity)
-        canonical = json.dumps(entries, sort_keys=True, separators=(",", ":"), default=str)
+        # The list as its clients read it: encoded as tools/list is (str()
+        # for what JSON has no type for, every key a string, so keys of
+        # mixed types can be sorted), then in canonical form.
+        parsed = json.loads(json.dumps(entries, default=str))
+        canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode("utf-8", "surrogatepass")).hexdigest()[:32]
         with self._digests_lock:
             self._digests[key] = (version, digest)
@@ -1520,8 +1524,13 @@ class MCPServer:
         return digest
 
     def _list_baselines(self, identity: ClientIdentity | None) -> dict[str, str]:
-        """The digest of every announced list as *identity* sees it now."""
-        return {kind: self._list_digest(kind, identity) for kind in self._list_kinds()}
+        """The digest of every announced list as *identity* sees it now.
+
+        A list whose digest cannot be computed is left out, and logged: its
+        recipient is not told about that list, rather than the handshake or
+        stream that asked failing.
+        """
+        return self._notifier.baselines(self._list_kinds(), identity)
 
     def _watch_session(
         self,
@@ -1540,7 +1549,8 @@ class MCPServer:
         last told the lists hold; by default the lists as they are now, which
         is right just before its ``initialize`` result is sent (its client
         lists after that).  A list that differs from its baseline is
-        announced at once.
+        announced at once.  A list whose digest cannot be computed is not
+        watched (:meth:`_list_baselines`).
         """
         current = self._list_baselines(identity)
         sink = self._notifier.watch_session(
@@ -1598,7 +1608,8 @@ class MCPServer:
             )
         requested, _ = parse_filter(request._params.get("notifications"))
         # Kinds the server does not announce, and resourceSubscriptions, are
-        # left out of the acknowledgment and never sent.
+        # left out of the acknowledgment and never sent; so is a list whose
+        # digest cannot be computed (the sink's kinds).
         kinds = requested & frozenset(self._list_kinds())
         sink = self._notifier.open(
             channel=push,
@@ -1614,7 +1625,7 @@ class MCPServer:
         # In the same step as the registration, and flushes run only from
         # loop callbacks: the acknowledgment is the stream's first frame.
         try:
-            push(ack_message(msg_id, kinds))
+            push(ack_message(msg_id, sink.kinds))
         except Exception:
             self._notifier.drop(sink, "undeliverable")
             raise
@@ -1622,7 +1633,7 @@ class MCPServer:
             "subscription_open",
             client_id=context.client_id,
             subscription_id=msg_id,
-            kinds=sorted(kinds),
+            kinds=sorted(sink.kinds),
         )
         timer: asyncio.TimerHandle | None = None
         deadline = self._stream_deadline(context.identity)

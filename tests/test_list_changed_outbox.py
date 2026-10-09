@@ -18,6 +18,7 @@ from easy_mcp.transport._outbox import (
     stream_events,
 )
 
+TAG = "io.modelcontextprotocol/subscriptionId"
 TOOLS = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
 PROMPTS = {"jsonrpc": "2.0", "method": "notifications/prompts/list_changed"}
 
@@ -39,6 +40,25 @@ async def test_change_notifications_coalesce_until_written() -> None:
     assert taken == [ack, TOOLS, PROMPTS, updated("a"), updated("b"), result, result]
     outbox.put(TOOLS)  # written already: a new change queues again
     assert await outbox.get(1) == TOOLS
+
+
+def tagged(subscription_id: Any) -> dict[str, Any]:
+    return {
+        **TOOLS,
+        "params": {"_meta": {TAG: subscription_id}},
+    }
+
+
+async def test_notifications_of_different_subscriptions_never_coalesce() -> None:
+    # One channel may carry several subscriptions (stdio, legacy SSE): each
+    # must hear of its own change.  1, 1.0 and "1" name three of them.
+    outbox = Outbox()
+    for message in (tagged("a"), tagged("a"), tagged(1), tagged(1.0), tagged("1"), TOOLS, TOOLS):
+        outbox.put(message)
+    taken = [await outbox.get(1) for _ in range(len(outbox))]
+    assert taken == [tagged("a"), tagged(1), tagged(1.0), tagged("1"), TOOLS]
+    tags = [message.get("params", {}).get("_meta", {}).get(TAG) for message in taken]
+    assert [type(tag) for tag in tags] == [str, int, float, str, type(None)]
 
 
 async def test_get_times_out_for_a_keep_alive_and_ends_once_closed_and_empty() -> None:

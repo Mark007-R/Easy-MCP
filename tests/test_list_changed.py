@@ -381,6 +381,22 @@ async def test_failing_push_drops_the_recipient(fast_debounce: float) -> None:
     assert server._notifier.session("session-1") is None
 
 
+async def test_a_change_that_could_not_be_sent_is_not_recorded_as_told() -> None:
+    server = make_server()
+    pushed = Pushed()
+    context = await initialized(server, pushed)
+    sink = server._notifier.session(context.session_id)
+    assert sink is not None
+    told = dict(sink.baselines)
+    pushed.explode = True  # its channel has closed
+    register(server)
+    sink.deliver(["tools"])
+    assert pushed.calls == 1
+    # Nothing reached the client: what it was last told is what it was.
+    assert sink.baselines == told
+    assert server._notifier.session(context.session_id) is None
+
+
 async def test_two_contexts_on_two_loops(fast_debounce: float) -> None:
     server = make_server()
     here = Pushed()
@@ -593,6 +609,37 @@ async def test_client_cancel_ends_the_subscription_silently(fast_debounce: float
     assert await server.dispatch(cancel, context) is None
     assert await task is None
     await settle(fast_debounce)
+    assert pushed.methods() == ["notifications/subscriptions/acknowledged"]
+    assert server._notifier.count() == 0
+
+
+async def test_a_cancel_handled_as_a_flush_falls_due_stops_the_flush(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = 0.05
+    monkeypatch.setattr(easy_mcp.subscriptions, "LIST_CHANGED_DEBOUNCE_SECONDS", window)
+    server = make_server()
+    pushed = Pushed()
+    context = make_context(push=pushed, multiplexed=True)
+    task = await open_listen(server, context, pushed, "listen-1", toolsListChanged=True)
+    register(server)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)  # the change's window is open: its flush is timed
+    cancel = notification("notifications/cancelled", {"requestId": "listen-1"})
+
+    def handle_cancel() -> None:
+        # To the end without suspending, as a transport task's first step
+        # handles a cancel (a task of its own would let the flush run first).
+        coro = server.dispatch(cancel, context)
+        with pytest.raises(StopIteration) as stopped:
+            coro.send(None)
+        assert stopped.value.value is None
+
+    loop = asyncio.get_running_loop()
+    loop.call_at(loop.time() + window / 5, handle_cancel)
+    time.sleep(0.2)  # the cancel and the flush fall due in the same loop iteration
+    await asyncio.sleep(0.1)
+    assert await task is None
     assert pushed.methods() == ["notifications/subscriptions/acknowledged"]
     assert server._notifier.count() == 0
 
@@ -854,3 +901,82 @@ async def test_subscription_lifecycle_is_audited(fast_debounce: float, logs: Log
     ]
     assert [event["reason"] for event in logs.events("subscription_refused")] == ["server_limit"]
     assert logs.events("request_cancelled") == []
+
+
+# ----------------------------------------------------------------- digests
+
+# Keys of two types: JSON has string keys only, so a client reads both as strings.
+WEIGHTS = {0: 0.5, "default": 1.0}
+BONUS = {1: 2.0, "base": 1.0}
+
+
+def mixed_keys_server(weights: dict[Any, float], bonus: dict[Any, float]) -> MCPServer:
+    """A server whose tools/list entries hold dicts with keys of mixed types."""
+    server = make_server()
+
+    # Examples are sent as given.
+    @server.tool(examples=[{"arguments": {"weights": weights}}])
+    def weigh(weights: dict[str, float]) -> float:
+        """Weigh things."""
+        return sum(weights.values())
+
+    # A default JSON can encode is advertised in inputSchema.
+    def score(bonus: dict[str, float] = bonus) -> float:
+        """Score with a bonus."""
+        return sum(bonus.values())
+
+    server.register_tool(score)
+    return server
+
+
+async def test_keys_of_mixed_types_are_digested_as_clients_read_them(
+    fast_debounce: float,
+) -> None:
+    server = mixed_keys_server(WEIGHTS, BONUS)
+    pushed = Pushed()
+    context = await initialized(server, pushed)  # the handshake takes a digest
+    listed = await server.dispatch(rpc("tools/list", msg_id=2), context)
+    assert listed is not None
+    assert {tool["name"] for tool in listed["result"]["tools"]} == {"add", "score", "weigh"}
+    task = await open_listen(server, context, pushed, "listen-1", toolsListChanged=True)
+    assert pushed.frames[0]["params"]["notifications"] == {"toolsListChanged": True}
+    register(server)
+    await pushed.wait_for(3)
+    assert (
+        sorted(frame["method"] for frame in pushed.frames[1:])
+        == ["notifications/tools/list_changed"] * 2
+    )
+    server.close_subscriptions(context)
+    assert await task is None
+    # The same lists with string keys are the same lists to a client.
+    as_read = mixed_keys_server(
+        {str(key): value for key, value in WEIGHTS.items()},
+        {str(key): value for key, value in BONUS.items()},
+    )
+    register(as_read)
+    assert as_read._list_digest("tools", None) == server._list_digest("tools", None)
+
+
+async def test_a_list_that_cannot_be_digested_leaves_handshake_and_listen_working(
+    monkeypatch: pytest.MonkeyPatch, fast_debounce: float, logs: LogCapture
+) -> None:
+    def undigestible(self: MCPServer, kind: str, identity: ClientIdentity | None) -> str:
+        raise TypeError("cannot digest this list")
+
+    # Before the server exists, so its notifier digests with it too.
+    monkeypatch.setattr(MCPServer, "_list_digest", undigestible)
+    server = make_server()
+    pushed = Pushed()
+    context = await initialized(server, pushed)
+    listed = await server.dispatch(rpc("tools/list", msg_id=2), context)
+    assert listed is not None and [tool["name"] for tool in listed["result"]["tools"]] == ["add"]
+    task = await open_listen(server, context, pushed, "listen-1", toolsListChanged=True)
+    # The listen honors no list it cannot follow, and says so.
+    assert pushed.frames[0]["params"]["notifications"] == {}
+    register(server)
+    await settle(fast_debounce)
+    assert len(pushed.frames) == 1
+    server.close_subscriptions(context)
+    assert await task is None
+    assert "could not compute the tools list" in logs.text
+    assert "error_id=" in logs.text

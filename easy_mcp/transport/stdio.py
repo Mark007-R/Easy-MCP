@@ -37,6 +37,7 @@ client, one process, and no network dependency for a desktop host.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import secrets
@@ -48,6 +49,7 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
 from ..logging import audit
 from ..middleware import TransportInfo
+from ..protocol import ACKNOWLEDGED_METHOD
 from ..store.base import session_ref
 from .base import ClientContext, Transport
 
@@ -145,17 +147,29 @@ class StdioTransport(Transport):
 
         session_id = "stdio-" + secrets.token_urlsafe(12)
         client_id = identity.fingerprint if identity else "stdio"
+        loop = asyncio.get_running_loop()
+        closing = False
+
+        def push(message: dict[str, Any]) -> None:
+            self._write(message)
+            if closing and message.get("method") == ACKNOWLEDGED_METHOD:
+                # A listen acknowledged once serving began to end (its line
+                # came with the end of input, or middleware held it): it ends
+                # at once, gracefully, rather than holding the drain.
+                loop.call_soon(
+                    functools.partial(server.close_subscriptions, context, reason="shutdown")
+                )
+
         # stdout carries the server's own messages too (list changes, listen
         # streams), one line each, between the responses.
         context = ClientContext(
             client_id=client_id,
             session_id=session_id,
             identity=identity,
-            push=self._write,
+            push=push,
             multiplexed=True,
         )
 
-        loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Any] = asyncio.Queue()
         self._loop = loop
         self._queue = queue
@@ -200,7 +214,9 @@ class StdioTransport(Transport):
                 task.add_done_callback(in_flight.discard)
         finally:
             # Open listen streams get their result and cancel lines now, and
-            # their requests return at once rather than holding the drain.
+            # their requests return at once rather than holding the drain;
+            # so do those acknowledged from now on (push).
+            closing = True
             server.close_subscriptions(context, reason="shutdown")
             await self._drain(in_flight)
             # Daemon threads die with the process, cancel callbacks included.

@@ -3,11 +3,12 @@
 An :class:`Outbox` holds what the server pushes for one stream (a
 Streamable HTTP session's ``GET /mcp`` stream, or the response stream of one
 ``subscriptions/listen`` request) until the stream writes it.  List-change
-notifications coalesce: a second one for the same list before the first is
-written adds nothing, since each only tells the client to fetch the list
-again.  So a stream's backlog stays bounded by the number of lists (plus the
-acknowledgment and the final result of a listen), however slowly its client
-reads.
+notifications coalesce: a second one for the same list (and subscription)
+before the first is written adds nothing, since each only tells the client
+to fetch the list again.  So a stream's backlog stays bounded by the number
+of lists (plus the acknowledgment and the final result of a listen), however
+slowly its client reads.  The legacy SSE stream, whose queue also carries
+responses, coalesces by the same :func:`coalesce_key`.
 
 :class:`EventStreamResponse` serves such a stream and runs its ``on_close``
 however the stream ends, even when the client left before the first byte.
@@ -24,7 +25,7 @@ from typing import Any
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from ..protocol import LIST_KINDS
+from ..protocol import LIST_KINDS, META_SUBSCRIPTION_ID
 
 # How long a stream may stay silent before it sends an SSE comment, which
 # keeps proxies from closing it and finds dead peers.
@@ -41,17 +42,26 @@ class ChannelClosed(Exception):
     """The stream behind an outbox has ended: it takes no more messages."""
 
 
-def _coalesce_key(message: dict[str, Any]) -> Hashable | None:
-    """What *message* coalesces by: ``(method, uri)`` for a change notification, else ``None``."""
+def coalesce_key(message: dict[str, Any]) -> Hashable | None:
+    """What *message* coalesces by, if it is a change notification: else ``None``.
+
+    Its method, the subscription it is tagged with (one channel may carry
+    several), and for a resource update its uri.
+    """
     method = message.get("method")
     if "id" in message or not isinstance(method, str):
         return None
+    params = message.get("params")
+    params = params if isinstance(params, dict) else {}
+    meta = params.get("_meta")
+    tag = meta.get(META_SUBSCRIPTION_ID) if isinstance(meta, dict) else None
+    # By type as well as value, so 1, 1.0 and "1" are three subscriptions.
+    subscription = (type(tag).__name__, tag)
     if method in _LIST_CHANGED:
-        return method, None
+        return method, subscription
     if method == _RESOURCE_UPDATED:
-        params = message.get("params")
-        uri = params.get("uri") if isinstance(params, dict) else None
-        return (method, uri) if isinstance(uri, str) else None
+        uri = params.get("uri")
+        return (method, subscription, uri) if isinstance(uri, str) else None
     return None
 
 
@@ -79,7 +89,7 @@ class Outbox:
         """
         if self._closed:
             raise ChannelClosed
-        key = _coalesce_key(message)
+        key = coalesce_key(message)
         if key is not None:
             if key in self._keys:
                 return  # one is waiting already, and says the same

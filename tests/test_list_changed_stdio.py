@@ -164,6 +164,57 @@ async def test_stdio_eof_closes_subscriptions_promptly() -> None:
     }
 
 
+async def test_stdio_listen_racing_the_end_of_input_still_gets_its_final_frames() -> None:
+    server = make_server()
+    line = json.dumps(listen(7, toolsListChanged=True)).encode() + b"\n"
+    stdout = io.BytesIO()
+    transport = StdioTransport(server, stdin=io.BytesIO(line), stdout=stdout, shutdown_timeout=5.0)
+    started = time.monotonic()
+    serving = asyncio.create_task(transport.serve())
+    await asyncio.sleep(0)  # serving: its reader reads the line, then the end of input
+    # The loop, held up meanwhile, takes both in one go: the listen is
+    # dispatched only once serving has begun to end.
+    time.sleep(0.2)
+    await asyncio.wait_for(serving, 10)
+    assert time.monotonic() - started < 2.0
+    lines = [json.loads(raw) for raw in stdout.getvalue().splitlines()]
+    assert [line.get("method") for line in lines] == [
+        "notifications/subscriptions/acknowledged",
+        None,
+        "notifications/cancelled",
+    ]
+    assert lines[1]["id"] == 7 and lines[1]["result"]["resultType"] == "complete"
+    assert lines[2]["params"] == {
+        "requestId": 7,
+        "reason": "server shutting down",
+        "_meta": {TAG: 7},
+    }
+
+
+async def test_stdio_handshake_with_keys_of_mixed_types(fast_debounce: float) -> None:
+    server = make_server()
+
+    # JSON keys are strings: a client reads this example's 0 as "0".
+    @server.tool(examples=[{"arguments": {"weights": {0: 0.5, "default": 1.0}}}])
+    def weigh(weights: dict[str, float]) -> float:
+        """Weigh things."""
+        return sum(weights.values())
+
+    session = Session(server)
+    session.stdin.send(rpc("initialize", INIT))
+    answer = (await session.wait_for(1))[0]
+    assert answer["result"]["capabilities"] == {"tools": {"listChanged": True}}, answer
+    session.stdin.send(rpc("tools/list", msg_id=2))
+    listed = (await session.wait_for(2))[1]
+    assert [tool["name"] for tool in listed["result"]["tools"]] == ["slow_echo", "weigh"]
+    register(server)
+    assert (await session.wait_for(3))[2] == {
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    }
+    assert len(await session.finish()) == 3
+
+
 async def test_stdio_lines_stay_whole_under_concurrent_writes(fast_debounce: float) -> None:
     server = make_server()
     session = Session(server)
