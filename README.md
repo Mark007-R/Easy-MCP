@@ -49,6 +49,10 @@ locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 Several worker processes sharing sessions and limits need Redis:
 `pip install "easy-mcp-kit[redis]"` (see
 [Running several workers](#running-several-workers)).
+`pip install "easy-mcp-kit[otel]"` adds the OpenTelemetry API, for traces
+(see [Traces and metrics](#traces-and-metrics)). Optional extras:
+`[pydantic]`, `[postgres]`, `[mysql]`, `[mongodb]`, `[oauth]`, `[redis]`,
+`[otel]`.
 
 ## Why easy_mcp?
 
@@ -65,6 +69,7 @@ Several worker processes sharing sessions and limits need Redis:
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
 | Several workers | `store=RedisStore.from_env()` | Sessions, call caps and rate limits shared between processes, no sticky routing |
 | Policy & telemetry | `@server.middleware`, `@server.tool_middleware` | Hooks around every request and tool call, after the built-in checks; refuse with an exception |
+| Observability | Nothing (or `metrics=True`) | OpenTelemetry spans per request with the MCP semantic conventions; Prometheus `/metrics` |
 | Errors | Just `raise` | Clients get a sanitized message + `error_id`; the log gets the traceback |
 | Crashes | Nothing | One failing tool never takes down the server |
 | Launching | Nothing | `easy-mcp run my_tools:server` serves a module on any transport |
@@ -527,7 +532,7 @@ The target is `module:attribute`, resolved from the current directory;
 `my_tools.py:server` works too. The attribute may be a server or a callable
 returning one, so a factory that reads configuration at startup is fine.
 
-`--host`, `--port` and `--debug` override the server's own constructor
+`--host`, `--port`, `--debug` and `--metrics` override the server's own constructor
 arguments, and only when given — the transport is the one thing you usually
 want to vary per host, since a desktop MCP client wants `stdio` where
 everything else wants HTTP.
@@ -982,6 +987,13 @@ With request middleware registered, a stateless `tools/list` is marked
 `cacheScope: "private"`, since your code may now answer it differently per
 caller.
 
+Spans and metrics need no middleware of yours: see
+[Traces and metrics](#traces-and-metrics). That built-in layer encloses every
+middleware, so a request a middleware refuses is still measured and
+classified, spans a middleware starts are children of the request's span, and
+a middleware can add to that span with
+`opentelemetry.trace.get_current_span().set_attribute(...)`.
+
 ### Error handling
 
 | Situation | What the client sees |
@@ -1091,6 +1103,128 @@ the worker holding a legacy SSE stream (`reason: "too_large"`,
 `"unserializable"` or `"owner_unreachable"`); the first two still reach the
 stream, as a `-32603` error with an `error_id`.
 
+`/metrics` adds `metrics_denied` (with its `reason`: `unauthenticated`,
+`insufficient_scope` or `not_local`).
+
+### Traces and metrics
+
+**Traces.** With `opentelemetry-api` installed (`pip install
+"easy-mcp-kit[otel]"`), every message the server handles is an OpenTelemetry
+`SERVER` span: `tools/call add`, `tools/list`, `initialize`. The spans follow
+the OpenTelemetry semantic conventions for MCP (`mcp.method.name`,
+`mcp.protocol.version`, `jsonrpc.request.id`, `mcp.session.id`,
+`gen_ai.tool.name`, `gen_ai.prompt.name`, `mcp.resource.uri`, `error.type`,
+`rpc.response.status_code` and the network attributes). They cost nothing
+until your application configures an OpenTelemetry SDK and an exporter; the
+server code does not change:
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+trace.set_tracer_provider(provider)
+
+server = MCPServer(port=8000)          # every request is now a span
+```
+
+Use a batch span processor: a simple one exports on the event loop, so every
+request would wait for the collector.
+
+A client that sends trace context in `params._meta` (`traceparent`,
+`tracestate`, `baggage`, which MCP reserves for this) gets the server span as
+a child of its own; the official MCP Python SDK client does this on its own.
+Over HTTP a `traceparent` header is used when `_meta` has none, and becomes a
+span link when it does; a span already current when the message arrives (an
+ASGI tracing middleware around the app) is the parent before the header.
+Code inside a tool runs in the span, sync tools' threads and cancel callbacks
+included, so spans it starts join the trace:
+
+```python
+from opentelemetry import trace
+
+@server.tool
+def report(query: str) -> list[dict]:
+    with trace.get_tracer("my-app").start_as_current_span("run report"):  # child of "tools/call report"
+        ...
+```
+
+JSON log lines written during a request carry `trace_id` and `span_id`, so an
+audit event leads to its trace and a trace to its log lines.
+
+A tool call's span also carries `easy_mcp.status` (the outcome, as in the
+metrics below) and, when the client was given one, the `easy_mcp.error_id`
+the log has the traceback under. Spans never contain tool arguments, results
+or exception text, and session ids appear only as a hash. A cancelled request
+is not an error (its status stays unset); a timeout is. Set
+`OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` to turn tracing off.
+
+Over stdio, nothing but protocol messages may reach stdout. A console
+exporter writes to stdout unless told otherwise, so pass `out=sys.stderr`
+(`ConsoleSpanExporter(out=sys.stderr)`).
+
+**Metrics.** `MCPServer(metrics=True)` serves Prometheus text (format 0.0.4) at
+`GET /metrics` next to `/mcp`, with no extra dependency:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `mcp_server_operation_duration_seconds` | histogram | `mcp_method_name`, `gen_ai_operation_name`, `gen_ai_tool_name`, `error_type`, `rpc_response_status_code`, `mcp_protocol_version`, `network_transport`, `network_protocol_name` | time from receiving a message to its answer; cancelled requests and established `subscriptions/listen` streams are not sampled |
+| `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name` | how long handshake-era sessions lasted (an idle one up to its last activity) |
+| `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, and `refused` or `internal_error` from tool middleware |
+| `easy_mcp_tool_calls_active` | gauge | `gen_ai_tool_name` | calls between their validation and their answer |
+| `easy_mcp_sync_workers_in_use` | gauge | | sync tool threads holding a `max_sync_workers` slot, those a timed-out tool still holds included |
+| `easy_mcp_tool_finished_after_cancel_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | sync tools that finished after their call was cancelled or timed out |
+| `easy_mcp_sessions_open` | gauge | `easy_mcp_transport` | handshake-era sessions this process holds |
+| `easy_mcp_subscriptions_open` | gauge | `easy_mcp_transport` | open `subscriptions/listen` streams |
+| `easy_mcp_rejected_total` | counter | `easy_mcp_reason` | requests refused before dispatch: `rate_limited`, `unauthenticated`, `origin`, `credential_mismatch`, `header_mismatch`, `payload_too_large`, `too_many_sessions`, `auth_rate_limited`, `store_unavailable` |
+
+Labels hold only bounded, server-chosen values: method names outside the MCP
+method set are `_OTHER`, tools only registered ones. No client ids, key
+fingerprints, session ids, addresses or request ids. Alert on
+`rate(easy_mcp_tool_calls_total{easy_mcp_status="busy"}[5m]) > 0` to see
+`max_sync_workers` saturating; the gap between `easy_mcp_tool_calls_active`
+and `easy_mcp_sync_workers_in_use` is the threads tools that ignore their
+cancel token left behind.
+
+With auth configured, `/metrics` needs an API key or token that holds the
+`metrics:read` scope (`easy_mcp.METRICS_SCOPE`; a key holding `*` passes too).
+Give your scraper a key of its own. It is still a key: it can call public
+tools and `requires_auth` tools that name no scopes, so give protected tools
+scopes. Without auth, `/metrics` answers only requests from this machine
+addressed to `localhost`, `127.0.0.1` or `[::1]`. Scrapes count against the
+rate limit (at a 15 s interval, 4 of the default 120 a minute).
+
+```python
+auth = APIKeyAuth({
+    "long-random-app-key......": ["reports"],
+    "long-random-scrape-key...": ["metrics:read"],   # easy_mcp.METRICS_SCOPE
+})
+server = MCPServer(auth=auth, metrics=True)
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: mcp
+    authorization:
+      credentials_file: /etc/prometheus/mcp-scrape-key
+    static_configs:
+      - targets: ["mcp.internal:8000"]
+```
+
+With OpenTelemetry installed, the same metrics are recorded through its
+metrics API too (`mcp.server.operation.duration`, `easy_mcp.tool.calls`, ...,
+with the same attributes before Prometheus renames them), so a metrics
+exporter your application configures gets them. That is how a stdio server
+exports them: over stdio there is no `/metrics` (a desktop host's child
+process opens no port), and `server.render_metrics()` returns the text.
+Each process keeps its own metrics; see
+[Production deployment](#production-deployment). `--metrics` turns this on
+for `easy-mcp run` and the connectors.
+
 ## Connecting a client
 
 ```bash
@@ -1156,8 +1290,10 @@ MYSQL_URL=mysql://reader:pass@host/shop easy-mcp-mysql --port 8013
 MONGODB_URI=mongodb://reader:pass@host/shop easy-mcp-mongodb --port 8014
 ```
 
-All of them take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`
-and `--debug`, load API keys from `EASY_MCP_API_KEYS` when it is set, and
+All of them take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`,
+`--debug` and `--metrics` (serve `GET /metrics`; with `EASY_MCP_API_KEYS` set,
+the scraper needs a key holding `metrics:read`), load API keys from
+`EASY_MCP_API_KEYS` when it is set, and
 accept OAuth tokens when `EASY_MCP_OAUTH_RESOURCE` is set (see
 [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 `python -m easy_mcp.connectors.<name>` works as well, and
@@ -1255,6 +1391,10 @@ easy_mcp/
 │   ├── oauth.py     OAuthResourceServer: token checks, resource metadata
 │   ├── _fetch.py    outbound HTTP for OAuth (https only, no redirects, size caps)
 │   └── ratelimit.py sliding-window per-client rate limiter
+├── telemetry/
+│   ├── _core.py     spans and metrics of each message: attributes, outcomes
+│   ├── _otel.py     the OpenTelemetry bridge (the only module importing it)
+│   └── prometheus.py  the built-in registry and its /metrics text
 ├── store/
 │   ├── base.py      Store interface (provisional until 1.0)
 │   ├── memory.py    MemoryStore: the default, state in this process
@@ -1326,6 +1466,13 @@ prefer returning compact structures over huge strings.
   every worker.
 - A resource's content is held in memory and base64-encoded when binary, and
   nothing caps its size: serve large data in pieces through a template.
+- Metrics are per process: with several workers behind one port, each scrape
+  reaches one of them. Give each worker a scrape target of its own, or push
+  with OpenTelemetry and a per-instance resource. Trace and metric exporters
+  run in your process: use batch span processors and a periodic metric
+  reader. With `metrics=True` behind a reverse proxy on the same machine,
+  configure auth: the proxy connects from loopback, and one that also sends
+  `Host: localhost` would get `/metrics` for anyone who reaches it.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development

@@ -377,6 +377,55 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `Store.update_subscriptions()`. The default raises `NotImplementedError`,
   and `resources/subscribe` is then answered `-32601` for that store's
   sessions; existing stores keep working otherwise.
+- OpenTelemetry tracing. With `opentelemetry-api` installed (new `[otel]`
+  extra) and an OpenTelemetry SDK configured by the application, every
+  message the server handles is a `SERVER` span named after its method and
+  tool or prompt (`tools/call add`, `prompts/get greet`), carrying the
+  attributes of the OpenTelemetry semantic conventions for MCP:
+  `mcp.method.name`, `mcp.protocol.version`, `jsonrpc.request.id`,
+  `mcp.session.id`, `gen_ai.tool.name`, `gen_ai.prompt.name`,
+  `mcp.resource.uri`, `error.type`, `rpc.response.status_code` and the
+  network attributes, plus `easy_mcp.status`, `easy_mcp.client_id`,
+  `easy_mcp.transport` and `easy_mcp.error_id`. Without an SDK the spans
+  are no-ops. Trace context a client sends in `params._meta`
+  (`traceparent`, `tracestate`, `baggage`, reserved for this in
+  `2026-07-28` and honoured for earlier versions too) makes the span a child
+  of the client's; failing that, a span already current when the message
+  arrives, then (over HTTP) a `traceparent` header, which becomes a span
+  link when `_meta` wins. Malformed values are ignored. Tool code runs in
+  the span, sync tools' threads and cancel callbacks included. A cancelled
+  request is no error and has no duration sample; JSON-RPC codes the
+  conventions call the caller's (`-32700`, `-32600`, `-32601`, `-32602`,
+  and `-32002` "resource not found") are not errors either. Spans never
+  record arguments, results or exception text, and session ids appear only
+  hashed. A `subscriptions/listen` span lasts as long as its stream and
+  records why it ended (`easy_mcp.subscription.end`).
+  `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns tracing off.
+- `MCPServer(metrics=True)` serves Prometheus text at `GET /metrics` on the
+  HTTP transports, with no new dependency:
+  `mcp_server_operation_duration_seconds` and
+  `mcp_server_session_duration_seconds` histograms (the conventions'
+  buckets), and `easy_mcp_tool_calls_total` (by outcome: `ok`,
+  `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`,
+  `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, and
+  `refused` or `internal_error` from tool middleware),
+  `easy_mcp_tool_calls_active`, `easy_mcp_tool_finished_after_cancel_total`,
+  `easy_mcp_sync_workers_in_use`, `easy_mcp_sessions_open`,
+  `easy_mcp_subscriptions_open` and `easy_mcp_rejected_total` (requests
+  refused before dispatch, by reason). With auth configured the endpoint
+  needs a key or token holding the `metrics:read` scope
+  (`easy_mcp.METRICS_SCOPE`), or a key holding `*`; without auth it answers
+  only local requests addressed to a loopback host. Scrapes count against
+  the rate limit, and refusals are audited as `metrics_denied`. With
+  OpenTelemetry installed the same metrics are also recorded through its
+  metrics API, which is how a stdio server exports them; over stdio no port
+  is opened, and `server.render_metrics()` returns the text. `--metrics`
+  enables it on `easy-mcp run` and on the connectors.
+- JSON log lines written while a traced request is handled carry `trace_id`
+  and `span_id`.
+- The startup log event carries `metrics` and `tracing`.
+- For custom stores: `ExpiredSession.idle_ms`, how long a session found
+  expired had been idle, so its duration ends at its last activity.
 
 ### Changed
 
@@ -505,6 +554,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - `ToolRegistrationError` is now a subclass of the new `RegistrationError`.
   Registering a tool, resource or prompt while serving with a shared store
   logs the same warning.
+- With `opentelemetry-api` installed (as it is next to the official MCP
+  Python SDK, for one), an application that configures an OpenTelemetry SDK
+  now sees MCP spans, and spans its tools create nest under them. Nothing
+  changes on the wire: responses carry no trace ids.
+- Cancel callbacks run in the cancelled call's OpenTelemetry context, so
+  spans they start (a database driver's cancel request, say) join the call's
+  trace. They still find the token through `current_cancel_token()`, and
+  `current_tool_call()` is still `None` there.
+- A `StreamableHTTPTransport` whose `path` is `/metrics` is refused when
+  `metrics=True`.
 
 ### Deprecated
 
