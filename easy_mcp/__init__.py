@@ -57,6 +57,7 @@ from .security.oauth import Introspection, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
 from .server import PROTOCOL_VERSION, MCPServer
 from .store import MemoryStore, RedisStore, Store
+from .telemetry import METRICS_SCOPE
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -76,6 +77,7 @@ __all__ = [
     "InsufficientScopeError",
     "Introspection",
     "InvalidTokenError",
+    "METRICS_SCOPE",
     "MCPServer",
     "MemoryStore",
     "Message",

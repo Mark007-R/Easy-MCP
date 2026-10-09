@@ -10,15 +10,40 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 LOGGER_NAME = "easy_mcp"
 AUDIT_LOGGER_NAME = "easy_mcp.audit"
 
+# Set once a server traces with OpenTelemetry: the current span's
+# (trace_id, span_id), or None outside one.
+_trace_ids: Callable[[], tuple[str, str] | None] | None = None
+
+
+def _set_trace_ids(hook: Callable[[], tuple[str, str] | None] | None) -> None:
+    """Name the current trace in every JSON log line, through *hook* (``None``: stop)."""
+    global _trace_ids
+    _trace_ids = hook
+
+
+def _current_trace_ids() -> tuple[str, str] | None:
+    hook = _trace_ids
+    if hook is None:
+        return None
+    try:
+        return hook()
+    except Exception:  # a log line must never fail for its trace ids
+        return None
+
 
 class JSONLogFormatter(logging.Formatter):
-    """Format log records as single-line JSON objects."""
+    """Format log records as single-line JSON objects.
+
+    A line written while a traced request is handled also carries the
+    current span's ``trace_id`` and ``span_id`` (lower-case hex).
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -29,6 +54,9 @@ class JSONLogFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        ids = _current_trace_ids()
+        if ids is not None:
+            payload["trace_id"], payload["span_id"] = ids
         event = getattr(record, "event", None)
         if isinstance(event, dict):
             payload["event"] = event
