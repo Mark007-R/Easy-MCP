@@ -217,6 +217,7 @@ class RequestInfo:
         "_session_id",
         "_state",
         "_stateless",
+        "_subscription",
         "_tool",
         "_tool_layers",
         "_tool_started",
@@ -238,6 +239,8 @@ class RequestInfo:
     _session_id: str | None
     _state: dict[str, Any]
     _stateless: bool
+    # The stream a subscriptions/listen request opened, once it has.
+    _subscription: Any
     _tool: ToolDefinition | None
     _tool_layers: tuple[ToolMiddleware, ...]
     _tool_started: bool
@@ -290,6 +293,7 @@ class RequestInfo:
         # Whether the tool a tools/call names was started, so request
         # middleware's audit knows even when no outcome reached it.
         self._tool_started = False
+        self._subscription = None
         self._watch = None
         self._watch_baseline = 0
         return self

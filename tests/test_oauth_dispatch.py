@@ -217,7 +217,7 @@ async def test_tools_list_private_with_oauth() -> None:
     assert listed is not None and listed["result"]["cacheScope"] == "private"
     discovered = await server.dispatch(modern("server/discover"), context)
     assert discovered is not None and discovered["result"]["cacheScope"] == "public"
-    assert discovered["result"]["capabilities"] == {"tools": {"listChanged": False}}
+    assert discovered["result"]["capabilities"] == {"tools": {"listChanged": True}}
     assert server.auth_configured
     assert not MCPServer(port=0).auth_configured
 

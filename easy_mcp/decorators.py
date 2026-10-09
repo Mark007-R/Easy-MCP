@@ -190,6 +190,8 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._lock = threading.Lock()
+        # Bumped by every change, so a digest of the list knows it is stale.
+        self._version = 0
 
     def register(self, tool: ToolDefinition, *, replace: bool = False) -> None:
         """Add a tool; refuses silent overwrites unless ``replace=True``."""
@@ -197,14 +199,28 @@ class ToolRegistry:
             if tool.name in self._tools and not replace:
                 raise ToolRegistrationError(f"a tool named {tool.name!r} is already registered")
             self._tools[tool.name] = tool
+            self._version += 1
 
     def unregister(self, name: str) -> ToolDefinition:
         """Remove and return a tool by name."""
         with self._lock:
             try:
-                return self._tools.pop(name)
+                removed = self._tools.pop(name)
             except KeyError:
                 raise ToolRegistrationError(f"no tool named {name!r} is registered") from None
+            self._version += 1
+            return removed
+
+    @property
+    def version(self) -> int:
+        """How many changes the registry has seen."""
+        with self._lock:
+            return self._version
+
+    def snapshot(self) -> tuple[int, list[ToolDefinition]]:
+        """The version and the tools sorted by name, as they stood together."""
+        with self._lock:
+            return self._version, sorted(self._tools.values(), key=lambda tool: tool.name)
 
     def get(self, name: str) -> ToolDefinition | None:
         """Look up a tool by name, or ``None``."""

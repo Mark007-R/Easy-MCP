@@ -52,6 +52,21 @@ _MODERN_REQUEST_KEYS = (META_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_CL
 
 DISCOVER_METHOD = "server/discover"
 
+# subscriptions/listen (2026-07-28): a request whose response is a stream of
+# the change notifications the client opted into, each tagged with the listen
+# request's id under META_SUBSCRIPTION_ID.
+LISTEN_METHOD = "subscriptions/listen"
+ACKNOWLEDGED_METHOD = "notifications/subscriptions/acknowledged"
+META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
+
+# Each list kind a change can be announced for: its notification method, and
+# the subscriptions/listen filter field that asks for it.
+LIST_KINDS: dict[str, tuple[str, str]] = {
+    "tools": ("notifications/tools/list_changed", "toolsListChanged"),
+    "prompts": ("notifications/prompts/list_changed", "promptsListChanged"),
+    "resources": ("notifications/resources/list_changed", "resourcesListChanged"),
+}
+
 # The MCP specification reserves -32020..-32099 for itself and defines only
 # -32020..-32022 so far; no implementation may send the rest.
 _RESERVED_ERROR_CODES = range(-32099, -32022)
@@ -89,9 +104,10 @@ def is_modern_request(method: object, params: dict[str, Any]) -> bool:
     Any reserved per-request key selects it, so a request that carries only
     some of them is judged -- and rejected -- as a malformed modern request
     instead of being quietly served under legacy rules.  ``server/discover``
-    exists only in the modern era.
+    and ``subscriptions/listen`` exist only in the modern era, so they are
+    modern requests whatever they carry.
     """
-    if method == DISCOVER_METHOD:
+    if method in (DISCOVER_METHOD, LISTEN_METHOD):
         return True
     meta = params.get("_meta")
     return isinstance(meta, dict) and any(key in meta for key in _MODERN_REQUEST_KEYS)

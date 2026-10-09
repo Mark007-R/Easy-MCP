@@ -73,7 +73,7 @@ async def test_discover() -> None:
     assert result["resultType"] == "complete"
     assert result["supportedVersions"][0] == VERSION
     assert "2025-11-25" in result["supportedVersions"]
-    assert result["capabilities"] == {"tools": {"listChanged": False}}
+    assert result["capabilities"] == {"tools": {"listChanged": True}}
     assert result["instructions"] == "Adds numbers."
     assert result["_meta"][SERVER_INFO] == {"name": "calc", "version": "9.9"}
     assert result["ttlMs"] > 0

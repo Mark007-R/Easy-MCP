@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -23,9 +24,64 @@ def make_context(
     identity: ClientIdentity | None = None,
     client_id: str = "ip:test",
     session_id: str = "test-session",
+    push: Callable[[dict[str, Any]], None] | None = None,
+    multiplexed: bool = False,
 ) -> ClientContext:
     """A fresh ClientContext, as a transport would build one."""
-    return ClientContext(client_id=client_id, session_id=session_id, identity=identity)
+    return ClientContext(
+        client_id=client_id,
+        session_id=session_id,
+        identity=identity,
+        push=push,
+        multiplexed=multiplexed,
+    )
+
+
+class Pushed:
+    """A fake channel for ``ClientContext.push``: records every frame pushed to it.
+
+    With ``explode`` set, every push raises, as a closed channel's does.
+    """
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.frames: list[dict[str, Any]] = []
+        self.explode = explode
+        self.calls = 0
+        self.threads: list[int] = []
+
+    def __call__(self, message: dict[str, Any]) -> None:
+        self.calls += 1
+        self.threads.append(threading.get_ident())
+        if self.explode:
+            raise ConnectionError("the channel is closed")
+        self.frames.append(message)
+
+    async def wait_for(self, count: int, timeout: float = 5.0) -> list[dict[str, Any]]:
+        """Wait until *count* frames have arrived; returns them all."""
+        deadline = time.monotonic() + timeout
+        while len(self.frames) < count:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"expected {count} frame(s), got {self.frames}")
+            await asyncio.sleep(0.005)
+        return list(self.frames)
+
+    def methods(self) -> list[str | None]:
+        """The method of each frame (``None`` for a response)."""
+        return [frame.get("method") for frame in self.frames]
+
+
+@pytest.fixture
+def fast_debounce(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Shorten the list-change window to 10 ms; returns it."""
+    import easy_mcp.subscriptions
+
+    monkeypatch.setattr(easy_mcp.subscriptions, "LIST_CHANGED_DEBOUNCE_SECONDS", 0.01)
+    return 0.01
+
+
+def listen(msg_id: Any = "listen-1", **notifications: Any) -> dict[str, Any]:
+    """A stateless ``subscriptions/listen`` request asking for *notifications*."""
+    return modern("subscriptions/listen", {"notifications": notifications}, msg_id)
 
 
 def rpc(method: str, params: Any | None = None, msg_id: Any = 1) -> dict[str, Any]:

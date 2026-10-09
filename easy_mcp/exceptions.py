@@ -126,6 +126,17 @@ class ServerBusyError(ProtocolError):
     code = SERVER_BUSY
 
 
+class SubscriptionLimitError(ProtocolError):
+    """Too many ``subscriptions/listen`` streams are open; close one first.
+
+    ``-32007``, the code of the session cap, since a listen stream holds a
+    connection as a session does; over HTTP it is answered ``503``.  A client
+    may hold 8 streams in one process, and ``max_sessions`` caps them all.
+    """
+
+    code = TOO_MANY_SESSIONS
+
+
 # --- OAuth (MCPServer(oauth=...)) ---------------------------------------------
 
 # What a client is told about a refused token: fixed strings only, so nothing
