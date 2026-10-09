@@ -13,7 +13,9 @@ from typing import Any
 
 from conftest import listen, notification, rpc
 
-from easy_mcp import MCPServer, StdioTransport
+from easy_mcp import MCPServer, RequestInfo, StdioTransport
+from easy_mcp.exceptions import INTERNAL_ERROR, ProtocolError
+from easy_mcp.middleware import RequestNext, RequestOutcome
 
 TAG = "io.modelcontextprotocol/subscriptionId"
 INIT = {
@@ -253,3 +255,86 @@ async def test_stdio_lines_stay_whole_under_concurrent_writes(fast_debounce: flo
     tagged = [line for line in lines if line.get("method") == "notifications/tools/list_changed"]
     assert any("params" not in line for line in tagged)  # the session's own
     assert any(line.get("params", {}).get("_meta") == {TAG: "l"} for line in tagged)
+
+
+async def test_stdio_initialize_answered_as_serving_ends_leaves_no_session(
+    fast_debounce: float,
+) -> None:
+    server = make_server()
+
+    @server.middleware
+    async def slow(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "initialize":
+            await asyncio.sleep(0.2)  # the end of input arrives meanwhile
+        return await call_next()
+
+    session = Session(server)
+    session.stdin.send(rpc("initialize", INIT))
+    lines = await session.finish()
+    assert [line["id"] for line in lines] == [1]  # the handshake is still answered
+    # Its session ended with serving: no change reaches stdout any more.
+    assert server._notifier._sessions == {}
+    register(server)
+    await asyncio.sleep(0.1)
+    assert session.lines() == lines
+
+
+async def test_stdio_initialize_racing_the_end_of_input_leaves_no_session(
+    fast_debounce: float,
+) -> None:
+    server = make_server()
+    for attempt in range(3):
+        line = json.dumps(rpc("initialize", INIT)).encode() + b"\n"
+        stdout = io.BytesIO()
+        transport = StdioTransport(server, stdin=io.BytesIO(line), stdout=stdout)
+        serving = asyncio.create_task(transport.serve())
+        await asyncio.sleep(0)  # serving: its reader reads the line, then the end of input
+        # The loop, held up meanwhile, takes both in one go: the handshake is
+        # dispatched only once serving has begun to end.
+        time.sleep(0.1)
+        await asyncio.wait_for(serving, 10)
+        answered = stdout.getvalue()
+        assert [json.loads(raw)["id"] for raw in answered.splitlines()] == [1]
+        assert server._notifier._sessions == {}
+        register(server, f"extra{attempt}")
+        await asyncio.sleep(0.1)
+        assert stdout.getvalue() == answered
+
+
+async def overrule_listen(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+    """Request middleware that replaces a listen's answer once its stream is over."""
+    outcome = await call_next()
+    if request.method == "subscriptions/listen":
+        raise ProtocolError("refused after the fact")
+    return outcome
+
+
+async def test_stdio_listen_the_server_ended_gets_one_answer() -> None:
+    server = make_server()
+    server.middleware(overrule_listen)
+    session = Session(server)
+    session.stdin.send(listen(5, toolsListChanged=True))
+    await session.wait_for(1)
+    lines = await session.finish()
+    assert [line.get("method") for line in lines] == [
+        "notifications/subscriptions/acknowledged",
+        None,
+        "notifications/cancelled",
+    ]
+    assert lines[1]["id"] == 5 and lines[1]["result"]["resultType"] == "complete"
+
+
+async def test_stdio_listen_cut_short_by_middleware_gets_its_error_once() -> None:
+    server = make_server()
+
+    @server.middleware
+    async def bounded(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        async with asyncio.timeout(0.1):
+            return await call_next()
+
+    session = Session(server)
+    session.stdin.send(listen(5, toolsListChanged=True))
+    ack, error = await session.wait_for(2)
+    assert ack["method"] == "notifications/subscriptions/acknowledged"
+    assert error["id"] == 5 and error["error"]["code"] == INTERNAL_ERROR
+    assert len(await session.finish()) == 2

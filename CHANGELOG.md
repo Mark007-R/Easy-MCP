@@ -233,7 +233,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   tool names. Changes within 0.1 s are combined into one notification, and a
   change undone within that time sends none. Registration from any thread
   works, including a sync tool's. On a session, what the client may see
-  follows the credential of its latest request.
+  follows the credential of its latest request, and a credential that
+  changes what it may see has it told once to list again. With a shared
+  store this holds for the requests served by the worker holding the
+  session's `GET /mcp` stream; requests served by other workers leave that
+  stream judging by the credential it last saw there.
 - Initialize-era clients receive `notifications/tools/list_changed` once
   `initialize` has been answered: on stdout over stdio, on the `/sse`
   stream, and over Streamable HTTP on the session's `GET /mcp` stream.
@@ -253,17 +257,24 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   and `resourceSubscriptions`, are left out of the acknowledgment. Over HTTP
   the client must accept `text/event-stream` (`406` otherwise), a refused
   listen is answered as JSON, and closing the response ends the
-  subscription; over stdio, `notifications/cancelled` does. At shutdown, and
-  when the OAuth token it was opened with expires, a stream gets the listen
-  request's completion result, followed on stdio and legacy SSE by
-  `notifications/cancelled` naming it. Request middleware sees listen
-  requests and may refuse them.
+  subscription; over stdio, `notifications/cancelled` does. At shutdown, when
+  the OAuth token it was opened with expires, and when a list it follows can
+  no longer be encoded, a stream gets the listen request's completion
+  result, followed on stdio and legacy SSE by `notifications/cancelled`
+  naming it. Request middleware sees listen requests and may refuse them;
+  `call_next()` returns once the stream ends. A listen that middleware cuts
+  short after its acknowledgment (a timeout of its own, say) is answered
+  with the middleware's error, over HTTP as the stream's last event; an
+  error raised once the stream has had its result, or its client cancelled
+  it, is not sent.
 - `SubscriptionLimitError` (`-32007`, HTTP `503`): a client may hold 8
   listen streams in one process, and `max_sessions` caps them across the
   process. A listen id already open on the same channel is refused with
   `-32600`.
 - For custom transports: `ClientContext.push` and `ClientContext.multiplexed`,
-  and `MCPServer.close_subscriptions(context)`.
+  and `MCPServer.close_subscriptions(context)`, called when the channel ends
+  and again once its requests still running have finished (an `initialize`
+  answered meanwhile starts the session's notifications anew).
 - `SessionRecord.baselines` and `Store.save_baselines()`, where a store keeps
   what a session's client was last told its lists hold. The default records
   nothing, so existing stores keep working.
@@ -376,11 +387,15 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   A client that stops reading any of these streams still holds shutdown up
   once its connection's buffers are full, and list changes can now fill
   them; a second Ctrl-C ends the wait.
-- `subscriptions/listen` without the stateless `_meta` is answered `-32602`
-  instead of `-32601` on every channel, as `server/discover` is: the method
-  exists only in the stateless revision. A listen that carries the stateless
-  `_meta` on a channel that cannot carry server-initiated messages
-  (`ClientContext.push` unset) is still `-32601`.
+- `subscriptions/listen` exists only in the stateless revision. Over stdio
+  and legacy SSE, a listen without the stateless `_meta` is answered `-32602`
+  instead of `-32601`, as `server/discover` is. Over Streamable HTTP a listen
+  with `params` is now judged a stateless request, as `server/discover` is: a
+  POST missing the mirrored `MCP-Protocol-Version` or `Mcp-Method` header
+  gets `400` with `-32020`, and one with the headers but no `_meta` gets
+  `400` with `-32602`; before, a session's client got `200` with `-32601`.
+  A listen that carries the stateless `_meta` on a channel that cannot carry
+  server-initiated messages (`ClientContext.push` unset) is still `-32601`.
 - `ClientContext` compares and hashes by identity, and can be weakly
   referenced.
 

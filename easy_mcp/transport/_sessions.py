@@ -918,8 +918,10 @@ class SessionManager:
             return
         if envelope.op == "cancel":
             request_id = envelope.body["rid"]
-            # A listen stream on the stream held here ends silently, at once.
-            self._server._cancel_subscription(local.context, request_id)
+            # A listen stream on the stream held here ends silently, at once,
+            # and its request returns by itself (see _handle_notification).
+            if self._server._cancel_subscription(local.context, request_id):
+                return
             task = local.in_flight.get(request_id)
             if task is not None:
                 task.cancel()

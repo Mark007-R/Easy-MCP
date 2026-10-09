@@ -451,7 +451,9 @@ class MCPServer:
         self._digests: OrderedDict[tuple[str, Hashable], tuple[int, str]] = OrderedDict()
         self._digests_lock = threading.Lock()
         # Who is told when a list changes: sessions and listen streams.
-        self._notifier = ChangeNotifier(self._list_digest, final=self._listen_final)
+        self._notifier = ChangeNotifier(
+            self._list_digest, view=self._visibility_class, final=self._listen_final
+        )
 
     # ------------------------------------------------------------ registration
 
@@ -1207,8 +1209,9 @@ class MCPServer:
     async def _serve(self, request: RequestInfo, context: ClientContext) -> dict[str, Any] | None:
         """Run the request middleware around the request; returns the response.
 
-        ``None`` for a ``subscriptions/listen`` that was served: its frames,
-        the final one included, went through ``context.push``.
+        ``None`` for a ``subscriptions/listen`` that was served, or whose
+        stream had its answer before middleware replaced it: its frames, the
+        final one included, went through ``context.push``.
         """
         outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
         if request.method == "initialize" and outcome.error_code is None:
@@ -1230,8 +1233,20 @@ class MCPServer:
                     multiplexed=context.multiplexed,
                     anchor=context,
                 )
-        if request.method == LISTEN_METHOD and outcome.error_code is None:
-            return None
+        if request.method == LISTEN_METHOD:
+            if outcome.error_code is None:
+                return None
+            sink = request._subscription
+            if sink is not None and sink.settled:
+                # Its stream had its answer already (its completion result,
+                # or none for a client's cancel): a request gets one.
+                self._logger.info(
+                    "subscriptions/listen %r: withheld the error (code %s) middleware "
+                    "answered once its stream had ended",
+                    request.request_id,
+                    outcome.error_code,
+                )
+                return None
         if outcome.error_code is not None:
             return _error_response(
                 request.request_id, outcome.error_code, outcome.message or "", outcome._data
@@ -1655,8 +1670,10 @@ class MCPServer:
         ``notifications/cancelled``) through ``context.push`` before this
         returns; then its ``dispatch`` returns ``None``.  The session the
         context carries stops receiving list changes.  Transports call this,
-        on the event loop, when a channel ends or the server shuts down;
-        *reason* is audited.  Idempotent.
+        on the event loop, when a channel ends or the server shuts down, and
+        again once the channel's requests still running have finished (an
+        ``initialize`` answered meanwhile starts the session's notifications
+        anew); *reason* is audited.  Idempotent.
 
         Returns:
             How many subscriptions ended.
@@ -1675,8 +1692,11 @@ class MCPServer:
         elif method == "notifications/cancelled":
             request_id = params.get("requestId")
             # A listen stream ends at once: nothing more is written for it,
-            # not even a change already pending.  Then its request stops.
-            self._cancel_subscription(context, request_id)
+            # not even a change already pending.  Its request then returns
+            # by itself, unanswered; no other request is looked up, since
+            # 1 and 1.0 name two subscriptions but one in_flight entry.
+            if self._cancel_subscription(context, request_id):
+                return
             # A list or an object is no request id this server handed out.
             task = context.in_flight.get(request_id) if isinstance(request_id, Hashable) else None
             if task is not None:

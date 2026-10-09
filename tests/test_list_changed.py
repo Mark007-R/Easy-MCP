@@ -11,9 +11,17 @@ from typing import Any
 
 import pytest
 from conftest import LogCapture, Pushed, listen, make_context, modern, notification, rpc
+from shared_store_fake import FakeHub
 
 import easy_mcp.subscriptions
-from easy_mcp import APIKeyAuth, ClientIdentity, MCPServer, RequestInfo, SubscriptionLimitError
+from easy_mcp import (
+    APIKeyAuth,
+    ClientIdentity,
+    MCPServer,
+    RequestInfo,
+    SSETransport,
+    SubscriptionLimitError,
+)
 from easy_mcp.exceptions import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -26,6 +34,7 @@ from easy_mcp.exceptions import (
 from easy_mcp.middleware import RequestNext, RequestOutcome
 from easy_mcp.protocol import is_modern_request
 from easy_mcp.security.oauth import LEEWAY_SECONDS
+from easy_mcp.transport import _bus
 from easy_mcp.transport.base import ClientContext
 
 # Built, not written out, so secret scanners do not take the fixtures for credentials.
@@ -360,10 +369,44 @@ async def test_forgotten_context_is_released(fast_debounce: float) -> None:
     assert server._notifier.session("forgotten") is not None
     del context
     gc.collect()
+    await asyncio.sleep(0)  # the session ends on its own loop
     assert server._notifier.session("forgotten") is None
     register(server)
     await settle(fast_debounce)
     assert pushed.frames == []
+
+
+async def test_a_context_collected_while_a_change_is_announced_hangs_nothing() -> None:
+    def change(server: MCPServer, allocations: int) -> None:
+        # The collection falls this many allocations into the change, perhaps
+        # while it holds the notifier's lock.
+        gc.set_threshold(gc.get_count()[0] + allocations, *saved[1:])
+        gc.enable()
+        server._notifier.changed("tools")
+
+    saved = gc.get_threshold()
+    for allocations in range(1, 25):
+        server = make_server()
+        gc.collect()
+        gc.disable()  # the context below stays in the youngest generation
+        try:
+            context = await initialized(server, Pushed(), session_id="forgotten")
+            # A transport that never ends the session, and whose context is
+            # left in a reference cycle: only a collection releases it.
+            context.in_flight["self"] = context  # type: ignore[assignment]
+            del context
+            worker = threading.Thread(target=change, args=(server, allocations), daemon=True)
+            worker.start()
+            worker.join(5)
+        finally:
+            gc.set_threshold(*saved)
+            gc.enable()
+        assert not worker.is_alive(), f"a collection {allocations} allocations in hung"
+        gc.collect()
+        deadline = time.monotonic() + 5
+        while server._notifier.session("forgotten") is not None:
+            assert time.monotonic() < deadline, "the session was never ended"
+            await asyncio.sleep(0.005)
 
 
 async def test_failing_push_drops_the_recipient(fast_debounce: float) -> None:
@@ -432,6 +475,25 @@ async def test_a_session_is_judged_by_its_latest_credential(fast_debounce: float
     # refreshed OAuth token would): what the session is told follows it.
     await server.dispatch(rpc("ping", msg_id=2), dataclasses.replace(context, identity=admin))
     register(server, scopes=("admin",))
+    assert await pushed.wait_for(1) == [TOOLS_CHANGED]
+
+
+async def test_a_session_that_listed_with_a_broader_credential_hears_its_list_shrink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A window long enough for the removal below to fall inside it.
+    monkeypatch.setattr(easy_mcp.subscriptions, "LIST_CHANGED_DEBOUNCE_SECONDS", 0.2)
+    server = keyed_server()
+    register(server, "secret", scopes=("admin",))
+    pushed = Pushed()
+    context = await initialized(server, pushed, identity_of(server, REPORTS_KEY))
+    # Told the list held "add" only; then it lists with a credential that sees more.
+    broad = dataclasses.replace(context, identity=identity_of(server, ADMIN_KEY))
+    listed = await server.dispatch(rpc("tools/list", msg_id=2), broad)
+    assert listed is not None
+    assert [tool["name"] for tool in listed["result"]["tools"]] == ["add", "secret"]
+    # The list it holds now loses a tool, though it is the one it was told about.
+    server.unregister_tool("secret")
     assert await pushed.wait_for(1) == [TOOLS_CHANGED]
 
 
@@ -659,6 +721,59 @@ async def test_cancel_names_a_subscription_of_its_own_channel_only() -> None:
     await theirs_task
 
 
+async def test_cancelling_listen_1_0_leaves_listen_1_open(fast_debounce: float) -> None:
+    server = make_server()
+    pushed = Pushed()
+    context = make_context(push=pushed, multiplexed=True)
+    # Two subscriptions, though 1 and 1.0 are one key to a dict.
+    floating = await open_listen(server, context, pushed, 1.0, toolsListChanged=True)
+    whole = await open_listen(server, context, pushed, 1, toolsListChanged=True)
+    cancel = notification("notifications/cancelled", {"requestId": 1.0})
+    assert await server.dispatch(cancel, context) is None
+    assert await floating is None
+    assert server._notifier.count() == 1 and not whole.done()
+    register(server)
+    frames = await pushed.wait_for(3)
+    assert frames[2]["params"]["_meta"] == {TAG: 1}
+    assert type(frames[2]["params"]["_meta"][TAG]) is int
+    server.close_subscriptions(context)
+    assert await whole is None
+
+
+async def test_a_cancel_from_another_worker_ends_only_the_listen_it_names() -> None:
+    hub = FakeHub()
+    store = hub.store("0123456789abcdef")
+    server = make_server(store=store)
+    manager = SSETransport(server)._manager
+    await store.start()
+    session_id = "a-session-id-of-192-random-bits-"
+    local = await manager.open(session_id, client_id="ip:x", identity=None, owned=True)
+    assert local is not None and local.stream is not None
+    # As the legacy SSE stream held here carries them.
+    local.context.push = local.push
+    local.context.multiplexed = True
+    try:
+        tasks = []
+        for msg_id in (1, 1.0):
+            tasks.append(asyncio.create_task(server.dispatch(listen(msg_id), local.context)))
+            deadline = time.monotonic() + 5
+            while server._notifier.count() < len(tasks):
+                assert time.monotonic() < deadline, "no acknowledgment"
+                await asyncio.sleep(0.005)
+        whole, floating = tasks
+        # notifications/cancelled for 1, sent to another worker of the session.
+        manager._on_bus(
+            _bus.seal("cancel", "sse", local.ref, None, session_id, "fedcba9876543210", rid=1)
+        )
+        assert await asyncio.wait_for(whole, 5) is None
+        await asyncio.sleep(0.05)
+        assert server._notifier.count() == 1 and not floating.done()
+        server.close_subscriptions(local.context)
+        assert await asyncio.wait_for(floating, 5) is None
+    finally:
+        await manager.shutdown()
+
+
 async def test_server_close_sends_the_completion_result() -> None:
     server = make_server(name="calc", version="9.9")
     pushed = Pushed()
@@ -811,12 +926,66 @@ async def test_listen_ends_when_its_token_expires() -> None:
         scopes=frozenset(),
         subject="user",
         issuer="https://issuer.example.com",
-        expires_at=int(time.time()) - LEEWAY_SECONDS + 1,
+        # Still accepted (within the clock-skew leeway) for 2 to 3 more seconds.
+        expires_at=int(time.time()) - LEEWAY_SECONDS + 3,
     )
     context = make_context(token, push=pushed)
     task = await open_listen(server, context, pushed)
+    await asyncio.sleep(1.0)
+    assert not task.done()  # the stream lasts as long as its token is accepted
     assert await asyncio.wait_for(task, 5) is None
     assert pushed.frames[-1]["result"]["resultType"] == "complete"
+
+
+async def overrule_listen(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+    """Request middleware that replaces a listen's answer once its stream is over."""
+    outcome = await call_next()
+    if request.method == "subscriptions/listen":
+        raise ProtocolError("refused after the fact")
+    return outcome
+
+
+async def test_a_listen_the_server_ended_gets_no_second_answer(logs: LogCapture) -> None:
+    server = make_server()
+    server.middleware(overrule_listen)
+    pushed = Pushed()
+    context = make_context(push=pushed, multiplexed=True)
+    task = await open_listen(server, context, pushed, 5, toolsListChanged=True)
+    server.close_subscriptions(context, reason="shutdown")
+    # Its completion result was its answer: dispatch adds none.
+    assert await task is None
+    assert pushed.methods() == [
+        "notifications/subscriptions/acknowledged",
+        None,
+        "notifications/cancelled",
+    ]
+    assert pushed.frames[1]["id"] == 5
+    assert pushed.frames[1]["result"]["resultType"] == "complete"
+    assert "withheld" in logs.text
+    # Nor does a listen its client cancelled get one.
+    cancelled = await open_listen(server, context, pushed, 6, toolsListChanged=True)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 6}), context)
+    assert await cancelled is None
+    assert len(pushed.frames) == 4
+
+
+async def test_a_listen_middleware_cuts_short_is_answered_with_its_error() -> None:
+    server = make_server()
+
+    @server.middleware
+    async def bounded(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        async with asyncio.timeout(0.1):
+            return await call_next()
+
+    pushed = Pushed()
+    context = make_context(push=pushed, multiplexed=True)
+    task = await open_listen(server, context, pushed, 5, toolsListChanged=True)
+    response = await asyncio.wait_for(task, 5)
+    # Acknowledged, then cut: the error is its one answer.
+    assert response is not None and response["id"] == 5
+    assert response["error"]["code"] == INTERNAL_ERROR
+    assert pushed.methods() == ["notifications/subscriptions/acknowledged"]
+    assert server._notifier.count() == 0
 
 
 async def test_middleware_sees_listen_and_may_refuse_it() -> None:
@@ -980,3 +1149,33 @@ async def test_a_list_that_cannot_be_digested_leaves_handshake_and_listen_workin
     assert await task is None
     assert "could not compute the tools list" in logs.text
     assert "error_id=" in logs.text
+
+
+def register_undigestible(server: MCPServer) -> None:
+    """Register a tool whose tools/list entry JSON cannot encode (a tuple key)."""
+
+    def locate(point: dict[str, str]) -> str:
+        """Name a point."""
+        return "here"
+
+    server.register_tool(locate, examples=[{"arguments": {"point": {(1, 2): "a"}}}])
+
+
+async def test_a_listen_whose_list_can_no_longer_be_digested_ends_gracefully(
+    fast_debounce: float, logs: LogCapture
+) -> None:
+    server = make_server()
+    pushed = Pushed()
+    context = make_context(push=pushed, multiplexed=True)
+    task = await open_listen(server, context, pushed, 3, toolsListChanged=True)
+    register_undigestible(server)
+    assert await asyncio.wait_for(task, 5) is None
+    # The server ended it: its completion result, then on this channel the cancel.
+    ack, result, cancelled = pushed.frames
+    assert result["id"] == 3 and result["result"]["resultType"] == "complete"
+    assert cancelled["method"] == "notifications/cancelled"
+    assert cancelled["params"]["requestId"] == 3
+    assert cancelled["params"]["_meta"] == {TAG: 3}
+    assert server._notifier.count() == 0
+    assert [event["reason"] for event in logs.events("subscription_close")] == ["undeliverable"]
+    assert "could not compute the tools list" in logs.text

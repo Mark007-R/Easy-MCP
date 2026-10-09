@@ -23,17 +23,26 @@ from conftest import LogCapture, headers_for, listen, modern, notification, rpc
 from oauth_fake_as import FakeAuthorizationServer
 from shared_store_fake import FakeHub, records
 
-from easy_mcp import APIKeyAuth, MCPServer, OAuthResourceServer, StreamableHTTPTransport
+from easy_mcp import (
+    APIKeyAuth,
+    MCPServer,
+    OAuthResourceServer,
+    RequestInfo,
+    StreamableHTTPTransport,
+)
 from easy_mcp.exceptions import (
     AUTHENTICATION_REQUIRED,
     FORBIDDEN,
     HEADER_MISMATCH,
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     RATE_LIMITED,
     TOO_MANY_SESSIONS,
+    ProtocolError,
 )
+from easy_mcp.middleware import RequestNext, RequestOutcome
 from easy_mcp.security.oauth import LEEWAY_SECONDS
 
 LiveServer = Callable[[Any], str]
@@ -508,13 +517,93 @@ async def test_get_stream_ends_when_its_token_expires(
     base = live_server(make_server(oauth=oauth))
     async with httpx.AsyncClient(base_url=base, timeout=10) as client:
         session = await initialize(client, bearer(fake_as.mint()))
-        # Still accepted (within the clock-skew leeway) for about 2 more seconds.
-        short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 2})
+        # Still accepted (within the clock-skew leeway) for 2 to 3 more seconds.
+        short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 3})
         stream = await get_stream(client, session, bearer(short))
+        await asyncio.sleep(1.0)
+        assert not stream.ended.is_set()  # it lasts as long as its token is accepted
         await stream.end(10)
         await stream.aclose()
     await until(lambda: bool(logs.events("stream_close")))
     assert logs.events("stream_close")[0]["reason"] == "token_expired"
+
+
+async def test_a_session_that_listed_with_a_broader_token_hears_its_list_shrink(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer, fast_debounce: float
+) -> None:
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer], step_up=False)
+    server = make_server(oauth=oauth)
+    register(server, "secret", scopes=["admin"])
+    base = live_server(server)
+    narrow = bearer(fake_as.mint())
+    broad = bearer(fake_as.mint(claims={"scope": "mcp:access admin"}))
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client, narrow)
+        stream = await get_stream(client, session, narrow)  # told the list holds "add"
+        listed = await client.post(
+            "/mcp",
+            json=rpc("tools/list", msg_id=2),
+            headers={**ACCEPT, "MCP-Session-Id": session, **broad},
+        )
+        assert [tool["name"] for tool in listed.json()["result"]["tools"]] == ["add", "secret"]
+        await asyncio.sleep(0.2)
+        while not stream.events.empty():  # what the new credential's view sent, if anything
+            assert stream.events.get_nowait() == TOOLS_CHANGED
+        # The list the client holds loses a tool: it is told, though the
+        # list is again the one its stream was opened with.
+        server.unregister_tool("secret")
+        assert await stream.next() == TOOLS_CHANGED
+        await stream.aclose()
+
+
+async def test_a_change_queued_on_a_replaced_stream_moves_to_the_new_one(
+    live_server: LiveServer,
+) -> None:
+    server = make_server()
+    transport = StreamableHTTPTransport(server)
+    base = live_server(transport.build_app())
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        first = await get_stream(client, session)
+        local = transport._sessions[session]
+        sink = local.notify_stream.sink
+        seen: dict[str, Any] = {}
+        done = threading.Event()
+
+        def change_then_replace() -> None:
+            # A change is queued on the first stream and, before its writer
+            # runs, a new stream replaces it (holding the session as a GET does).
+            register(server)
+            sink.deliver(["tools"])
+            seen["queued"] = len(local.notify_stream.outbox)
+            local.active += 1
+            response = transport._open_stream(local, local.context.identity)
+            seen["moved"] = [message for _, message in local.notify_stream.outbox._items]
+            response._on_close()  # its client leaves
+            done.set()
+
+        sink.loop.call_soon_threadsafe(change_then_replace)
+        assert await asyncio.to_thread(done.wait, 5)
+        await first.end()
+        await first.aclose()
+        assert seen == {"queued": 1, "moved": [TOOLS_CHANGED]}
+
+
+async def test_a_replacing_stream_does_not_repeat_what_the_first_told(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    server = make_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        session = await initialize(client)
+        first = await get_stream(client, session)
+        register(server)
+        assert await first.next() == TOOLS_CHANGED
+        second = await get_stream(client, session)
+        await first.end()
+        await second.quiet()
+        await first.aclose()
+        await second.aclose()
 
 
 # ------------------------------------------------------- subscriptions/listen
@@ -639,6 +728,76 @@ async def test_anonymous_listener_is_not_told_about_a_protected_tool(
         await keyed.aclose()
 
 
+async def test_a_listen_cut_short_by_middleware_ends_with_its_error(
+    live_server: LiveServer,
+) -> None:
+    server = make_server()
+
+    @server.middleware
+    async def bounded(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        async with asyncio.timeout(0.3):
+            return await call_next()
+
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        stream = await listen_stream(client, "L1")
+        assert (await stream.next())["method"] == "notifications/subscriptions/acknowledged"
+        # Acknowledged, then cut: the error is the stream's last event.
+        error = await stream.next()
+        assert error["id"] == "L1" and error["error"]["code"] == INTERNAL_ERROR
+        await stream.end()
+        assert stream.events.empty()
+        await stream.aclose()
+
+
+async def overrule_listen(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+    """Request middleware that replaces a listen's answer once its stream is over."""
+    outcome = await call_next()
+    if request.method == "subscriptions/listen":
+        raise ProtocolError("refused after the fact")
+    return outcome
+
+
+async def test_a_listen_its_token_ended_gets_no_second_answer(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer])
+    server = make_server(oauth=oauth)
+    server.middleware(overrule_listen)
+    base = live_server(server)
+    short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 2})
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        stream = await listen_stream(client, 5, bearer(short))
+        assert (await stream.next())["method"] == "notifications/subscriptions/acknowledged"
+        final = await stream.next(10)
+        assert final["id"] == 5 and final["result"]["resultType"] == "complete"
+        await stream.end()
+        assert stream.events.empty()
+        await stream.aclose()
+
+
+async def test_a_listen_whose_list_can_no_longer_be_digested_ends_with_its_result(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    server = make_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        stream = await listen_stream(client, 3)
+        await stream.next()
+
+        def locate(point: dict[str, str]) -> str:
+            """Name a point."""
+            return "here"
+
+        # Its tools/list entry has a key JSON cannot carry.
+        server.register_tool(locate, examples=[{"arguments": {"point": {(1, 2): "a"}}}])
+        final = await stream.next()
+        assert final["id"] == 3 and final["result"]["resultType"] == "complete"
+        await stream.end()
+        assert stream.events.empty()
+        await stream.aclose()
+
+
 async def test_shutdown_closes_get_and_listen_streams(fast_debounce: float) -> None:
     server = make_server()
     with running(server) as (base, thread):
@@ -749,6 +908,47 @@ async def test_sse_shutdown_sends_listen_result_before_closing() -> None:
             await opened.end()
             await asyncio.to_thread(thread.join, 10)
             await opened.aclose()
+
+
+async def test_a_closed_sse_stream_stops_its_session_notifications(
+    live_server: LiveServer, fast_debounce: float
+) -> None:
+    server = make_server()
+    base = live_server(server)
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        opened = await open_stream(client, "GET", "/sse")
+        assert isinstance(opened, Stream)
+        endpoint = await opened.next()
+        await client.post(endpoint, json=rpc("initialize", INIT))
+        await opened.next()
+        assert len(server._notifier._sessions) == 1
+        await opened.aclose()
+        await until(lambda: not server._notifier._sessions)
+
+
+async def test_sse_listen_its_token_ended_gets_no_second_answer(
+    live_server: LiveServer, fake_as: FakeAuthorizationServer
+) -> None:
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, [fake_as.issuer])
+    server = make_server(oauth=oauth)
+    server.middleware(overrule_listen)
+    base = live_server(server)
+    short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 2})
+    async with httpx.AsyncClient(base_url=base, timeout=10) as client:
+        opened = await open_stream(client, "GET", "/sse", headers=bearer(fake_as.mint()))
+        assert isinstance(opened, Stream)
+        endpoint = await opened.next()
+        posted = await client.post(
+            endpoint, json=listen(5, toolsListChanged=True), headers=bearer(short)
+        )
+        assert posted.status_code == 202
+        assert (await opened.next())["method"] == "notifications/subscriptions/acknowledged"
+        result = await opened.next(10)
+        cancelled = await opened.next()
+        assert result["id"] == 5 and result["result"]["resultType"] == "complete"
+        assert cancelled["method"] == "notifications/cancelled"
+        await opened.quiet(0.5)  # and nothing else for its id
+        await opened.aclose()
 
 
 # --------------------------------------------------- two workers, one store

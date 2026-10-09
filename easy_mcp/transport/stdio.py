@@ -219,12 +219,16 @@ class StdioTransport(Transport):
             closing = True
             server.close_subscriptions(context, reason="shutdown")
             await self._drain(in_flight)
+            # Again: an initialize answered during the drain started the
+            # session's notifications after the first close.
+            server.close_subscriptions(context, reason="shutdown")
             # Daemon threads die with the process, cancel callbacks included.
             await self._server.wait_for_tool_threads(self._shutdown_timeout)
             if self._stdout_override is None:
                 sys.stdout = real_stdout
             self._loop = None
             self._queue = None
+            self._stdout = None  # nothing more is written once serving has ended
             server._session_event(
                 False,
                 kind="stdio",

@@ -184,6 +184,7 @@ class _Sink:
         "loop",
         "multiplexed",
         "push",
+        "settled",
         "subscription_id",
     )
 
@@ -218,6 +219,9 @@ class _Sink:
         self.baselines = baselines
         # Set when a listen stream ends, whoever ended it.
         self.ended: asyncio.Event | None = asyncio.Event() if listen else None
+        # Set once a listen request needs no other answer: the server sent
+        # its completion result, or its client cancelled it.
+        self.settled = False
         self.closed = False
         self._finalizer: Any = None
         self._pending: set[str] = set()
@@ -255,9 +259,10 @@ class _Sink:
     def deliver(self, kinds: Iterable[str]) -> None:
         """Tell the client about each of *kinds* whose list changed since it was last told.
 
-        On the loop.  A recipient that cannot be told (its channel is gone,
-        or its list cannot be computed) is dropped: it never fails the
-        change that caused it.
+        On the loop.  A recipient that cannot be told never fails the change
+        that caused it: one whose channel is gone is dropped; one whose list
+        cannot be computed any more is dropped too, except a listen stream,
+        which the server ends with its final frames.
         """
         for kind in kinds:
             if self.closed:
@@ -266,7 +271,10 @@ class _Sink:
                 digest = self._notifier._digest(kind, self.identity)
             except Exception:
                 _digest_failed(kind)
-                self._notifier.drop(self, "undeliverable")
+                if self.listen:
+                    self._notifier.end(self, "undeliverable")
+                else:
+                    self._notifier.drop(self, "undeliverable")
                 return
             if self.baselines.get(kind) == digest:
                 continue
@@ -320,12 +328,21 @@ class ChangeNotifier:
     Args:
         digest: ``digest(kind, identity)``: a digest of the *kind* list the
             identity may see.  Called on the sinks' loops.
+        view: ``view(identity)``: what decides which lists the identity
+            sees; two identities with the same view see the same lists.
         final: ``final(subscription_id)``: the completion result a listen
             stream the server ends receives.
     """
 
-    def __init__(self, digest: Digest, *, final: Callable[[Any], dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        digest: Digest,
+        *,
+        view: Callable[[ClientIdentity | None], Hashable],
+        final: Callable[[Any], dict[str, Any]],
+    ) -> None:
         self._digest = digest
+        self._view = view
         self._final = final
         self._lock = threading.Lock()
         # Session sinks by session; listen sinks by channel, then by id.
@@ -367,8 +384,9 @@ class ChangeNotifier:
 
         On the loop that delivers to it.  *baselines* is what its client was
         last told the lists hold.  A sink the session had is replaced.
-        With an *anchor*, the sink goes when the anchor is collected, so a
-        transport that forgets to end the session leaks nothing.
+        With an *anchor*, the sink goes (on its loop) once the anchor is
+        collected, so a transport that forgets to end the session leaks
+        nothing.
         """
         kinds = frozenset(kinds)
         sink = _Sink(
@@ -386,7 +404,7 @@ class ChangeNotifier:
             baselines={kind: digest for kind, digest in baselines.items() if kind in kinds},
         )
         if anchor is not None:
-            sink._finalizer = weakref.finalize(anchor, self.end_session, key, sink)
+            sink._finalizer = weakref.finalize(anchor, self._anchor_collected, key, sink)
         with self._lock:
             replaced = self._sessions.get(key)
             self._sessions[key] = sink
@@ -400,11 +418,31 @@ class ChangeNotifier:
             return self._sessions.get(key)
 
     def refresh_identity(self, key: Hashable, identity: ClientIdentity | None) -> None:
-        """Judge what the session *key* may see by *identity* from now on (its latest request's)."""
+        """Judge what the session *key* may see by *identity* from now on (its latest request's).
+
+        When that changes which lists it sees, what its client holds is no
+        longer known (it may have listed with either credential): it is
+        told once to list again, at the next flush.
+        """
         with self._lock:
             sink = self._sessions.get(key)
-            if sink is not None:
-                sink.identity = identity
+            if sink is None:
+                return
+            previous, sink.identity = sink.identity, identity
+        if self._view(previous) == self._view(identity):
+            return
+        sink.baselines.clear()
+        for kind in sink.kinds:
+            sink.request_flush(kind)
+
+    def _anchor_collected(self, key: Hashable, sink: _Sink) -> None:
+        # Run by the collector, which may run on any thread, inside any of
+        # this notifier's (or the sink's) locks held there: it takes none,
+        # and leaves ending the session to the sink's loop.
+        try:
+            sink.loop.call_soon_threadsafe(self.end_session, key, sink)
+        except RuntimeError:
+            pass  # its loop has closed: the next change drops it (request_flush)
 
     def end_session(self, key: Hashable, sink: _Sink | None = None) -> bool:
         """Stop telling the session *key* (or only its *sink*, if that is still its sink)."""
@@ -504,7 +542,10 @@ class ChangeNotifier:
         with self._lock:
             streams = self._channels.get(channel)
             sink = streams.get(_subscription_key(request_id)) if streams is not None else None
-        return sink is not None and self.drop(sink, "client_cancelled")
+        if sink is None or not self.drop(sink, "client_cancelled"):
+            return False
+        sink.settled = True  # a cancelled request gets no answer
+        return True
 
     def drop(self, sink: _Sink, reason: str) -> bool:
         """Remove *sink* without a word to its client.  Idempotent; whether this call removed it."""
@@ -534,6 +575,7 @@ class ChangeNotifier:
         if not self._unregister(sink):
             return False
         sink._close()
+        sink.settled = True
         try:
             sink.push(self._final(sink.subscription_id))
             if sink.multiplexed:

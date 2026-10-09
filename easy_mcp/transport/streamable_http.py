@@ -108,7 +108,13 @@ from ._http import (
     rpc_error,
     store_unavailable,
 )
-from ._outbox import EventStreamResponse, Outbox, accepts_event_stream, stream_events
+from ._outbox import (
+    ChannelClosed,
+    EventStreamResponse,
+    Outbox,
+    accepts_event_stream,
+    stream_events,
+)
 from ._sessions import ClientHandle, LocalSession, Rejection, SessionManager
 from .base import ClientContext
 from .sse import SSETransport
@@ -749,7 +755,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         response.  If the acknowledgment comes first, the answer is a
         ``text/event-stream`` starting with it; if ``dispatch`` finishes
         first, the listen was refused, and the error is answered as JSON.
-        Closing the stream is the client's cancel.
+        An answer ``dispatch`` gives once the stream has begun (middleware
+        that cut the listen short) is the stream's last event.  Closing the
+        stream is the client's cancel.
         """
         msg_id = message.get("id")
         if not accepts_event_stream(request.headers.get("accept")):
@@ -773,10 +781,23 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             push=outbox.put,
         )
         task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
-        # The stream ends once the request does and its last frame is written.
-        task.add_done_callback(lambda _: outbox.close())
-        self._dispatches.add(task)
         streaming = False
+
+        def finished(_: object) -> None:
+            # The stream ends once the request does and its last frame is
+            # written.  A listen acknowledged (its acknowledgment is queued,
+            # or the stream has begun) and then cut short, by middleware
+            # that gave up on it say, ends with the answer dispatch gave.
+            acknowledged = streaming or len(outbox)
+            if acknowledged and not task.cancelled() and task.exception() is None:
+                response = task.result()
+                if response is not None:
+                    with contextlib.suppress(ChannelClosed):
+                        outbox.put(response)
+            outbox.close()
+
+        task.add_done_callback(finished)
+        self._dispatches.add(task)
         try:
             waiter = asyncio.ensure_future(outbox.wait())
             try:

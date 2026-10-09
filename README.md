@@ -317,9 +317,18 @@ in each process, even with a shared store (`-32007`, HTTP `503`, beyond
 either). Opening a listen or `GET` stream costs one request
 of the rate-limit budget; what the server sends on it costs nothing.
 
+Request middleware sees listen requests and may refuse them; `call_next()`
+returns once the stream ends. A listen that middleware cuts short after its
+acknowledgment (a timeout around `call_next()`, say) is answered with the
+middleware's error, over HTTP as the stream's last event. Once a stream has
+had its result, or its client cancelled it, an error raised after
+`call_next()` is not sent: a request gets one answer.
+
 A custom transport takes part by setting `ClientContext.push` (how the server
 sends on the client's channel) and `ClientContext.multiplexed`, and by calling
-`server.close_subscriptions(context)` when the channel ends.
+`server.close_subscriptions(context)` when the channel ends, and again once
+the requests it was still running have finished (an `initialize` answered
+meanwhile starts the session's notifications anew).
 
 ### Launching from the command line
 

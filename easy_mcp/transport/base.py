@@ -58,7 +58,10 @@ class ClientContext:
     channel (stdio, the legacy SSE stream): a subscription the server ends
     is then also announced with ``notifications/cancelled``.  A transport
     calls :meth:`MCPServer.close_subscriptions
-    <easy_mcp.MCPServer.close_subscriptions>` when the channel ends.
+    <easy_mcp.MCPServer.close_subscriptions>` when the channel ends, and
+    again once the requests it was still running have finished: an
+    ``initialize`` answered meanwhile starts the session's notifications
+    anew.
 
     New fields are only ever appended, with defaults, so positional
     construction keeps working.
