@@ -6,7 +6,7 @@ import dataclasses
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from ..security.ratelimit import SlidingWindowRateLimiter
@@ -177,6 +177,27 @@ class MemoryStore(Store):
             entry.record = dataclasses.replace(
                 entry.record, baselines=tuple(sorted(baselines.items()))
             )
+
+    async def update_subscriptions(
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        add: Collection[str] = (),
+        remove: Collection[str] = (),
+        cap: int,
+    ) -> tuple[str, ...] | None:
+        entry = self._entry(kind, ref)
+        if entry is None:
+            return None
+        uris = set(entry.record.subscriptions or ()) - set(remove)
+        for uri in add:
+            if len(uris) >= cap:
+                break
+            uris.add(uri)
+        subscribed = tuple(sorted(uris))
+        entry.record = dataclasses.replace(entry.record, subscriptions=subscribed)
+        return subscribed
 
     async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         if self._entry(kind, ref) is None:

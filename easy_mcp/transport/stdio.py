@@ -22,8 +22,9 @@ Security handled here (before anything reaches the dispatcher):
   inside a tool cannot break the protocol stream.
 
 The server's own messages share stdout with the responses, one line each:
-``notifications/tools/list_changed`` once ``initialize`` has been answered,
-and the frames of ``subscriptions/listen`` streams, which a
+the list-change notifications once ``initialize`` has been answered,
+``notifications/resources/updated`` for the resources the client subscribed
+to, and the frames of ``subscriptions/listen`` streams, which a
 ``notifications/cancelled`` naming the listen request ends.  When stdin
 closes, each open listen stream gets its result and then
 ``notifications/cancelled`` before serving ends.

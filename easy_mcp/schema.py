@@ -10,12 +10,14 @@ the request path and its behavior is easy to audit.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import json
+import math
 import re
 import types
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from .exceptions import SchemaError, ValidationError
@@ -393,6 +395,210 @@ def output_model(fn: Callable[..., Any]) -> Any | None:
         return None
     base, _ = _unwrap_annotated(hints.get("return", inspect.Parameter.empty))
     return base if is_pydantic_model(base) else None
+
+
+# ----------------------------------------------- string parameters (prompts)
+#
+# Prompt arguments and URI template variables arrive as strings, so their
+# parameters are limited to types with an exact, strict string form.
+
+_STRING_TYPES_MESSAGE = (
+    "prompt arguments and template variables arrive as strings; use str, int, float, "
+    "bool or Literal"
+)
+_INTEGER = re.compile(r"[+-]?[0-9]+")
+_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+class _Unconvertible(ValueError):
+    """A string that is not a value of the parameter's type; the message says what was expected."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StringParameter:
+    """One parameter whose value arrives as a string (a prompt argument, a template variable).
+
+    Attributes:
+        name: The parameter's name.
+        description: From ``Annotated[T, "..."]`` or the docstring; ``None`` when absent.
+        required: Whether it has no default.
+        default: The default, when it has one.
+        convert: Turns the wire string into the parameter's value, raising
+            ``ValueError`` (whose message says what was expected) when it cannot.
+        choices: The strings it accepts, for a ``Literal`` or ``bool``
+            parameter (completed automatically); ``None`` otherwise.
+        type_label: The parameter's type, for messages.
+    """
+
+    name: str
+    description: str | None
+    required: bool
+    default: Any
+    convert: Callable[[str], Any]
+    choices: tuple[str, ...] | None
+    type_label: str
+
+
+def _convert_str(value: str) -> str:
+    return value
+
+
+def _convert_int(value: str) -> int:
+    if _INTEGER.fullmatch(value) is None:
+        raise _Unconvertible("expected integer")
+    try:
+        return int(value)
+    except ValueError:  # beyond the interpreter's digit limit
+        raise _Unconvertible("expected integer") from None
+
+
+def _convert_float(value: str) -> float:
+    if _NUMBER.fullmatch(value) is None:
+        raise _Unconvertible("expected number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise _Unconvertible("expected a finite number")
+    return number
+
+
+def _convert_bool(value: str) -> bool:
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    raise _Unconvertible("expected true or false")
+
+
+def _literal_converter(members: tuple[Any, ...]) -> Callable[[str], Any]:
+    by_text = {str(member): member for member in members}
+
+    def convert(value: str) -> Any:
+        try:
+            return by_text[value]
+        except KeyError:
+            raise _Unconvertible(f"must be one of {list(by_text)!r}") from None
+
+    return convert
+
+
+def _string_type(annotation: Any) -> tuple[Callable[[str], Any], tuple[str, ...] | None, str]:
+    """``(convert, choices, label)`` for one of the string-parameter types.
+
+    Raises:
+        SchemaError: Any other annotation.
+    """
+    if annotation is str:
+        return _convert_str, None, "string"
+    if annotation is bool:
+        return _convert_bool, ("false", "true"), "boolean"
+    if annotation is int:
+        return _convert_int, None, "integer"
+    if annotation is float:
+        return _convert_float, None, "number"
+    if typing.get_origin(annotation) is typing.Literal:
+        members = typing.get_args(annotation)
+        for member in members:
+            if not isinstance(member, str | int | float | bool):
+                raise SchemaError(f"Literal values must be str, int, float or bool, got {member!r}")
+        choices = tuple(dict.fromkeys(str(member) for member in members))
+        return _literal_converter(members), choices, "one of " + ", ".join(choices)
+    raise SchemaError(_STRING_TYPES_MESSAGE)
+
+
+def string_parameters(
+    fn: Callable[..., Any], param_docs: Mapping[str, str] | None = None
+) -> tuple[StringParameter, ...]:
+    """The parameters of *fn*, each of a type that arrives as a string.
+
+    Allowed: ``str``, ``int``, ``float``, ``bool``, ``Literal[...]`` of those,
+    and ``T | None`` of them with a default, each optionally in
+    ``Annotated[T, "description"]``.  A parameter without an annotation is
+    a ``str``.
+
+    Raises:
+        SchemaError: Naming the parameter that is refused, and why.
+    """
+    param_docs = param_docs or {}
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except Exception as exc:
+        raise SchemaError(f"could not resolve type hints: {exc}") from exc
+    result: list[StringParameter] = []
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            raise SchemaError("*args/**kwargs parameters are not supported")
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            raise SchemaError("positional-only parameters are not supported")
+        annotation = hints.get(name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = str  # the value arrives as one, and nothing says to convert it
+        base, description = _unwrap_annotated(annotation)
+        has_default = param.default is not inspect.Parameter.empty
+        origin = typing.get_origin(base)
+        if origin is typing.Union or origin is types.UnionType:
+            options = [arg for arg in typing.get_args(base) if arg is not type(None)]
+            if len(options) != 1 or len(options) == len(typing.get_args(base)):
+                raise SchemaError(f"parameter '{name}': {_STRING_TYPES_MESSAGE}")
+            if not has_default:
+                raise SchemaError(f"parameter '{name}': an optional parameter needs a default")
+            base, inner_description = _unwrap_annotated(options[0])
+            description = description or inner_description
+        try:
+            convert, choices, label = _string_type(base)
+        except SchemaError as exc:
+            raise SchemaError(f"parameter '{name}': {exc}") from exc
+        result.append(
+            StringParameter(
+                name=name,
+                description=description or param_docs.get(name) or None,
+                required=not has_default,
+                default=param.default if has_default else None,
+                convert=convert,
+                choices=choices,
+                type_label=label,
+            )
+        )
+    return tuple(result)
+
+
+def bind_string_arguments(
+    params: Iterable[StringParameter],
+    raw: Mapping[str, Any],
+    *,
+    message: str = "Invalid prompt arguments",
+) -> dict[str, Any]:
+    """Convert string arguments to the values *params* take, checking every one.
+
+    Every violation is reported together: a value that is not a string, an
+    unknown key, a missing required argument, a value that does not convert.
+    Arguments left out that have a default are left out (the default applies).
+
+    Raises:
+        ValidationError: ``-32602`` listing every violation, under *message*.
+    """
+    known = {param.name: param for param in params}
+    errors: list[str] = []
+    bound: dict[str, Any] = {}
+    for key in raw:
+        if not isinstance(key, str) or key not in known:
+            errors.append(f"arguments.{key}: unexpected argument")
+    for name, param in known.items():
+        if name not in raw:
+            if param.required:
+                errors.append(f"arguments.{name}: missing required argument")
+            continue
+        value = raw[name]
+        if not isinstance(value, str):
+            errors.append(f"arguments.{name}: expected string, got {type(value).__name__}")
+            continue
+        try:
+            bound[name] = param.convert(value)
+        except ValueError as exc:
+            errors.append(f"arguments.{name}: {exc}")
+    if errors:
+        raise ValidationError(errors, message=message)
+    return bound
 
 
 def validate_result(result: Any, schema: dict[str, Any]) -> Any:

@@ -106,7 +106,7 @@ class ClientIdentity:
 
 
 class Guarded(Protocol):
-    """What authorization reads from a registered item (a tool, for now)."""
+    """What authorization reads from a registered item: a tool, resource, template or prompt."""
 
     @property
     def name(self) -> str: ...
@@ -134,7 +134,8 @@ def current_identity() -> ClientIdentity | None:
     ``scopes`` and ``claims``, so a tool can key its own state by the user
     the token names; the token itself is never handed to tool code.  Works in
     sync tools (on their thread) and in tool middleware, as
-    :func:`~easy_mcp.current_cancel_token` does.
+    :func:`~easy_mcp.current_cancel_token` does, and in resources, prompts
+    and completers too.
     """
     return _current_identity.get()
 
@@ -240,27 +241,29 @@ class APIKeyAuth:
         return matched
 
 
-def authorize(identity: ClientIdentity | None, tool: Guarded) -> None:
-    """Enforce a tool's auth requirements against the caller's identity.
+def authorize(identity: ClientIdentity | None, tool: Guarded, kind: str = "Tool") -> None:
+    """Enforce an item's auth requirements against the caller's identity.
+
+    *kind* names the item in messages (``"Tool"``, ``"Prompt"``, ...).
 
     Raises:
-        AuthenticationError: The tool is protected and the caller is anonymous.
-        AuthorizationError: The caller lacks every scope the tool requires.
+        AuthenticationError: The item is protected and the caller is anonymous.
+        AuthorizationError: The caller lacks every scope the item requires.
     """
     if not tool.requires_auth:
         return
     if identity is None:
-        raise AuthenticationError(f"Tool '{tool.name}' requires authentication")
+        raise AuthenticationError(f"{kind} '{tool.name}' requires authentication")
     if tool.scopes and "*" not in identity.scopes and not (identity.scopes & tool.scopes):
         raise AuthorizationError(
-            f"Tool '{tool.name}' requires one of scopes: {sorted(tool.scopes)}"
+            f"{kind} '{tool.name}' requires one of scopes: {sorted(tool.scopes)}"
         )
 
 
 def visible(identity: ClientIdentity | None, tool: Guarded) -> bool:
-    """Whether *tool* should appear in ``tools/list`` for this caller.
+    """Whether *tool* (or a resource, template or prompt) is listed for this caller.
 
-    Protected tools are hidden from callers who could not invoke them, so
+    Protected items are hidden from callers who could not use them, so
     unauthorized clients cannot even enumerate them.
     """
     if not tool.requires_auth:

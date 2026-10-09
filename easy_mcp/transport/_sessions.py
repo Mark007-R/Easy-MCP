@@ -29,7 +29,7 @@ import json
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable, Mapping
+from collections.abc import Collection, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -142,6 +142,12 @@ class LocalSession:
     waiting: set[Hashable] = field(default_factory=set)
     # The transport's own object, with a close(reason) method.
     notify_stream: Any = None
+    # Changes to its resource subscriptions and reads of them under way
+    # here, and whether two overlapped: their answers may then have come
+    # in another order than the store took them, so the subscriptions a
+    # stream held here watches are read again once none is under way.
+    subscription_ops: int = 0
+    subscriptions_stale: bool = False
 
     @property
     def in_flight(self) -> _InFlight:
@@ -194,6 +200,13 @@ class _SessionHandle(StoreHandle):
 
     async def cancel_elsewhere(self, request_id: str | int) -> None:
         await self._manager.cancel_elsewhere(self._local, request_id)
+
+    async def update_subscriptions(
+        self, *, add: Collection[str] = (), remove: Collection[str] = (), cap: int
+    ) -> tuple[str, ...] | None:
+        return await self._manager.update_subscriptions(
+            self._local, add=add, remove=remove, cap=cap
+        )
 
 
 class ClientHandle(StoreHandle):
@@ -503,7 +516,7 @@ class SessionManager:
             self._server._logger.error("could not record a session's lists", exc_info=True)
 
     def start_notifications(self, local: LocalSession, identity: ClientIdentity | None) -> None:
-        """Announce list changes on *local*'s legacy SSE stream from now on.
+        """Announce list changes and resource updates on *local*'s legacy SSE stream from now on.
 
         Called once its ``initialize`` result is queued on the stream held
         here, whichever worker dispatched it: nothing can then reach the
@@ -517,7 +530,116 @@ class SessionManager:
             identity=identity,
             client_id=local.record.client_id,
             multiplexed=True,
+            subscriptions=local.record.subscriptions or (),
         )
+
+    async def update_subscriptions(
+        self,
+        local: LocalSession,
+        *,
+        add: Collection[str] = (),
+        remove: Collection[str] = (),
+        cap: int,
+    ) -> tuple[str, ...] | None:
+        """Change the resources *local* is subscribed to, in the store.
+
+        With a shared store, the worker holding the session's stream (its
+        legacy SSE stream, or a ``GET /mcp`` stream wherever one is open)
+        is told to read them again (``resub``).
+
+        Returns:
+            Every URI it is now subscribed to, or ``None`` when it is gone.
+
+        Raises:
+            StoreUnavailableError: The store cannot be reached.
+            NotImplementedError: The store keeps no subscriptions.
+        """
+        self._subscriptions_begin(local)
+        try:
+            subscribed = await self.store.update_subscriptions(
+                self._kind, local.ref, add=add, remove=remove, cap=cap
+            )
+            if subscribed is None:
+                return None
+            if not local.ended:
+                local.record = dataclasses.replace(local.record, subscriptions=subscribed)
+            if self.store.shared and not (self._kind == "sse" and local.owned):
+                payload = _bus.seal(
+                    "resub",
+                    self._kind,
+                    local.ref,
+                    local.record.identity_fp,
+                    local.session_id,
+                    self.store.worker_id,
+                )
+                owner = local.record.owner
+                if self._kind == "sse" and owner is not None:
+                    await self._publish(payload, to=owner)
+                else:
+                    # A GET /mcp stream may be open on any worker.
+                    await self._broadcast(payload)
+            return subscribed
+        finally:
+            self._subscriptions_end(local)
+
+    def resync_subscriptions(self, local: LocalSession) -> None:
+        """Read *local*'s resource subscriptions again, in the background, for its new stream.
+
+        For a ``GET /mcp`` stream just opened here with a shared store: the
+        record was read before the stream existed, and a ``resub`` that
+        came meanwhile found no stream to update.
+        """
+        if self.store.shared and not local.ended:
+            self._spawn(self._reload_subscriptions(local))
+
+    def _holds_stream(self, local: LocalSession) -> bool:
+        """Whether the stream *local*'s updates go to is held here."""
+        return local.notify_stream is not None or (local.owned and local.stream is not None)
+
+    def _subscriptions_begin(self, local: LocalSession) -> None:
+        if local.subscription_ops:
+            local.subscriptions_stale = True
+        local.subscription_ops += 1
+
+    def _subscriptions_end(self, local: LocalSession) -> None:
+        local.subscription_ops -= 1
+        if local.subscription_ops or not local.subscriptions_stale:
+            return
+        local.subscriptions_stale = False
+        if self.store.shared and not local.ended and self._holds_stream(local):
+            # Read after every change made here: the store has them all.
+            self._spawn(self._reload_subscriptions(local))
+
+    async def _reload_subscriptions(self, local: LocalSession) -> None:
+        """Read *local*'s resource subscriptions from the store again, for the stream held here.
+
+        A read that overlapped another change or read here is not applied:
+        one more read follows once none is under way (:meth:`_subscriptions_end`).
+        Never raises: what fails leaves the stream with the subscriptions it had.
+        """
+        self._subscriptions_begin(local)
+        try:
+            try:
+                record, expired = await self.store.acquire_session(self._kind, local.ref, ttl=None)
+            except StoreUnavailableError:
+                return  # the store logged the outage
+            except Exception:
+                self._server._logger.error(
+                    "could not read a session's subscriptions", exc_info=True
+                )
+                return
+            self._expire(expired)
+            if record is None:
+                return
+            await self._release(local.ref, touch=False)
+            if local.ended or local.subscriptions_stale:
+                return
+            local.record = dataclasses.replace(local.record, subscriptions=record.subscriptions)
+            self._server._notifier.set_subscriptions(
+                local.session_id, record.subscriptions or (), hold=False
+            )
+        finally:
+            self._subscriptions_end(local)
 
     async def record_version(self, local: LocalSession, version: str) -> None:
         """Record in a shared store the version *local*'s handshake negotiated here.
@@ -927,6 +1049,12 @@ class SessionManager:
                 task.cancel()
         elif envelope.op == "end":
             self._end_here(local)
+        elif envelope.op == "resub":
+            # The session's resource subscriptions changed on another worker;
+            # only one holding a stream of it has anything to update (one
+            # still opening reads them once it is open: resync_subscriptions).
+            if self._holds_stream(local):
+                self._spawn(self._reload_subscriptions(local))
         elif local.owned and local.stream is not None:  # deliver, to the stream's owner
             version = envelope.body.get("ver")
             message = envelope.body["msg"]

@@ -1,12 +1,14 @@
-"""Change notifications: who is told that a list changed, and the listen frames.
+"""Change notifications: who is told that a list or a resource changed, and the listen frames.
 
 Internal: users never import it.  A change to a list (registering or
-removing a tool) is announced to two kinds of recipient, each a *sink*:
+removing a tool, a resource, a template or a prompt) is announced to two
+kinds of recipient, each a *sink*:
 
 * a handshake-era session, told with an untagged
-  ``notifications/tools/list_changed`` once its ``initialize`` result has
-  been sent: on stdout over stdio, on the legacy ``/sse`` stream, on a
-  Streamable HTTP session's ``GET /mcp`` stream;
+  ``notifications/tools/list_changed`` (or the prompts or resources one)
+  once its ``initialize`` result has been sent: on stdout over stdio, on the
+  legacy ``/sse`` stream, on a Streamable HTTP session's ``GET /mcp``
+  stream;
 * one ``subscriptions/listen`` stream (2026-07-28), told with notifications
   tagged with the listen request's id, after its acknowledgment.
 
@@ -17,9 +19,17 @@ its client may see with the digest of what it was last told, so a client
 hears about a change only when *its* list changed: a tool it cannot see,
 or one added and removed within the window, sends nothing.
 
-Changes may come from any thread.  Only :meth:`_Sink.request_flush` runs off
-the event loop, and it touches nothing but the pending set, under a lock;
-the flush itself runs on the sink's own loop.
+A resource update (``notifications/resources/updated``) is the second topic.
+It goes to the sessions subscribed to the URI (``resources/subscribe``) and
+to the listen streams whose acknowledgment honored it
+(``resourceSubscriptions``), matched by the exact URI.  It is not debounced,
+only coalesced: an update still waiting to be written is not queued again.
+An update for a session that has no sink yet (no ``GET /mcp`` stream open,
+say) waits for one, when the session is kept in this process.
+
+Changes may come from any thread.  Only :meth:`_Sink.request_flush` and
+:meth:`_Sink.request_update` run off the event loop, and they touch nothing
+but the pending sets, under a lock; the flushes run on the sink's own loop.
 """
 
 from __future__ import annotations
@@ -46,6 +56,11 @@ LIST_CHANGED_DEBOUNCE_SECONDS = 0.1
 
 # Listen streams one client may hold open in one process.
 MAX_SUBSCRIPTIONS_PER_CLIENT = 8
+
+# Resource URIs one listen stream, or one handshake-era session, may watch.
+MAX_RESOURCE_SUBSCRIPTIONS = 1000
+
+RESOURCE_UPDATED_METHOD = "notifications/resources/updated"
 
 # The text of the notifications/cancelled that ends a subscription the
 # server tore down, by why it did.
@@ -75,10 +90,14 @@ def _subscription_key(value: Any) -> tuple[str, Any]:
     return type(value).__name__, value
 
 
-def parse_filter(value: object) -> tuple[frozenset[str], bool]:
-    """The list kinds a ``notifications`` filter asks for, and whether it names resources.
+def parse_filter(value: object) -> tuple[frozenset[str], tuple[str, ...] | None]:
+    """The list kinds a ``notifications`` filter asks for, and the resource URIs it names.
 
-    Unknown fields are ignored (a later revision may add some).
+    The URIs are ``None`` when the filter has no ``resourceSubscriptions``,
+    and are not counted here: a server without resources ignores them, and
+    one with resources refuses more than :data:`MAX_RESOURCE_SUBSCRIPTIONS`
+    as a limit (``-32007``).  Unknown fields are ignored (a later revision
+    may add some).
 
     Raises:
         ProtocolError: ``-32602`` for a filter that is not an object, a flag
@@ -101,15 +120,15 @@ def parse_filter(value: object) -> tuple[frozenset[str], bool]:
             )
         if flag:
             kinds.add(kind)
-    resources = value.get("resourceSubscriptions")
-    if "resourceSubscriptions" in value and not (
-        isinstance(resources, list) and all(isinstance(uri, str) for uri in resources)
-    ):
+    if "resourceSubscriptions" not in value:
+        return frozenset(kinds), None
+    resources = value["resourceSubscriptions"]
+    if not (isinstance(resources, list) and all(isinstance(uri, str) for uri in resources)):
         raise ProtocolError(
             "Invalid params: notifications.resourceSubscriptions must be an array of strings",
             code=INVALID_PARAMS,
         )
-    return frozenset(kinds), bool(resources)
+    return frozenset(kinds), tuple(resources)
 
 
 def _digest_failed(kind: str) -> None:
@@ -126,14 +145,30 @@ def _tag(subscription_id: Any) -> dict[str, Any]:
     return {META_SUBSCRIPTION_ID: subscription_id}
 
 
-def ack_message(subscription_id: Any, kinds: Iterable[str]) -> dict[str, Any]:
-    """``notifications/subscriptions/acknowledged`` naming the kinds that will be honored."""
-    honored = {LIST_KINDS[kind][1]: True for kind in sorted(kinds)}
+def ack_message(
+    subscription_id: Any, kinds: Iterable[str], resources: Iterable[str] | None = None
+) -> dict[str, Any]:
+    """``notifications/subscriptions/acknowledged`` naming what will be honored.
+
+    *resources* are the resource URIs honored; ``None`` leaves
+    ``resourceSubscriptions`` out.
+    """
+    honored: dict[str, Any] = {LIST_KINDS[kind][1]: True for kind in sorted(kinds)}
+    if resources is not None:
+        honored["resourceSubscriptions"] = list(resources)
     return {
         "jsonrpc": "2.0",
         "method": ACKNOWLEDGED_METHOD,
         "params": {"_meta": _tag(subscription_id), "notifications": honored},
     }
+
+
+def resource_updated_message(uri: str, subscription_id: Any = None) -> dict[str, Any]:
+    """``notifications/resources/updated`` for *uri*: tagged on a listen stream, bare otherwise."""
+    params: dict[str, Any] = {"uri": uri}
+    if subscription_id is not None:
+        params = {"_meta": _tag(subscription_id), "uri": uri}
+    return {"jsonrpc": "2.0", "method": RESOURCE_UPDATED_METHOD, "params": params}
 
 
 def list_changed_message(kind: str, subscription_id: Any = None) -> dict[str, Any]:
@@ -172,6 +207,8 @@ class _Sink:
         "_pending",
         "_scheduled",
         "_timer",
+        "_updates",
+        "_updates_scheduled",
         "baselines",
         "channel",
         "client_id",
@@ -186,6 +223,7 @@ class _Sink:
         "push",
         "settled",
         "subscription_id",
+        "uris",
     )
 
     def __init__(
@@ -203,6 +241,7 @@ class _Sink:
         multiplexed: bool,
         loop: asyncio.AbstractEventLoop,
         baselines: dict[str, str],
+        uris: frozenset[str] = frozenset(),
     ) -> None:
         self._notifier = notifier
         self.key = key
@@ -223,10 +262,16 @@ class _Sink:
         # its completion result, or its client cancelled it.
         self.settled = False
         self.closed = False
+        # The resource URIs a listen stream was acknowledged for; a session's
+        # are kept by the notifier, since they outlive its sinks.
+        self.uris = uris
         self._finalizer: Any = None
         self._pending: set[str] = set()
         self._scheduled = False
         self._timer: asyncio.TimerHandle | None = None
+        # Resource updates waiting for a flush, in order (a dict as an ordered set).
+        self._updates: dict[str, None] = {}
+        self._updates_scheduled = False
         self._lock = threading.Lock()
 
     def request_flush(self, kind: str) -> None:
@@ -288,17 +333,67 @@ class _Sink:
             self.baselines[kind] = digest
             logger.debug("told client %s that the %s list changed", self.client_id, kind)
 
-    def _close(self) -> None:
-        """Stop for good: no flush runs for it from now on.  On its loop, or once it has closed."""
+    def request_update(self, uri: str) -> bool:
+        """Note that the resource *uri* changed; any thread.  Whether it will be told.
+
+        Not debounced: the update is sent on the sink's loop as soon as it
+        runs.  An update for *uri* still waiting is not queued again.
+        """
+        with self._lock:
+            if self.closed:
+                return False
+            if uri in self._updates:
+                return True
+            self._updates[uri] = None
+            if self._updates_scheduled:
+                return True
+            self._updates_scheduled = True
+        try:
+            self.loop.call_soon_threadsafe(self._flush_updates)
+        except RuntimeError:
+            # Its loop has closed: nobody is left to tell.
+            self._notifier.drop(self, "undeliverable")
+            return False
+        return True
+
+    def _flush_updates(self) -> None:
+        with self._lock:
+            uris = list(self._updates)
+            self._updates.clear()
+            self._updates_scheduled = False
+        for index, uri in enumerate(uris):
+            if self.closed:
+                return
+            if not self._notifier._watches(self, uri):
+                continue  # unsubscribed meanwhile
+            try:
+                self.push(resource_updated_message(uri, self.subscription_id))
+            except Exception:
+                # Its channel closed before the sink ended (a stream whose
+                # token expired): this update and the rest go on (drop).
+                self._notifier.drop(self, "undeliverable", unsent=uris[index:])
+                return
+            logger.debug("told client %s that a resource changed", self.client_id)
+
+    def _close(self) -> list[str]:
+        """Stop for good: no flush runs for it from now on.  On its loop, or once it has closed.
+
+        Returns the resource updates that were still waiting here, taken in
+        the same step, so none can be queued between: a sink that replaces
+        it, or the session's next one, sends them instead.
+        """
         with self._lock:
             self.closed = True
             self._pending.clear()
+            waiting = list(self._updates)
+            self._updates.clear()
         timer, self._timer = self._timer, None
         if timer is not None:
             timer.cancel()
         finalizer, self._finalizer = self._finalizer, None
         if finalizer is not None:
             finalizer.detach()
+        return waiting
 
     def _set_ended(self) -> None:
         ended = self.ended
@@ -320,6 +415,23 @@ class _Sink:
         """Wait until the stream ends, whoever ends it."""
         assert self.ended is not None
         await self.ended.wait()
+
+
+class _Subscriptions:
+    """The resources one session is subscribed to, and the updates waiting for its sink.
+
+    *hold*: updates made while the session has no sink wait for one.  Only
+    for a session kept in this process: with a shared store its next
+    stream may open on another worker, and the entry lives only as long as
+    a sink here.
+    """
+
+    __slots__ = ("held", "hold", "uris")
+
+    def __init__(self, hold: bool) -> None:
+        self.uris: set[str] = set()
+        self.held: dict[str, None] = {}
+        self.hold = hold
 
 
 class ChangeNotifier:
@@ -350,6 +462,10 @@ class ChangeNotifier:
         self._channels: dict[Hashable, dict[tuple[str, Any], _Sink]] = {}
         self._per_client: collections.Counter[str] = collections.Counter()
         self._listens = 0
+        # The resource URIs each handshake-era session is subscribed to, by
+        # session.  They outlive the session's sinks (a GET /mcp stream may
+        # close and another open), and end with the session.
+        self._subscribed: dict[Hashable, _Subscriptions] = {}
 
     def baselines(self, kinds: Iterable[str], identity: ClientIdentity | None) -> dict[str, str]:
         """The digest of each of *kinds* as *identity* sees it now.
@@ -379,6 +495,8 @@ class ChangeNotifier:
         baselines: dict[str, str],
         multiplexed: bool = False,
         anchor: object | None = None,
+        subscriptions: Iterable[str] | None = None,
+        hold: bool = True,
     ) -> _Sink:
         """Tell the session *key* about list changes from now on, through *push*.
 
@@ -386,7 +504,10 @@ class ChangeNotifier:
         last told the lists hold.  A sink the session had is replaced.
         With an *anchor*, the sink goes (on its loop) once the anchor is
         collected, so a transport that forgets to end the session leaks
-        nothing.
+        nothing.  It is told about updates of the resources the session is
+        subscribed to as well: *subscriptions* when given (with *hold*, as
+        :meth:`set_subscriptions` takes them), and first about those updated
+        while the session had no sink.
         """
         kinds = frozenset(kinds)
         sink = _Sink(
@@ -408,8 +529,17 @@ class ChangeNotifier:
         with self._lock:
             replaced = self._sessions.get(key)
             self._sessions[key] = sink
-        if replaced is not None:
-            replaced._close()
+            if subscriptions is not None:
+                self._set_subscriptions(key, subscriptions, hold)
+            entry = self._subscribed.get(key)
+            held = list(entry.held) if entry is not None else []
+            if entry is not None:
+                entry.held.clear()
+        # An update a publisher hands the replaced sink from now on is
+        # refused there, and sent here instead (publish_resource_updated).
+        carried = replaced._close() if replaced is not None else []
+        for uri in dict.fromkeys([*carried, *held]):
+            sink.request_update(uri)
         return sink
 
     def session(self, key: Hashable) -> _Sink | None:
@@ -440,20 +570,179 @@ class ChangeNotifier:
         # this notifier's (or the sink's) locks held there: it takes none,
         # and leaves ending the session to the sink's loop.
         try:
-            sink.loop.call_soon_threadsafe(self.end_session, key, sink)
+            sink.loop.call_soon_threadsafe(self._session_collected, key, sink)
         except RuntimeError:
             pass  # its loop has closed: the next change drops it (request_flush)
 
+    def _session_collected(self, key: Hashable, sink: _Sink) -> None:
+        # The session's context is gone, so the session is: its
+        # subscriptions go too, unless another sink took over meanwhile.
+        if self.end_session(key, sink):
+            self.forget_session(key)
+
+    # ------------------------------------------------- resource subscriptions
+
+    def _sink_gone(self, key: Hashable) -> None:
+        """The session *key* has no sink here any more; with the lock held."""
+        entry = self._subscribed.get(key)
+        if entry is not None and not entry.hold:
+            # Kept only while a sink here delivers (a shared store).
+            del self._subscribed[key]
+
+    def _set_subscriptions(self, key: Hashable, uris: Iterable[str], hold: bool) -> None:
+        """:meth:`set_subscriptions`, with the lock held."""
+        wanted = set(uris)
+        if not wanted or (not hold and key not in self._sessions):
+            self._subscribed.pop(key, None)
+            return
+        entry = self._subscribed.get(key)
+        if entry is None:
+            entry = self._subscribed[key] = _Subscriptions(hold)
+        entry.hold = hold
+        entry.uris = wanted
+        entry.held = {uri: None for uri in entry.held if uri in wanted}
+
+    def set_subscriptions(self, key: Hashable, uris: Iterable[str], *, hold: bool) -> None:
+        """The session *key* is subscribed to exactly *uris* (as its store record says).
+
+        With *hold*, updates made while it has no sink wait for one; without,
+        nothing is kept for a session with no sink here.  Any thread.
+        """
+        with self._lock:
+            self._set_subscriptions(key, uris, hold)
+
+    def add_subscription(self, key: Hashable, uri: str, *, hold: bool) -> None:
+        """The session *key*, whose store record keeps its subscriptions, watches *uri* too.
+
+        As :meth:`set_subscriptions` takes the record's whole set (with
+        *hold*), but for the one URI a request added: two requests answered
+        out of order then never leave the older set in place.  Any thread.
+        """
+        with self._lock:
+            if not hold and key not in self._sessions:
+                return  # kept only while a sink here delivers (a shared store)
+            entry = self._subscribed.get(key)
+            if entry is None:
+                entry = self._subscribed[key] = _Subscriptions(hold)
+            entry.hold = hold
+            entry.uris.add(uri)
+
+    def subscribe(self, key: Hashable, uri: str, *, cap: int) -> bool:
+        """Subscribe the session *key*, kept in this process, to *uri*; any thread.
+
+        Returns ``False`` (and changes nothing) when it watches *cap* URIs
+        already.  Idempotent.
+        """
+        with self._lock:
+            entry = self._subscribed.get(key)
+            if entry is None:
+                entry = self._subscribed[key] = _Subscriptions(hold=True)
+            if uri in entry.uris:
+                return True
+            if len(entry.uris) >= cap:
+                return False
+            entry.uris.add(uri)
+            return True
+
+    def unsubscribe(self, key: Hashable, uri: str) -> None:
+        """Stop telling the session *key* about *uri*, even an update already waiting."""
+        with self._lock:
+            entry = self._subscribed.get(key)
+            if entry is None:
+                return
+            entry.uris.discard(uri)
+            entry.held.pop(uri, None)
+            if not entry.uris:
+                del self._subscribed[key]
+
+    def subscriptions(self, key: Hashable) -> frozenset[str]:
+        """The resource URIs the session *key* is subscribed to, as this process knows them."""
+        with self._lock:
+            entry = self._subscribed.get(key)
+            return frozenset(entry.uris) if entry is not None else frozenset()
+
+    def forget_session(self, key: Hashable) -> None:
+        """The session *key* has ended: its subscriptions and waiting updates go."""
+        with self._lock:
+            self._subscribed.pop(key, None)
+
+    def _watches(self, sink: _Sink, uri: str) -> bool:
+        """Whether *sink* is still to be told about *uri*."""
+        if sink.listen:
+            return uri in sink.uris
+        with self._lock:
+            entry = self._subscribed.get(sink.key)
+            return entry is not None and uri in entry.uris
+
+    def publish_resource_updated(self, uri: str) -> int:
+        """The resource *uri* changed: tell every recipient watching it.  Any thread.
+
+        Returns how many subscriptions matched and had the update queued
+        (an update for a session with no sink yet waits for one, when the
+        session is kept in this process).  Delivery itself happens on each
+        recipient's loop.  A session sink that closes between being picked
+        here and being handed the update (its stream replaced or ended
+        meanwhile, on its loop) refuses it, and it goes to the session's
+        sink after it, or waits for one, instead.
+        """
+        count = 0
+        sinks: list[_Sink] = []
+        with self._lock:
+            for key, entry in self._subscribed.items():
+                if uri not in entry.uris:
+                    continue
+                sink = self._sessions.get(key)
+                if sink is not None:
+                    sinks.append(sink)
+                elif entry.hold:
+                    entry.held[uri] = None
+                    count += 1
+            for streams in self._channels.values():
+                sinks.extend(sink for sink in streams.values() if uri in sink.uris)
+        for sink in sinks:
+            if sink.request_update(uri) or (not sink.listen and self._redeliver(sink.key, uri)):
+                count += 1
+        return count
+
     def end_session(self, key: Hashable, sink: _Sink | None = None) -> bool:
-        """Stop telling the session *key* (or only its *sink*, if that is still its sink)."""
+        """Stop telling the session *key* (or only its *sink*, if that is still its sink).
+
+        Resource updates it had yet to write wait for the session's next
+        sink, when the session is kept in this process.
+        """
         with self._lock:
             current = self._sessions.get(key)
             if current is None or (sink is not None and current is not sink):
                 return False
             del self._sessions[key]
-        current._close()
+            self._sink_gone(key)
+        for uri in current._close():
+            self._redeliver(key, uri)
         logger.debug("session sink %s ended", current.client_id)
         return True
+
+    def _redeliver(self, key: Hashable, uri: str) -> bool:
+        """Pass an update of *uri* that a closed sink of the session *key* never sent on.
+
+        To the session's sink now, or else to the updates waiting for its
+        next one (when the session is kept in this process); nowhere when
+        the session no longer watches *uri*.  Whether it was queued or kept.
+        Any thread.
+        """
+        while True:
+            with self._lock:
+                entry = self._subscribed.get(key)
+                if entry is None or uri not in entry.uris:
+                    return False
+                sink = self._sessions.get(key)
+                if sink is None:
+                    if not entry.hold:
+                        return False
+                    entry.held[uri] = None
+                    return True
+            if sink.request_update(uri):
+                return True
+            # That sink closed meanwhile too, and has left _sessions: look again.
 
     # ------------------------------------------------------- listen streams
 
@@ -468,11 +757,13 @@ class ChangeNotifier:
         push: Push,
         multiplexed: bool,
         max_total: int,
+        uris: frozenset[str] = frozenset(),
     ) -> _Sink:
         """Register one listen stream; on its loop.
 
         The sink's ``kinds`` are *kinds* less any whose list cannot be
-        computed (:meth:`baselines`): those it is never told about.
+        computed (:meth:`baselines`): those it is never told about.  *uris*
+        are the resources whose updates it is told about.
 
         Raises:
             ProtocolError: ``-32600``: *subscription_id* is open on *channel*
@@ -498,6 +789,7 @@ class ChangeNotifier:
             multiplexed=multiplexed,
             loop=asyncio.get_running_loop(),
             baselines=baselines,
+            uris=uris,
         )
         refused: str | None = None
         with self._lock:
@@ -547,11 +839,16 @@ class ChangeNotifier:
         sink.settled = True  # a cancelled request gets no answer
         return True
 
-    def drop(self, sink: _Sink, reason: str) -> bool:
-        """Remove *sink* without a word to its client.  Idempotent; whether this call removed it."""
+    def drop(self, sink: _Sink, reason: str, *, unsent: Iterable[str] = ()) -> bool:
+        """Remove *sink* without a word to its client.  Idempotent; whether this call removed it.
+
+        A session sink's resource updates it never wrote (*unsent*, which its
+        channel refused, then those still waiting) go to the session's next
+        sink, or wait for one, as with :meth:`end_session`.
+        """
         if not self._unregister(sink):
             return False
-        sink._close()
+        waiting = sink._close()
         if sink.listen:
             audit(
                 "subscription_close",
@@ -561,6 +858,8 @@ class ChangeNotifier:
             )
             sink._set_ended()
         else:
+            for uri in dict.fromkeys([*unsent, *waiting]):
+                self._redeliver(sink.key, uri)
             logger.debug(
                 "session of client %s stops receiving list changes (%s)", sink.client_id, reason
             )
@@ -595,13 +894,16 @@ class ChangeNotifier:
         """End every listen stream of *channel*, and the session *session*'s notifications.
 
         On the loop.  Each listen stream gets its final frames (:meth:`end`)
-        before this returns.  Returns how many subscriptions ended.
+        before this returns.  The session's resource subscriptions end too.
+        Returns how many subscriptions ended.
         """
         with self._lock:
             streams = list(self._channels.get(channel, {}).values()) if channel is not None else []
         ended = sum(1 for sink in streams if self.end(sink, reason))
-        if session is not None and self.end_session(session):
-            ended += 1
+        if session is not None:
+            if self.end_session(session):
+                ended += 1
+            self.forget_session(session)
         return ended
 
     def changed(self, kind: str) -> None:
@@ -624,6 +926,7 @@ class ChangeNotifier:
                 if self._sessions.get(sink.key) is not sink:
                     return False
                 del self._sessions[sink.key]
+                self._sink_gone(sink.key)
                 return True
             streams = self._channels.get(sink.channel)
             if streams is None or streams.get(sink.key) is not sink:

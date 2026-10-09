@@ -31,13 +31,16 @@ from collections.abc import (
     Hashable,
     Iterable,
     Mapping,
+    Sequence,
 )
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from ._version import __version__
 from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cancel_scope
+from .completion import CompletionSource, collect, empty, filter_static, shape
+from .content import NotFound, to_prompt_messages, to_resource_contents
 from .decorators import ToolDefinition, ToolRegistry, build_tool
 from .exceptions import (
     AUTHENTICATION_REQUIRED,
@@ -46,13 +49,18 @@ from .exceptions import (
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    RESOURCE_NOT_FOUND_LEGACY,
     TOOL_TIMEOUT,
     AuthenticationError,
+    AuthorizationError,
     InsufficientScopeError,
     ProtocolError,
+    RegistrationError,
+    ResourceNotFoundError,
     ServerBusyError,
     SessionLimitError,
     StoreUnavailableError,
+    SubscriptionLimitError,
     TokenRequiredError,
     ToolError,
     ToolRegistrationError,
@@ -80,6 +88,8 @@ from .middleware import (
     describe,
     run_chain,
 )
+from .pagination import paginate
+from .prompts import PromptDefinition, PromptRegistry, build_prompt
 from .protocol import (
     DISCOVER_METHOD,
     LATEST_PROTOCOL_VERSION,
@@ -95,6 +105,12 @@ from .protocol import (
     is_reserved_error_code,
     negotiate_protocol_version,
 )
+from .resources import (
+    ResourceDefinition,
+    ResourceRegistry,
+    ResourceTemplateDefinition,
+    build_resource,
+)
 from .schema import build_param_models, dump_model, validate_arguments, validate_result
 from .security.auth import (
     APIKeyAuth,
@@ -107,9 +123,10 @@ from .security.auth import (
 )
 from .security.oauth import LEEWAY_SECONDS, OAuthResourceServer
 from .security.ratelimit import SlidingWindowRateLimiter
-from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle
+from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle, session_ref
 from .store.memory import MemoryStore
 from .subscriptions import (
+    MAX_RESOURCE_SUBSCRIPTIONS,
     ChangeNotifier,
     Push,
     _Sink,
@@ -123,9 +140,12 @@ from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
 from .transport.streamable_http import StreamableHTTPTransport
+from .uritemplate import MAX_URI_LENGTH
 
 # The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
 PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 # Cache hints (ttlMs) on stateless results.  What server/discover reports
 # only ever grows (a capability, once advertised, stays), so clients may keep
@@ -135,6 +155,23 @@ PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 # cached copy is stale immediately.
 DISCOVER_TTL_MS = 3_600_000
 TOOLS_LIST_TTL_MS = 0
+# The same holds for the resources, templates and prompts lists.
+RESOURCES_LIST_TTL_MS = RESOURCE_TEMPLATES_LIST_TTL_MS = PROMPTS_LIST_TTL_MS = 0
+
+# The paginated list methods: (the kind their cursor names, the result field).
+_LISTS: dict[str, tuple[str, str]] = {
+    "resources/list": ("resources", "resources"),
+    "resources/templates/list": ("templates", "resourceTemplates"),
+    "prompts/list": ("prompts", "prompts"),
+}
+
+# A resource URI is echoed in data.uri only up to this length, and audited
+# (logs, never responses) up to the second, so a hostile one-megabyte URI
+# doubles neither a response nor a log line.
+_ECHO_URI_MAX = 2048
+_AUDIT_URI_MAX = 512
+# Messages name a URI by at most this many characters.
+_LABEL_MAX = 256
 
 # Digests of lists as one visibility class sees them, kept for this many
 # (kind, class) pairs: enough for every scope set a deployment uses.
@@ -167,6 +204,10 @@ class _Method:
     # Served only on a channel that can carry server-initiated messages
     # (ClientContext.push).
     needs_push: bool = False
+    # Served only for a session something can later be delivered to: one
+    # with a channel (ClientContext.push), or one kept in the store, whose
+    # GET /mcp stream delivers.
+    needs_session: bool = False
 
 
 # Every method dispatch serves.  Anything else is answered -32601 (or, for a
@@ -177,6 +218,20 @@ _METHODS: dict[str, _Method] = {
     "ping": _Method(legacy=True, modern=False),
     "tools/list": _Method(legacy=True, modern=True, capability="tools"),
     "tools/call": _Method(legacy=True, modern=True, capability="tools"),
+    "resources/list": _Method(legacy=True, modern=True, capability="resources"),
+    "resources/templates/list": _Method(legacy=True, modern=True, capability="resources"),
+    "resources/read": _Method(legacy=True, modern=True, capability="resources"),
+    # Removed in 2026-07-28, where subscriptions/listen replaces them (they
+    # would keep per-connection state).
+    "resources/subscribe": _Method(
+        legacy=True, modern=False, capability="resources", needs_session=True
+    ),
+    "resources/unsubscribe": _Method(
+        legacy=True, modern=False, capability="resources", needs_session=True
+    ),
+    "prompts/list": _Method(legacy=True, modern=True, capability="prompts"),
+    "prompts/get": _Method(legacy=True, modern=True, capability="prompts"),
+    "completion/complete": _Method(legacy=True, modern=True, capability="completions"),
     # Refusing server/discover would make a dual-era client take this server
     # for a legacy one.
     DISCOVER_METHOD: _Method(legacy=False, modern=True, observe_only=True),
@@ -190,6 +245,27 @@ _METHODS: dict[str, _Method] = {
         legacy=True, modern=False, notification=True, observe_only=True, cancellable=False
     ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """What a call of user code runs, for thread names and audit events."""
+
+    kind: str  # "tool", "resource", "prompt" or "completion"
+    label: str  # the tool or prompt name, the URI, or "<prompt or template>.<argument>"
+    field: str  # the audit field the label goes in: "tool", "uri" or "prompt"
+
+
+class _DeadlineExceeded(Exception):
+    """The server's deadline for one call of user code passed; its token fired."""
+
+
+class _UserCancelled(Exception):
+    """User code raised ``CancelledError`` although nothing cancelled its call."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error: BaseException | None = error
 
 
 def _result_response(msg_id: Any, result: Any) -> dict[str, Any]:
@@ -236,6 +312,37 @@ def _drop_unreported_error(awaitable: Any) -> None:
         # task's own step and are reported by whoever runs the loop.
         if error is not None and not isinstance(error, KeyboardInterrupt | SystemExit):
             error.__traceback__ = None
+
+
+def _gather(produced: Any) -> tuple[list[str], int | None]:
+    """What a completer returned, read as :func:`~easy_mcp.completion.collect` reads it."""
+    if isinstance(produced, str | bytes) or not isinstance(produced, Iterable):
+        raise TypeError(f"a completer result of type {type(produced).__name__}")
+    return collect(produced, sized=isinstance(produced, Sequence))
+
+
+def _completer_call(
+    source: CompletionSource, value: str, known: Mapping[str, str]
+) -> tuple[Callable[[], Any], bool]:
+    """A function of no arguments running *source*'s completer, and whether it is async.
+
+    The completer's result is read inside it: on its worker thread for a
+    sync completer, so even a slow generator never holds the event loop.
+    """
+    fn = source.fn
+    assert fn is not None
+    arguments = dict(known)
+    if source.is_async:
+
+        async def run_async() -> tuple[list[str], int | None]:
+            return _gather(await fn(value, arguments))
+
+        return run_async, True
+
+    def run() -> tuple[list[str], int | None]:
+        return _gather(fn(value, arguments))
+
+    return run, False
 
 
 def _tool_failure(text: str) -> dict[str, Any]:
@@ -290,7 +397,8 @@ def _render_result(definition: ToolDefinition, result: Any) -> tuple[str, Any | 
 
 
 class MCPServer:
-    """A secure-by-default MCP server exposing Python functions as tools.
+    """A secure-by-default MCP server exposing Python functions as tools,
+    resources and prompts.
 
     Example::
 
@@ -302,6 +410,11 @@ class MCPServer:
         def add(a: int, b: int) -> int:
             \"\"\"Add two numbers.\"\"\"
             return a + b
+
+        @server.resource("config://app")
+        def app_config() -> dict[str, str]:
+            \"\"\"The application's configuration.\"\"\"
+            return {"region": "eu-west-1"}
 
         server.run()
 
@@ -326,13 +439,15 @@ class MCPServer:
             to the same budget.
         max_request_bytes: Hard cap on request body size.
         default_timeout: Tool execution timeout in seconds unless a tool
-            overrides it; ``None`` disables.
+            overrides it; ``None`` disables.  Resources, prompts and
+            completers get it too.
         max_sync_workers: Cap on sync tools running at once.  Each runs in a
             thread of its own, and a cancelled or timed-out call keeps its
             thread until the tool returns, so the cap also bounds threads
             left behind by tools that ignore their cancel token.  A call
             beyond it is refused with ``-32008`` rather than queued.
-            ``None`` removes the cap.
+            ``None`` removes the cap.  Sync resources, prompts and
+            completers share the same workers.
         max_sessions: Cap on concurrent handshake-era sessions, counted
             separately for Streamable HTTP and legacy SSE; stdio has exactly
             one.  With a shared ``store`` it counts the sessions of every
@@ -417,6 +532,8 @@ class MCPServer:
         )
         self.instructions = instructions
         self._registry = ToolRegistry()
+        self._resources = ResourceRegistry()
+        self._prompts = PromptRegistry()
         self._limiter = (
             SlidingWindowRateLimiter(rate_limit_per_minute)
             if rate_limit_per_minute
@@ -450,6 +567,9 @@ class MCPServer:
         # -> (the registry version it was computed at, digest).
         self._digests: OrderedDict[tuple[str, Hashable], tuple[int, str]] = OrderedDict()
         self._digests_lock = threading.Lock()
+        # The public templates a protected resource or template may answer
+        # for instead (see _shadowed), and the registry version they are of.
+        self._shadowed_templates: tuple[int, frozenset[str]] = (-1, frozenset())
         # Who is told when a list changes: sessions and listen streams.
         self._notifier = ChangeNotifier(
             self._list_digest, view=self._visibility_class, final=self._listen_final
@@ -540,15 +660,236 @@ class MCPServer:
         self._notifier.changed("tools")
         return removed
 
-    def _warn_if_shared(self, change: str, name: str) -> None:
-        """Warn that a tool changed in this worker only, when workers share a store."""
+    def _warn_if_shared(self, change: str, name: str, noun: str = "tool") -> None:
+        """Warn that a tool (or other *noun*) changed in this worker only, with a shared store."""
         if self._serving and self._store.shared:
             self._logger.warning(
-                "tool %r %s while serving with a shared store: only this worker sees the "
-                "change; every worker must register the same tools",
+                "%s %r %s while serving with a shared store: only this worker sees the "
+                "change; every worker must register the same %ss",
+                noun,
                 name,
                 change,
+                noun,
             )
+
+    def _check_oauth_scopes(self, scopes: Iterable[str], what: str) -> None:
+        """Refuse a scope no ``WWW-Authenticate`` challenge could name, with ``oauth``.
+
+        Raises:
+            RegistrationError: Naming *what* and the scope.
+        """
+        if self.oauth is None:
+            return
+        for scope in scopes:
+            if not is_scope_token(scope) or scope == "offline_access":
+                raise RegistrationError(
+                    f"cannot register {what}: scope {scope!r} cannot be used with OAuth (a "
+                    "scope is printable ASCII without spaces, quotes or backslashes, and "
+                    "offline_access is no resource scope)"
+                )
+
+    # ------------------------------------------------------- resources, prompts
+
+    def resource(
+        self,
+        uri: str,
+        /,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        mime_type: str | None = None,
+        size: int | None = None,
+        annotations: Mapping[str, Any] | None = None,
+        requires_auth: bool = False,
+        scopes: Iterable[str] = (),
+        timeout: float | None = None,
+        cache_ttl: float = 0.0,
+        complete: Mapping[str, Any] | None = None,
+    ) -> Callable[[_F], _F]:
+        """Register a function as an MCP resource at *uri*.
+
+        The function's return value is the content: ``str`` is text,
+        ``bytes`` a base64 ``blob``, dicts, lists and Pydantic models JSON,
+        :class:`~easy_mcp.ResourceContent` items as given.  Returning
+        ``None`` means the resource does not exist.  A *uri* containing
+        ``{name}`` (one path segment) or ``{+name}`` (several) is a template
+        whose variables become the function's parameters (``str``, ``int``,
+        ``float``, ``bool`` or a ``Literal``)::
+
+            @server.resource("users://{user_id}/profile", scopes=("users",))
+            def profile(user_id: int) -> dict[str, Any] | None:
+                \"\"\"A user's profile.\"\"\"
+                return load_profile(user_id)
+
+        The function is returned unchanged.  *mime_type* defaults from the
+        return annotation, *description* from the docstring.  *cache_ttl* is
+        how many seconds a stateless client may cache a read (default 0).
+        *complete* maps a template variable to a completer: a list of
+        strings, or ``fn(value, arguments)``.  The other options are the
+        tools' own.
+
+        Raises:
+            RegistrationError: The resource cannot be served safely.
+        """
+        if not isinstance(uri, str):
+            raise RegistrationError(
+                "@server.resource needs the URI first: @server.resource('scheme://...')"
+            )
+
+        def decorate(target: _F) -> _F:
+            self.register_resource(
+                target,
+                uri,
+                name=name,
+                title=title,
+                description=description,
+                mime_type=mime_type,
+                size=size,
+                annotations=annotations,
+                requires_auth=requires_auth,
+                scopes=scopes,
+                timeout=timeout,
+                cache_ttl=cache_ttl,
+                complete=complete,
+            )
+            return target
+
+        return decorate
+
+    def register_resource(
+        self, fn: Callable[..., Any], uri: str, /, **options: Any
+    ) -> ResourceDefinition | ResourceTemplateDefinition:
+        """Register a resource dynamically at runtime (same options as :meth:`resource`).
+
+        Works from any thread.  Clients that asked to hear of resource list
+        changes, and may see it, are told the list changed.
+
+        Raises:
+            RegistrationError: The resource cannot be served safely, or (with
+                ``oauth``) a scope could not appear in a challenge.
+        """
+        definition = build_resource(fn, uri, **options)
+        key = (
+            definition.uri_template
+            if isinstance(definition, ResourceTemplateDefinition)
+            else definition.uri
+        )
+        self._check_oauth_scopes(definition.declared_scopes, f"resource {key!r}")
+        self._resources.register(definition)
+        self._logger.debug("registered resource %r", key)
+        self._advertise("resources", {"subscribe": True, "listChanged": True})
+        if isinstance(definition, ResourceTemplateDefinition) and definition.completers:
+            self._advertise("completions", {})
+        self._warn_if_shared("registered", key, "resource")
+        self._notifier.changed("resources")
+        return definition
+
+    def unregister_resource(self, uri: str) -> ResourceDefinition | ResourceTemplateDefinition:
+        """Remove a resource or template at runtime (by its URI or template); returns it.
+
+        The ``resources`` capability stays advertised: clients may have
+        cached it.
+
+        Raises:
+            RegistrationError: Nothing is registered under *uri*.
+        """
+        removed = self._resources.unregister(uri)
+        self._logger.debug("unregistered resource %r", uri)
+        self._warn_if_shared("unregistered", uri, "resource")
+        self._notifier.changed("resources")
+        return removed
+
+    @property
+    def resources(self) -> list[ResourceDefinition]:
+        """All registered concrete resources, sorted by URI."""
+        return self._resources.list_resources()
+
+    @property
+    def resource_templates(self) -> list[ResourceTemplateDefinition]:
+        """All registered resource templates, sorted by template."""
+        return self._resources.list_templates()
+
+    def prompt(
+        self,
+        fn: Callable[..., Any] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        requires_auth: bool = False,
+        scopes: Iterable[str] = (),
+        timeout: float | None = None,
+        complete: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """Register a function as an MCP prompt.
+
+        Works bare (``@server.prompt``) or with options, as :meth:`tool`
+        does; the function is returned unchanged.  Its parameters are the
+        prompt's arguments, which arrive as strings and are converted to
+        ``str``, ``int``, ``float``, ``bool`` or a ``Literal``.  It returns a
+        string (one user message), a :class:`~easy_mcp.Message`, or a list
+        of strings and messages.  ``Literal`` and ``bool`` arguments complete
+        automatically; *complete* adds completers for the others.
+
+        Raises:
+            RegistrationError: The prompt cannot be served safely.
+        """
+
+        def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
+            self.register_prompt(
+                target,
+                name=name,
+                title=title,
+                description=description,
+                requires_auth=requires_auth,
+                scopes=scopes,
+                timeout=timeout,
+                complete=complete,
+            )
+            return target
+
+        if fn is not None:
+            return decorate(fn)
+        return decorate
+
+    def register_prompt(self, fn: Callable[..., Any], **options: Any) -> PromptDefinition:
+        """Register a prompt dynamically at runtime (same options as :meth:`prompt`).
+
+        Works from any thread; clients that asked to hear of prompt list
+        changes, and may see it, are told the list changed.
+
+        Raises:
+            RegistrationError: The prompt cannot be served safely.
+        """
+        definition = build_prompt(fn, **options)
+        self._check_oauth_scopes(definition.declared_scopes, f"prompt {definition.name!r}")
+        self._prompts.register(definition)
+        self._logger.debug("registered prompt %r", definition.name)
+        self._advertise("prompts", {"listChanged": True})
+        if definition.completers:
+            self._advertise("completions", {})
+        self._warn_if_shared("registered", definition.name, "prompt")
+        self._notifier.changed("prompts")
+        return definition
+
+    def unregister_prompt(self, name: str) -> PromptDefinition:
+        """Remove a prompt at runtime; returns its definition.
+
+        Raises:
+            RegistrationError: No prompt has that name.
+        """
+        removed = self._prompts.unregister(name)
+        self._logger.debug("unregistered prompt %r", name)
+        self._warn_if_shared("unregistered", name, "prompt")
+        self._notifier.changed("prompts")
+        return removed
+
+    @property
+    def prompts(self) -> list[PromptDefinition]:
+        """All registered prompts, sorted by name."""
+        return self._prompts.list()
 
     def middleware(self, fn: RequestMiddlewareT, /) -> RequestMiddlewareT:
         """Register request middleware: your async code around every request.
@@ -782,16 +1123,26 @@ class MCPServer:
             return None
         return item.declared_scopes[0] if item.declared_scopes else min(item.scopes)
 
-    def _check_step_up(self, identity: ClientIdentity | None, item: Guarded) -> None:
+    def _check_step_up(
+        self,
+        identity: ClientIdentity | None,
+        item: Guarded,
+        kind: str = "tool",
+        label: str | None = None,
+    ) -> None:
         """Refuse a token that holds none of *item*'s scopes, naming the one to ask for.
+
+        *kind* and *label* name the item in the message (by default a tool
+        and its name).
 
         Raises:
             InsufficientScopeError: With the narrowest declared scope.
         """
         first = self._step_up_scope(identity, item)
         if identity is not None and first is not None:
+            named = label if label is not None else item.name
             raise InsufficientScopeError(
-                (first,), f"Insufficient scope for tool '{item.name}'", granted=identity.scopes
+                (first,), f"Insufficient scope for {kind} '{named}'", granted=identity.scopes
             )
 
     def _initial_scopes(self) -> tuple[str, ...]:
@@ -805,17 +1156,21 @@ class MCPServer:
             return ()
         scopes = list(self.oauth.required_scopes)
         if not self.oauth.step_up:
-            tool_scopes = {scope for definition in self.tools for scope in definition.scopes}
-            scopes.extend(sorted(tool_scopes - set(scopes)))
+            item_scopes = {scope for item in self._guarded() for scope in item.scopes}
+            scopes.extend(sorted(item_scopes - set(scopes)))
         return tuple(scope for scope in scopes if scope != "offline_access")
 
     def _known_scopes(self) -> frozenset[str]:
-        """Every scope this server checks: ``required_scopes`` and every tool scope."""
+        """Every scope this server checks: ``required_scopes`` and every item's scopes."""
         scopes = set(self.oauth.required_scopes) if self.oauth is not None else set()
-        for definition in self.tools:
-            scopes.update(definition.scopes)
+        for item in self._guarded():
+            scopes.update(item.scopes)
         scopes.discard("offline_access")
         return frozenset(scopes)
+
+    def _guarded(self) -> list[Guarded]:
+        """Every registered item that scopes can guard: tools, resources, templates, prompts."""
+        return [*self.tools, *self.resources, *self.resource_templates, *self.prompts]
 
     @staticmethod
     def _request_context(
@@ -1081,6 +1436,8 @@ class MCPServer:
             return None
         if spec.needs_push and context.push is None:
             return None
+        if spec.needs_session and context.push is None and context.store_handle is None:
+            return None
         return spec
 
     def _request_info(
@@ -1309,6 +1666,7 @@ class MCPServer:
         Never raises but ``CancelledError``: errors become outcomes.
         """
         method = request.method
+        result: Any
         try:
             if method == "tools/call":
                 return RequestOutcome._of_tool(await self._execute_tool(request, context))
@@ -1317,14 +1675,26 @@ class MCPServer:
                 # through context.push.
                 await self._handle_listen(request, context)
                 return RequestOutcome._create(result={})
-            if request.stateless:
-                result: Any = self._dispatch_modern(method, context)
+            if method == "resources/read":
+                result = await self._read_resource(request, context)
+            elif method == "prompts/get":
+                result = await self._get_prompt(request, context)
+            elif method == "completion/complete":
+                result = await self._complete(request, context)
+            elif method == "resources/subscribe":
+                result = await self._subscribe(request, context)
+            elif method == "resources/unsubscribe":
+                result = await self._unsubscribe(request, context)
+            elif request.stateless:
+                result = self._dispatch_modern(method, context, request._params)
             elif method == "initialize":
                 result = self._handle_initialize(request._params, context)
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
                 result = self._handle_tools_list(context)
+            elif method in _LISTS:
+                result = self._handle_list(method, request._params, context)
             else:  # the method table and this routing disagree
                 raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
         except ProtocolError as exc:
@@ -1421,8 +1791,10 @@ class MCPServer:
             result["instructions"] = self.instructions
         return result
 
-    def _dispatch_modern(self, method: str, context: ClientContext) -> dict[str, Any]:
-        """Serve a stateless request other than ``tools/call``.
+    def _dispatch_modern(
+        self, method: str, context: ClientContext, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Serve a stateless request that runs no user code: discovery and the lists.
 
         ``initialize``, ``ping`` and ``notifications/initialized`` do not
         exist in this era, so they are unknown methods here.
@@ -1442,24 +1814,74 @@ class MCPServer:
             result["ttlMs"] = TOOLS_LIST_TTL_MS
             result["cacheScope"] = self._cache_scope(method)
             return result
+        if method in _LISTS:
+            result = self._handle_list(method, params or {}, context)
+            # The same scope on every page, as the caching spec requires.
+            result["ttlMs"] = (
+                PROMPTS_LIST_TTL_MS if method == "prompts/list" else RESOURCES_LIST_TTL_MS
+            )
+            result["cacheScope"] = self._cache_scope(method)
+            return result
         raise ProtocolError(f"Method not found: {method}", code=METHOD_NOT_FOUND)
 
-    def _cache_scope(self, method: str) -> str:
+    def _cache_scope(self, method: str, item: Guarded | None = None, *, retry: bool = False) -> str:
         """The ``cacheScope`` of a stateless result.
 
         ``"public"`` only when an anonymous request would get the same bytes.
         ``server/discover`` is the same for everyone (with ``oauth`` it needs
         a token, but its answer does not depend on which).  A list is not once
-        auth is configured (protected tools are hidden from callers who cannot
+        auth is configured (protected items are hidden from callers who cannot
         use them, and API keys and tokens may see different lists) or request
         middleware is registered (it may answer each caller differently), and
-        a shared cache must not hand one caller's list to another.
+        a shared cache must not hand one caller's list to another.  A
+        ``resources/read`` of *item* is not when the resource is protected,
+        ``oauth`` is set, request middleware is registered, or it is a retry
+        carrying ``inputResponses``/``requestState`` (*retry*), whose result
+        must not be cached at all; nor when *item* is a template a protected
+        resource or template may answer for instead, for a caller who may
+        use it (:meth:`_shadowed`).
         """
         if method == DISCOVER_METHOD:
+            return "public"
+        if method == "resources/read":
+            protected = item is not None and item.requires_auth
+            if retry or protected or self.oauth is not None or self._request_middleware:
+                return "private"
+            if isinstance(item, ResourceTemplateDefinition) and self._shadowed(item):
+                return "private"
             return "public"
         if self.auth_configured or self._request_middleware:
             return "private"
         return "public"
+
+    def _shadowed(self, template: ResourceTemplateDefinition) -> bool:
+        """Whether a protected item may answer a URI *template* answers anonymous callers.
+
+        It may when a protected concrete resource's URI binds the template,
+        or a protected template tried before it may match the same URIs.  A
+        caller who may use that item reads other bytes at that URI, so no
+        read of the template is the same for everyone.  Decided per
+        template, never per URI, so a read's scope does not tell which URIs
+        hide a protected resource.  Kept until the resources change.
+        """
+        version, shadowed = self._shadowed_templates
+        current = self._resources.version
+        if version != current:
+            # Read after the version: a change meanwhile is seen next time.
+            resources = self._resources.list_resources()
+            protected = [r.uri for r in resources if r.requires_auth]
+            earlier: list[ResourceTemplateDefinition] = []  # protected, tried first
+            found: set[str] = set()
+            for candidate in self._resources.templates_by_specificity():
+                if candidate.requires_auth:
+                    earlier.append(candidate)
+                elif any(t.template.may_overlap(candidate.template) for t in earlier) or any(
+                    candidate.bind(uri) is not None for uri in protected
+                ):
+                    found.add(candidate.uri_template)
+            shadowed = frozenset(found)
+            self._shadowed_templates = (current, shadowed)
+        return template.uri_template in shadowed
 
     def _modern_result(self, result: dict[str, Any]) -> dict[str, Any]:
         """Stamp a stateless result with its ``resultType`` and our identity."""
@@ -1471,6 +1893,470 @@ class MCPServer:
         _, tools = self._list_entries("tools", context.identity)
         return {"tools": tools}
 
+    def _handle_list(
+        self, method: str, params: dict[str, Any], context: ClientContext
+    ) -> dict[str, Any]:
+        """One page of ``resources/list``, ``resources/templates/list`` or ``prompts/list``.
+
+        Items the caller cannot see are left out before paging, so they are
+        neither shown nor counted.
+
+        Raises:
+            ProtocolError: ``-32602`` for an invalid cursor.
+        """
+        kind, field = _LISTS[method]
+        identity = context.identity
+        cursor = params.get("cursor")
+        entries: list[dict[str, Any]]
+        next_cursor: str | None
+        if kind == "resources":
+            resources = [r for r in self.resources if self._visible(identity, r)]
+            page, next_cursor = paginate(resources, key=lambda r: r.uri, kind=kind, cursor=cursor)
+            entries = [r.to_mcp() for r in page]
+        elif kind == "templates":
+            templates = [t for t in self.resource_templates if self._visible(identity, t)]
+            pages, next_cursor = paginate(
+                templates, key=lambda t: t.uri_template, kind=kind, cursor=cursor
+            )
+            entries = [t.to_mcp() for t in pages]
+        else:
+            prompts = [p for p in self.prompts if self._visible(identity, p)]
+            found, next_cursor = paginate(prompts, key=lambda p: p.name, kind=kind, cursor=cursor)
+            entries = [p.to_mcp() for p in found]
+        result: dict[str, Any] = {field: entries}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
+
+    # ------------------------------------------------- resources and prompts
+
+    def _resolve_resource(
+        self, uri: str, identity: ClientIdentity | None
+    ) -> tuple[ResourceDefinition | ResourceTemplateDefinition | None, dict[str, Any], bool]:
+        """What a read of *uri* by *identity* runs: ``(definition, arguments, hidden)``.
+
+        A concrete resource with exactly that URI first, then the templates,
+        most specific first, whose pattern matches and whose variables
+        convert.  Items *identity* cannot see are skipped as if they did not
+        exist; *hidden* says one of them matched (for the audit log only).
+        A URI over :data:`~.uritemplate.MAX_URI_LENGTH` characters (the
+        longest a resource or template may be written as) resolves to
+        nothing, before any template is tried.
+        """
+        if len(uri) > MAX_URI_LENGTH:
+            return None, {}, False
+        hidden = False
+        concrete = self._resources.get(uri)
+        if concrete is not None:
+            if self._visible(identity, concrete):
+                return concrete, {}, False
+            hidden = True
+        for template in self._resources.templates_by_specificity():
+            arguments = template.bind(uri)
+            if arguments is None:
+                continue
+            if self._visible(identity, template):
+                return template, arguments, False
+            hidden = True
+        return None, {}, hidden
+
+    @staticmethod
+    def _resource_not_found(
+        uri: str | None, stateless: bool, message: str = "Resource not found"
+    ) -> ProtocolError:
+        """The error for a missing resource: ``-32602`` statelessly, ``-32002`` before."""
+        data = {"uri": uri} if uri is not None and len(uri) <= _ECHO_URI_MAX else None
+        code = INVALID_PARAMS if stateless else RESOURCE_NOT_FOUND_LEGACY
+        return ProtocolError(message, code=code, data=data)
+
+    @staticmethod
+    def _label(uri: str) -> str:
+        """*uri* as messages and thread names name it: cut short when long."""
+        return uri if len(uri) <= _LABEL_MAX else uri[: _LABEL_MAX - 3] + "..."
+
+    def _user_code_failed(
+        self, kind: str, label: str, exc: BaseException, *, unsupported: bool = False
+    ) -> tuple[str, ProtocolError]:
+        """Log what a resource, prompt or completer raised; the sanitized error for the client.
+
+        *unsupported* marks a return value the server cannot send, which is
+        logged by its type only, never by its value.
+        """
+        error_id = uuid.uuid4().hex[:12]
+        try:
+            if unsupported:
+                self._logger.error(
+                    "%s %r returned something it cannot return (%s) error_id=%s",
+                    kind,
+                    label,
+                    exc,
+                    error_id,
+                )
+            else:
+                self._logger.error("%s %r failed error_id=%s", kind, label, error_id, exc_info=exc)
+            message = f"Internal server error (error_id={error_id})"
+            if self.debug:
+                trace = "".join(traceback.format_exception(exc))
+                message = f"{message}: {type(exc).__name__}: {exc}\n{trace}"
+            return error_id, ProtocolError(message, code=INTERNAL_ERROR)
+        finally:
+            exc.__traceback__ = None  # see _tool_failed
+
+    async def _call_user_code(
+        self,
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
+        *,
+        is_async: bool,
+        timeout: float | None,
+        target: _Target,
+        context: ClientContext,
+    ) -> Any:
+        """Run a resource, prompt or completer the way tools run: token, deadline, caller.
+
+        Raises what :meth:`_run_user_code` raises.  ``current_cancel_token()``
+        and ``current_identity()`` work inside the function.
+        """
+        token = CancelToken()
+        token._on_error = self._callback_failed(target.label, context, target.kind)
+        with cancel_scope(token), _identity_scope(context.identity):
+            return await self._run_user_code(
+                fn,
+                arguments,
+                is_async=is_async,
+                timeout=timeout,
+                token=token,
+                target=target,
+                context=context,
+            )
+
+    async def _read_resource(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/read``: resolve the URI, run the resource, render its contents.
+
+        Raises:
+            ProtocolError: Not found (``-32602`` statelessly, ``-32002``
+                before), ``-32005`` past its timeout, ``-32008`` with no free
+                worker, ``-32603`` for a failure (a ``ToolError`` keeps its
+                message), or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            raise ProtocolError("resources/read requires a string 'uri'", code=INVALID_PARAMS)
+        stateless = request.stateless
+        identity = context.identity
+        started = time.perf_counter()
+        fields: dict[str, Any] = {"uri": uri[:_AUDIT_URI_MAX]}
+
+        def done(status: str, **extra: Any) -> None:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            audit(
+                "resource_read",
+                **fields,
+                client_id=context.client_id,
+                duration_ms=duration_ms,
+                status=status,
+                **extra,
+            )
+
+        definition, arguments, hidden = self._resolve_resource(uri, identity)
+        if definition is None:
+            done("not_found", **({"hidden": True} if hidden else {}))
+            raise self._resource_not_found(uri, stateless)
+        if isinstance(definition, ResourceTemplateDefinition):
+            fields["template"] = definition.uri_template
+        label = self._label(uri)
+        try:
+            self._check_step_up(identity, definition, "resource", label)
+        except InsufficientScopeError:
+            done("denied")
+            raise
+        try:
+            authorize(identity, definition, "Resource")
+        except (AuthenticationError, AuthorizationError):
+            # Cannot happen while visibility and authorization agree.
+            done("not_found", hidden=True)
+            raise self._resource_not_found(uri, stateless) from None
+        timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        try:
+            result = await self._call_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                target=_Target("resource", label, "uri"),
+                context=context,
+            )
+        except ServerBusyError:
+            done("busy")
+            raise
+        except _DeadlineExceeded:
+            done("timeout")
+            raise ProtocolError(
+                f"Resource '{label}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except ResourceNotFoundError as exc:
+            done("not_found")
+            missing = exc.uri if exc.uri is not None else uri
+            error = self._resource_not_found(missing, stateless, str(exc))
+            exc.__traceback__ = None
+            raise error from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            error_id, error = self._user_code_failed("resource", label, cause)
+            done("error", error_id=error_id)
+            raise error from None
+        except ToolError as exc:
+            done("tool_error")
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            error_id, error = self._user_code_failed("resource", label, exc)
+            done("error", error_id=error_id)
+            raise error from None
+        try:
+            contents = to_resource_contents(result, uri=uri, mime_type=definition.mime_type)
+        except NotFound:
+            done("not_found")
+            raise self._resource_not_found(uri, stateless) from None
+        except TypeError as exc:
+            error_id, error = self._user_code_failed("resource", label, exc, unsupported=True)
+            done("error", error_id=error_id)
+            raise error from None
+        done("ok")
+        read: dict[str, Any] = {"contents": contents}
+        if stateless:
+            # A retry this server never asked for (it does not implement
+            # input requests) is served, and must not be cached.
+            retry = "inputResponses" in params or "requestState" in params
+            read["ttlMs"] = 0 if retry else definition.cache_ttl_ms
+            read["cacheScope"] = self._cache_scope("resources/read", definition, retry=retry)
+        return read
+
+    def _find_prompt(self, name: object, identity: ClientIdentity | None) -> PromptDefinition:
+        """The prompt *name* names, if *identity* may see it and use it.
+
+        Raises:
+            ProtocolError: ``-32602 "Unknown prompt"`` for a missing or hidden
+                one, alike; a step-up ``InsufficientScopeError``.
+        """
+        definition = self._prompts.get(name) if isinstance(name, str) else None
+        if definition is None or not self._visible(identity, definition):
+            raise ProtocolError(f"Unknown prompt: {name}", code=INVALID_PARAMS)
+        self._check_step_up(identity, definition, "prompt")
+        try:
+            authorize(identity, definition, "Prompt")
+        except (AuthenticationError, AuthorizationError):
+            raise ProtocolError(f"Unknown prompt: {name}", code=INVALID_PARAMS) from None
+        return definition
+
+    async def _get_prompt(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``prompts/get``: check and convert the arguments, run the prompt.
+
+        Raises:
+            ProtocolError: ``-32602`` for an unknown prompt or invalid
+                arguments (every violation listed), ``-32005``, ``-32008``,
+                ``-32603``, or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        name = params.get("name")
+        if not isinstance(name, str):
+            raise ProtocolError("prompts/get requires a string 'name'", code=INVALID_PARAMS)
+        definition = self._find_prompt(name, context.identity)
+        started = time.perf_counter()
+
+        def done(status: str, **extra: Any) -> None:
+            duration_ms = round((time.perf_counter() - started) * 1000, 2)
+            audit(
+                "prompt_get",
+                prompt=name,
+                client_id=context.client_id,
+                duration_ms=duration_ms,
+                status=status,
+                **extra,
+            )
+
+        raw = params.get("arguments")
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            done("denied")
+            raise ProtocolError("'arguments' must be an object", code=INVALID_PARAMS)
+        try:
+            arguments = definition.bind(raw)
+        except ValidationError:
+            done("denied")
+            raise
+        timeout = definition.timeout if definition.timeout is not None else self.default_timeout
+        try:
+            result = await self._call_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                target=_Target("prompt", name, "prompt"),
+                context=context,
+            )
+        except ServerBusyError:
+            done("busy")
+            raise
+        except _DeadlineExceeded:
+            done("timeout")
+            raise ProtocolError(
+                f"Prompt '{name}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            error_id, error = self._user_code_failed("prompt", name, cause)
+            done("error", error_id=error_id)
+            raise error from None
+        except ToolError as exc:
+            done("tool_error")
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            error_id, error = self._user_code_failed("prompt", name, exc)
+            done("error", error_id=error_id)
+            raise error from None
+        try:
+            messages = to_prompt_messages(result)
+        except TypeError as exc:
+            error_id, error = self._user_code_failed("prompt", name, exc, unsupported=True)
+            done("error", error_id=error_id)
+            raise error from None
+        done("ok")
+        answer: dict[str, Any] = {}
+        if definition.description:
+            answer["description"] = definition.description
+        answer["messages"] = messages
+        return answer
+
+    async def _complete(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``completion/complete`` for a prompt argument or a template variable.
+
+        Completions are not audited per request (they arrive per keystroke);
+        failures are logged with an ``error_id``.
+
+        Raises:
+            ProtocolError: ``-32602`` for a malformed request or an unknown
+                (or hidden) prompt, template or argument, ``-32005``,
+                ``-32008``, ``-32603``, or a step-up ``InsufficientScopeError``.
+        """
+        params = request._params
+        identity = context.identity
+        ref = params.get("ref")
+        argument = params.get("argument")
+        if not isinstance(ref, dict):
+            raise ProtocolError("completion/complete requires a 'ref' object", code=INVALID_PARAMS)
+        if (
+            not isinstance(argument, dict)
+            or not isinstance(argument.get("name"), str)
+            or not isinstance(argument.get("value"), str)
+        ):
+            raise ProtocolError(
+                "completion/complete requires 'argument' with a string name and value",
+                code=INVALID_PARAMS,
+            )
+        given = params.get("context")
+        given_arguments: Any = None
+        if given is not None:
+            if not isinstance(given, dict):
+                raise ProtocolError("'context' must be an object", code=INVALID_PARAMS)
+            given_arguments = given.get("arguments")
+        if given_arguments is None:
+            given_arguments = {}
+        if not isinstance(given_arguments, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in given_arguments.items()
+        ):
+            raise ProtocolError(
+                "'context.arguments' must map argument names to strings", code=INVALID_PARAMS
+            )
+        name: str = argument["name"]
+        value: str = argument["value"]
+        ref_type = ref.get("type")
+        names: tuple[str, ...]
+        completers: Mapping[str, CompletionSource]
+        if ref_type == "ref/prompt":
+            prompt_name = ref.get("name")
+            if not isinstance(prompt_name, str):
+                raise ProtocolError("ref/prompt requires a string 'name'", code=INVALID_PARAMS)
+            prompt = self._find_prompt(prompt_name, identity)
+            names = tuple(param.name for param in prompt.arguments)
+            completers = prompt.completers
+            timeout = prompt.timeout
+            label, field = f"{prompt.name}.{name}", "prompt"
+        elif ref_type == "ref/resource":
+            uri = ref.get("uri")
+            if not isinstance(uri, str):
+                raise ProtocolError("ref/resource requires a string 'uri'", code=INVALID_PARAMS)
+            template = self._resources.get_template(uri)
+            if template is None or not self._visible(identity, template):
+                concrete = self._resources.get(uri)
+                if concrete is not None and self._visible(identity, concrete):
+                    return {"completion": empty()}  # a concrete URI has no arguments
+                raise ProtocolError(
+                    f"Unknown resource template: {self._label(uri)}", code=INVALID_PARAMS
+                )
+            self._check_step_up(identity, template, "resource template", self._label(uri))
+            try:
+                authorize(identity, template, "Resource template")
+            except (AuthenticationError, AuthorizationError):
+                raise ProtocolError(
+                    f"Unknown resource template: {self._label(uri)}", code=INVALID_PARAMS
+                ) from None
+            names = template.template.variables
+            completers = template.completers
+            timeout = template.timeout
+            label, field = f"{self._label(uri)}.{name}", "uri"
+        else:
+            raise ProtocolError(
+                "ref.type must be 'ref/prompt' or 'ref/resource'", code=INVALID_PARAMS
+            )
+        if name not in names:
+            raise ProtocolError(f"Unknown argument: {name}", code=INVALID_PARAMS)
+        source = completers.get(name)
+        if source is None:
+            return {"completion": empty()}
+        if source.values is not None:
+            found, total = collect(filter_static(source.values, value), sized=True)
+            return {"completion": shape(found, total)}
+        # Only the other arguments of the same prompt or template.
+        known = {key: text for key, text in given_arguments.items() if key in names}
+        work, is_async = _completer_call(source, value, known)
+        if timeout is None:
+            timeout = self.default_timeout
+        try:
+            found, total = await self._call_user_code(
+                work,
+                {},
+                is_async=is_async,
+                timeout=timeout,
+                target=_Target("completion", label, field),
+                context=context,
+            )
+        except ServerBusyError:
+            raise
+        except _DeadlineExceeded:
+            raise ProtocolError(
+                f"Completion for '{label}' timed out after {timeout:g}s", code=TOOL_TIMEOUT
+            ) from None
+        except _UserCancelled as wrapped:
+            cause, wrapped.error = wrapped.error, None
+            assert cause is not None
+            raise self._user_code_failed("completer", label, cause)[1] from None
+        except ToolError as exc:
+            message = str(exc)
+            exc.__traceback__ = None
+            raise ProtocolError(message, code=INTERNAL_ERROR) from None
+        except Exception as exc:
+            raise self._user_code_failed("completer", label, exc)[1] from None
+        return {"completion": shape(found, total)}
+
     # -------------------------------------------------- change notifications
 
     def _list_entries(
@@ -1481,11 +2367,22 @@ class MCPServer:
         The one source of both the list a client fetches and the digest it
         is told about changes of, so the two never disagree.
         """
-        if kind != "tools":
+        if kind == "resources":
+            # One list, as one notification covers both: resources/list and
+            # resources/templates/list.
+            version, resources, templates = self._resources.snapshot()
+            entries = [r.to_mcp() for r in resources if self._visible(identity, r)]
+            entries.extend(t.to_mcp() for t in templates if self._visible(identity, t))
+            return version, entries
+        definitions: list[ToolDefinition] | list[PromptDefinition]
+        if kind == "tools":
+            version, definitions = self._registry.snapshot()
+        elif kind == "prompts":
+            version, definitions = self._prompts.snapshot()
+        else:
             raise KeyError(kind)
-        version, definitions = self._registry.snapshot()
-        # Protected tools are omitted for callers who could not invoke them
-        # (a token with step-up sees them all, and is challenged on a call).
+        # Protected items are omitted for callers who could not use them (a
+        # token with step-up sees them all, and is challenged on a call).
         return version, [
             definition.to_mcp()
             for definition in definitions
@@ -1494,9 +2391,13 @@ class MCPServer:
 
     def _list_version(self, kind: str) -> int:
         """How many changes the registry behind the *kind* list has seen."""
-        if kind != "tools":
-            raise KeyError(kind)
-        return self._registry.version
+        if kind == "tools":
+            return self._registry.version
+        if kind == "prompts":
+            return self._prompts.version
+        if kind == "resources":
+            return self._resources.version
+        raise KeyError(kind)
 
     def _visibility_class(self, identity: ClientIdentity | None) -> Hashable:
         """What decides which items *identity* sees, and nothing else.
@@ -1539,13 +2440,16 @@ class MCPServer:
         return digest
 
     def _list_baselines(self, identity: ClientIdentity | None) -> dict[str, str]:
-        """The digest of every announced list as *identity* sees it now.
+        """The digest of every announced list as *identity* sees it now, for a handshake.
 
-        A list whose digest cannot be computed is left out, and logged: its
-        recipient is not told about that list, rather than the handshake or
-        stream that asked failing.
+        Every list whose changes the handshake's result offers has an entry;
+        one whose digest cannot be computed has an empty digest, and is
+        logged: rather than the handshake failing, a stream announces it
+        once it can be computed.
         """
-        return self._notifier.baselines(self._list_kinds(), identity)
+        kinds = self._list_kinds()
+        digests = self._notifier.baselines(kinds, identity)
+        return {kind: digests.get(kind, "") for kind in kinds}
 
     def _watch_session(
         self,
@@ -1557,17 +2461,27 @@ class MCPServer:
         multiplexed: bool = False,
         baselines: dict[str, str] | None = None,
         anchor: object | None = None,
+        subscriptions: Iterable[str] | None = None,
     ) -> _Sink:
         """Announce list changes to the session *key* through *push* from now on.
 
         On the loop that delivers to it.  *baselines* is what its client was
-        last told the lists hold; by default the lists as they are now, which
-        is right just before its ``initialize`` result is sent (its client
-        lists after that).  A list that differs from its baseline is
-        announced at once.  A list whose digest cannot be computed is not
-        watched (:meth:`_list_baselines`).
+        last told the lists hold, one entry for each list its ``initialize``
+        offered changes of (an empty digest where what its client holds is
+        not known), and only those lists are watched: a capability added
+        since was never negotiated with it.  By default, the lists as they
+        are now, which is right just before its ``initialize`` result is
+        sent (its client lists after that).  A list that differs from its
+        baseline is announced at once.  A list whose digest cannot be
+        computed now is not watched (and is logged).  Updates of the
+        resources the session is subscribed to go there too:
+        *subscriptions*, read from the session's record in the store, or
+        those this process holds.
         """
-        current = self._list_baselines(identity)
+        kinds = self._list_kinds()
+        if baselines is not None:
+            kinds = tuple(kind for kind in kinds if kind in baselines)
+        current = self._notifier.baselines(kinds, identity)
         sink = self._notifier.watch_session(
             key,
             push=push,
@@ -1577,6 +2491,10 @@ class MCPServer:
             baselines=current if baselines is None else baselines,
             multiplexed=multiplexed,
             anchor=anchor,
+            subscriptions=subscriptions,
+            # Updates made while no stream is open wait for one only where
+            # the session is kept: in this process.
+            hold=not self._store.shared,
         )
         if baselines is not None:
             sink.deliver(sorted(current))
@@ -1610,7 +2528,9 @@ class MCPServer:
             ProtocolError: ``-32600`` for an id that is no string or number,
                 or one open on this channel already; ``-32602`` for a
                 malformed filter.
-            SubscriptionLimitError: Too many streams are open.
+            SubscriptionLimitError: Too many streams are open, or (on a
+                server with resources) the filter names more than
+                :data:`MAX_RESOURCE_SUBSCRIPTIONS` resources.
         """
         msg_id = request.request_id
         push = context.push
@@ -1621,11 +2541,21 @@ class MCPServer:
                 "Invalid request: subscriptions/listen needs a string or number id",
                 code=INVALID_REQUEST,
             )
-        requested, _ = parse_filter(request._params.get("notifications"))
-        # Kinds the server does not announce, and resourceSubscriptions, are
-        # left out of the acknowledgment and never sent; so is a list whose
-        # digest cannot be computed (the sink's kinds).
+        requested, asked = parse_filter(request._params.get("notifications"))
+        # Kinds the server does not announce are left out of the
+        # acknowledgment and never sent; so is a list whose digest cannot be
+        # computed (the sink's kinds).
         kinds = requested & frozenset(self._list_kinds())
+        # Resource URIs only with the resources capability, and only those
+        # the caller may read: a missing and a protected one look the same.
+        honored: tuple[str, ...] | None = None
+        if asked is not None and "resources" in self._capabilities():
+            if len(asked) > MAX_RESOURCE_SUBSCRIPTIONS:
+                raise SubscriptionLimitError(
+                    "Too many resources for one subscriptions/listen stream (at most "
+                    f"{MAX_RESOURCE_SUBSCRIPTIONS} in notifications.resourceSubscriptions)"
+                )
+            honored = self._honored_resources(asked, context.identity)
         sink = self._notifier.open(
             channel=push,
             client_id=context.client_id,
@@ -1635,12 +2565,13 @@ class MCPServer:
             push=push,
             multiplexed=context.multiplexed,
             max_total=self.max_sessions,
+            uris=frozenset(honored or ()),
         )
         request._subscription = sink
         # In the same step as the registration, and flushes run only from
         # loop callbacks: the acknowledgment is the stream's first frame.
         try:
-            push(ack_message(msg_id, sink.kinds))
+            push(ack_message(msg_id, sink.kinds, honored))
         except Exception:
             self._notifier.drop(sink, "undeliverable")
             raise
@@ -1649,6 +2580,7 @@ class MCPServer:
             client_id=context.client_id,
             subscription_id=msg_id,
             kinds=sorted(sink.kinds),
+            **({"resources": len(honored)} if honored is not None else {}),
         )
         timer: asyncio.TimerHandle | None = None
         deadline = self._stream_deadline(context.identity)
@@ -1669,7 +2601,9 @@ class MCPServer:
         its completion result (and, on a multiplexed channel,
         ``notifications/cancelled``) through ``context.push`` before this
         returns; then its ``dispatch`` returns ``None``.  The session the
-        context carries stops receiving list changes.  Transports call this,
+        context carries stops receiving list changes, and its resource
+        subscriptions end (this is the end of the session, not of one of
+        its streams).  Transports call this,
         on the event loop, when a channel ends or the server shuts down, and
         again once the channel's requests still running have finished (an
         ``initialize`` answered meanwhile starts the session's notifications
@@ -1679,6 +2613,162 @@ class MCPServer:
             How many subscriptions ended.
         """
         return self._notifier.close(context.push, context.session_id, reason=reason)
+
+    def _honored_resources(
+        self, uris: Iterable[str], identity: ClientIdentity | None
+    ) -> tuple[str, ...]:
+        """The URIs of a listen's ``resourceSubscriptions`` its acknowledgment honors.
+
+        Those that resolve to a resource *identity* may read, each once, in
+        order.  A missing one, a protected one, one a token would need a
+        scope for (one acknowledgment cannot carry a partial 403) and one
+        over 2048 characters are left out alike.
+        """
+        honored: list[str] = []
+        for uri in dict.fromkeys(uris):
+            if len(uri) > _ECHO_URI_MAX:
+                continue
+            definition, _, _ = self._resolve_resource(uri, identity)
+            if definition is None or self._step_up_scope(identity, definition) is not None:
+                continue
+            try:
+                authorize(identity, definition, "Resource")
+            except (AuthenticationError, AuthorizationError):
+                continue
+            honored.append(uri)
+        return tuple(honored)
+
+    def notify_resource_updated(self, uri: str) -> int:
+        """Tell every client subscribed to the resource *uri* that it changed.
+
+        Thread-safe: call it from anywhere (a sync tool's thread, a file
+        watcher, an async task).  Clients get the URI only and read the
+        resource again: ``notifications/resources/updated`` on the channel of
+        each handshake-era session that subscribed to exactly *uri*
+        (``resources/subscribe``), and tagged on each ``subscriptions/listen``
+        stream whose acknowledgment honored it.  An update still waiting to
+        be written is not queued again.  A session without an open stream
+        (a Streamable HTTP session between ``GET /mcp`` streams) gets it when
+        one opens, with the in-process store; with a shared store it is
+        lost.  Per process: with several workers, call it in each.
+
+        Returns:
+            How many subscriptions matched and had the update queued (0 when
+            nobody listens); delivery happens on the event loop.
+
+        Raises:
+            TypeError: *uri* is not a string.
+        """
+        if not isinstance(uri, str):
+            raise TypeError(f"uri must be a str, got {type(uri).__name__}")
+        return self._notifier.publish_resource_updated(uri)
+
+    async def _subscribe(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/subscribe`` (handshake era): watch one resource for the session.
+
+        The URI must resolve to a resource the caller may read now, as for a
+        read, without running it.  The session's subscriptions live with it:
+        in this process (stdio, a direct ``dispatch``), or in the store's
+        session record (the HTTP transports), and end with it.
+
+        Raises:
+            ProtocolError: ``-32602`` for a URI that is no string or is too
+                long, ``-32002`` for one that resolves to nothing the caller
+                may read, ``-32007`` at 1000 URIs, ``-32601`` with a store
+                that keeps no subscriptions, ``-32600`` for a session gone,
+                or a step-up ``InsufficientScopeError``.
+        """
+        uri = self._subscription_uri(request)
+        identity = context.identity
+        definition, _, _ = self._resolve_resource(uri, identity)
+        if definition is None:
+            raise self._resource_not_found(uri, request.stateless)
+        self._check_step_up(identity, definition, "resource", self._label(uri))
+        try:
+            authorize(identity, definition, "Resource")
+        except (AuthenticationError, AuthorizationError):
+            raise self._resource_not_found(uri, request.stateless) from None
+        key = context.session_id
+        handle = context.store_handle
+        if handle is None:
+            added = self._notifier.subscribe(key, uri, cap=MAX_RESOURCE_SUBSCRIPTIONS)
+        else:
+            subscribed = await self._update_subscriptions(handle, add=(uri,))
+            added = uri in subscribed
+            if added:
+                # This request's change only: with a shared store, another
+                # request's answer, holding an older set, may come after it.
+                self._notifier.add_subscription(key, uri, hold=not self._store.shared)
+        if not added:
+            raise SubscriptionLimitError(
+                f"Too many resource subscriptions for this session (at most "
+                f"{MAX_RESOURCE_SUBSCRIPTIONS}); unsubscribe from one first"
+            )
+        self._audit_subscription("resource_subscribe", uri, context)
+        return {}
+
+    async def _unsubscribe(self, request: RequestInfo, context: ClientContext) -> dict[str, Any]:
+        """Serve ``resources/unsubscribe``: stop watching a resource.  Idempotent.
+
+        Raises:
+            ProtocolError: ``-32602`` for a URI that is no string or is too
+                long, ``-32601`` with a store that keeps no subscriptions,
+                ``-32600`` for a session gone.
+        """
+        uri = self._subscription_uri(request)
+        key = context.session_id
+        handle = context.store_handle
+        if handle is not None:
+            await self._update_subscriptions(handle, remove=(uri,))
+        # This request's change only, as for resources/subscribe.
+        self._notifier.unsubscribe(key, uri)
+        self._audit_subscription("resource_unsubscribe", uri, context)
+        return {}
+
+    @staticmethod
+    def _subscription_uri(request: RequestInfo) -> str:
+        uri = request._params.get("uri")
+        if not isinstance(uri, str):
+            raise ProtocolError(f"{request.method} requires a string 'uri'", code=INVALID_PARAMS)
+        if len(uri) > _ECHO_URI_MAX:
+            raise ProtocolError(
+                f"{request.method}: the URI is longer than {_ECHO_URI_MAX} characters",
+                code=INVALID_PARAMS,
+            )
+        return uri
+
+    async def _update_subscriptions(
+        self, handle: StoreHandle, *, add: Iterable[str] = (), remove: Iterable[str] = ()
+    ) -> tuple[str, ...]:
+        """Change a stored session's subscriptions; every URI it is subscribed to now.
+
+        Raises:
+            ProtocolError: ``-32601`` when the store keeps none; ``-32600``
+                when the session is gone.
+        """
+        try:
+            subscribed = await handle.update_subscriptions(
+                add=tuple(add), remove=tuple(remove), cap=MAX_RESOURCE_SUBSCRIPTIONS
+            )
+        except NotImplementedError:
+            raise ProtocolError(
+                "Method not found: this server's store keeps no resource subscriptions",
+                code=METHOD_NOT_FOUND,
+            ) from None
+        if subscribed is None:
+            raise ProtocolError(
+                "Session not found; send a new initialize request", code=INVALID_REQUEST
+            )
+        return subscribed
+
+    def _audit_subscription(self, event: str, uri: str, context: ClientContext) -> None:
+        audit(
+            event,
+            uri=uri[:_AUDIT_URI_MAX],
+            client_id=context.client_id,
+            session_id=context.session_id,
+            session_ref=session_ref(context.session_id),
+        )
 
     def _cancel_subscription(self, context: ClientContext, request_id: object) -> bool:
         """End the listen stream *request_id* names on *context*'s channel, as its client asked."""
@@ -1857,45 +2947,32 @@ class MCPServer:
             raise asyncio.CancelledError
         definition = call.tool
         name = definition.name
-        token = call.cancel_token
         timeout = call.timeout
         started = time.perf_counter()
 
         def _duration_ms() -> float:
             return round((time.perf_counter() - started) * 1000, 2)
 
-        deadline: asyncio.Timeout | None = None
-        awaitable: Any = None
-        # Every cancel of the call (the request's, its caller's, a
-        # middleware's timeout) is a cancel of the task this runs in.
-        cancels = _task_cancels()
-        try:
-            if definition.is_async:
-                # A task of its own, as asyncio.wait_for gave it on 3.11:
-                # a cancel request the tool leaves on its task (an old
-                # async-timeout, say) must not turn this call's timeout
-                # into a cancellation that answers nobody.
-                awaitable = asyncio.ensure_future(definition.fn(**arguments))
-            else:
-                # Sync tools run in a worker thread so they cannot block
-                # the event loop.  Python cannot kill that thread, so a
-                # cancel or timeout reaches the tool through the token.
-                awaitable = self._start_sync_tool(definition, arguments, token, context)
+        def _started() -> None:
             call._started = call.request._tool_started = True
-            async with asyncio.timeout(timeout) as deadline:
-                result = await awaitable
+
+        try:
+            result = await self._run_user_code(
+                definition.fn,
+                arguments,
+                is_async=definition.is_async,
+                timeout=timeout,
+                token=call.cancel_token,
+                target=_Target("tool", name, "tool"),
+                context=context,
+                started=_started,
+            )
         except ServerBusyError as exc:
             audit("tool_call", tool=name, client_id=context.client_id, status="busy")
             return ToolOutcome._create(
                 "busy", message=str(exc), started=call._started, error_code=exc.code
             )
-        except TimeoutError as exc:
-            if deadline is None or not deadline.expired():
-                # The tool raised it (a socket read timing out, say): a tool
-                # failure like any other, not the server's deadline.
-                return self._tool_failed(name, context, exc, _duration_ms())
-            _drop_unreported_error(awaitable)
-            self._stop_tool(token, TIMEOUT, name, context)
+        except _DeadlineExceeded:
             duration_ms = _duration_ms()
             audit(
                 "tool_call",
@@ -1911,15 +2988,12 @@ class MCPServer:
                 error_code=TOOL_TIMEOUT,
                 duration_ms=duration_ms,
             )
-        except asyncio.CancelledError as exc:
-            if _task_cancels() == cancels:
-                # Nothing cancelled the call: the tool raised CancelledError
-                # on its own (awaiting a shared future another waiter
-                # cancelled, say).  It failed, and the client is told so.
-                return self._tool_failed(name, context, exc, _duration_ms())
-            _drop_unreported_error(awaitable)
-            self._stop_tool(token, CANCELLED, name, context)
-            raise
+        except _UserCancelled as wrapped:
+            # The tool raised CancelledError on its own: it failed, and the
+            # client is told so.
+            error, wrapped.error = wrapped.error, None
+            assert error is not None
+            return self._tool_failed(name, context, error, _duration_ms())
         except ToolError as exc:
             # Intentional, safe-to-show tool error raised by the tool author.
             try:
@@ -1995,6 +3069,85 @@ class MCPServer:
             "ok", message=text, started=True, payload=payload, duration_ms=duration_ms
         )
 
+    async def _run_user_code(
+        self,
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
+        *,
+        is_async: bool,
+        timeout: float | None,
+        token: CancelToken,
+        target: _Target,
+        context: ClientContext,
+        started: Callable[[], None] | None = None,
+    ) -> Any:
+        """Run one registered function (a tool, resource, prompt or completer) and return its value.
+
+        The machinery every call of user code gets: an async function runs
+        as a task of its own, a sync one on a thread of its own (counted
+        against ``max_sync_workers``), under *timeout*; a cancel or the
+        deadline triggers *token* and abandons the call.  *started* is
+        called once the function has been started.  The caller sets the
+        context variables the function reads (the cancel token, the caller's
+        identity) before calling this, so a sync function's thread gets them.
+
+        Raises:
+            ServerBusyError: No sync worker was free; the function never started.
+            _DeadlineExceeded: *timeout* passed; *token* fired with ``TIMEOUT``.
+            asyncio.CancelledError: The call was cancelled; *token* fired with
+                ``CANCELLED``.
+            _UserCancelled: The function raised ``CancelledError`` although
+                nothing cancelled the call (awaiting a shared future another
+                waiter cancelled, say): a failure like any other.
+            Exception: Whatever the function raised, ``TimeoutError``
+                included when it was not the server's deadline.
+        """
+        deadline: asyncio.Timeout | None = None
+        awaitable: Any = None
+        # Every cancel of the call (the request's, its caller's, a
+        # middleware's timeout) is a cancel of the task this runs in.
+        cancels = _task_cancels()
+        try:
+            if is_async:
+                # A task of its own, as asyncio.wait_for gave it on 3.11:
+                # a cancel request the function leaves on its task (an old
+                # async-timeout, say) must not turn this call's timeout
+                # into a cancellation that answers nobody.
+                awaitable = asyncio.ensure_future(fn(**arguments))
+            else:
+                # Sync functions run in a worker thread so they cannot block
+                # the event loop.  Python cannot kill that thread, so a
+                # cancel or timeout reaches the function through the token.
+                awaitable = self._start_sync_call(fn, arguments, token, context, target)
+            if started is not None:
+                started()
+            async with asyncio.timeout(timeout) as deadline:
+                return await awaitable
+        except TimeoutError:
+            if deadline is None or not deadline.expired():
+                # The function raised it (a socket read timing out, say): a
+                # failure like any other, not the server's deadline.
+                raise
+            _drop_unreported_error(awaitable)
+            self._stop_call(token, TIMEOUT, target, context)
+            raise _DeadlineExceeded from None
+        except asyncio.CancelledError as exc:
+            if _task_cancels() == cancels:
+                raise _UserCancelled(exc) from None
+            _drop_unreported_error(awaitable)
+            self._stop_call(token, CANCELLED, target, context)
+            raise
+
+    def _stop_call(
+        self, token: CancelToken, reason: str, target: _Target, context: ClientContext
+    ) -> None:
+        if target.kind == "tool":
+            # As tools always called it (a test of the late-finish audit
+            # replaces it with one taking exactly these).
+            self._stop_tool(token, reason, target.label, context)
+        else:
+            self._stop_tool(token, reason, target.label, context, kind=target.kind)
+
     def _tool_failed(
         self, name: str, context: ClientContext, exc: BaseException, duration_ms: float
     ) -> ToolOutcome:
@@ -2033,41 +3186,44 @@ class MCPServer:
             exc.__traceback__ = None
 
     def _callback_failed(
-        self, name: str, context: ClientContext
+        self, name: str, context: ClientContext, kind: str = "tool"
     ) -> Callable[[BaseException], None]:
-        """How a failing cancel callback of tool *name* is reported."""
+        """How a failing cancel callback of the tool (or other *kind*) *name* is reported."""
+        fields: dict[str, Any] = {"tool": name} if kind == "tool" else {"kind": kind, "name": name}
 
         def failed(exc: BaseException) -> None:
             error_id = uuid.uuid4().hex[:12]
             self._logger.warning(
-                "cancel callback of tool %r failed error_id=%s", name, error_id, exc_info=exc
+                "cancel callback of %s %r failed error_id=%s", kind, name, error_id, exc_info=exc
             )
             audit(
                 "cancel_callback_failed",
-                tool=name,
+                **fields,
                 client_id=context.client_id,
                 error_id=error_id,
             )
 
         return failed
 
-    def _start_sync_tool(
+    def _start_sync_call(
         self,
-        definition: ToolDefinition,
-        arguments: dict[str, Any],
+        fn: Callable[..., Any],
+        arguments: Mapping[str, Any],
         token: CancelToken,
         context: ClientContext,
+        target: _Target,
     ) -> asyncio.Future[Any]:
-        """Run a sync tool on a thread of its own; returns its future.
+        """Run a sync function (a tool, resource, prompt or completer) on a thread of its own.
 
-        A daemon thread rather than a shared pool: a tool that ignores its
-        token keeps its thread after the call is abandoned, and in a pool
-        that thread would hold up unrelated calls queued behind it (and, at
-        exit, the interpreter).  ``max_sync_workers`` bounds them instead,
-        and :meth:`wait_for_tool_threads` gives them time at shutdown.
+        Returns its future.  A daemon thread rather than a shared pool: a
+        function that ignores its token keeps its thread after the call is
+        abandoned, and in a pool that thread would hold up unrelated calls
+        queued behind it (and, at exit, the interpreter).
+        ``max_sync_workers`` bounds them instead, and
+        :meth:`wait_for_tool_threads` gives them time at shutdown.
 
         Raises:
-            ServerBusyError: ``max_sync_workers`` tools are already running.
+            ServerBusyError: ``max_sync_workers`` sync calls are already running.
         """
         slots = self._sync_slots
         if slots is not None and not slots.acquire(blocking=False):
@@ -2079,11 +3235,11 @@ class MCPServer:
         # Carries the cancel token (and any other context) into the thread,
         # as asyncio.to_thread does.
         run_in_context = contextvars.copy_context().run
-        name = definition.name
+        kind, label, field = target.kind, target.label, target.field
 
         def work() -> None:
             try:
-                outcome: tuple[bool, Any] = (True, run_in_context(definition.fn, **arguments))
+                outcome: tuple[bool, Any] = (True, run_in_context(fn, **arguments))
             except BaseException as exc:
                 outcome = (False, exc)
             finally:
@@ -2096,12 +3252,12 @@ class MCPServer:
 
             def finished_late() -> None:
                 # The client was told the call was cancelled or timed out; a
-                # tool that acts (a write, say) may have done so anyway, and
-                # this is the record of it.
+                # function that acts (a write, say) may have done so anyway,
+                # and this is the record of it.
                 fired = token_ref()
                 audit(
-                    "tool_finished_after_cancel",
-                    tool=name,
+                    f"{kind}_finished_after_cancel",
+                    **{field: label},
                     client_id=context.client_id,
                     reason=fired.reason if fired is not None else None,
                     status=status,
@@ -2123,7 +3279,7 @@ class MCPServer:
                 del outcome
 
         try:
-            self._spawn(f"easy-mcp-tool:{name}", work)
+            self._spawn(f"easy-mcp-{kind}:{label}", work)
         except BaseException:
             if slots is not None:
                 slots.release()
@@ -2131,19 +3287,25 @@ class MCPServer:
         return future
 
     def _stop_tool(
-        self, token: CancelToken, reason: str, name: str, context: ClientContext
+        self,
+        token: CancelToken,
+        reason: str,
+        name: str,
+        context: ClientContext,
+        kind: str = "tool",
     ) -> None:
         """Trigger *token* and run its callbacks off the event loop.
 
-        The flag is set at once, so a tool polling ``token.cancelled`` sees
-        it immediately; callbacks may block (a MySQL ``KILL QUERY`` opens a
-        connection), so they get a thread of their own.  Never raises: it
-        runs while a cancellation or timeout is propagating.
+        The flag is set at once, so a function polling ``token.cancelled``
+        sees it immediately; callbacks may block (a MySQL ``KILL QUERY``
+        opens a connection), so they get a thread of their own.  Never
+        raises: it runs while a cancellation or timeout is propagating.
+        *kind* is what was called, ``"tool"`` or another kind of call.
         """
         callbacks = token._trigger(reason)
         if not callbacks:
             return
-        failed = token._on_error or self._callback_failed(name, context)
+        failed = token._on_error or self._callback_failed(name, context, kind)
 
         def run() -> None:
             # The token stays alive while its callbacks run (the call may be
@@ -2309,6 +3471,11 @@ class MCPServer:
                     "type": "startup",
                     "transport": self._transport.describe(),
                     "tools": [definition.name for definition in self.tools],
+                    "resources": [definition.uri for definition in self.resources],
+                    "resource_templates": [
+                        definition.uri_template for definition in self.resource_templates
+                    ],
+                    "prompts": [definition.name for definition in self.prompts],
                     "middleware": [describe(fn) for fn in self._request_middleware],
                     "tool_middleware": [describe(fn) for fn in self._tool_middleware],
                     "auth": self.auth is not None,
@@ -2351,6 +3518,17 @@ class MCPServer:
                     "tools %s require authentication but no auth is configured; "
                     "they will be unreachable",
                     protected,
+                )
+            others = [
+                *(f"resource {d.uri}" for d in self.resources if d.requires_auth),
+                *(f"template {d.uri_template}" for d in self.resource_templates if d.requires_auth),
+                *(f"prompt {d.name}" for d in self.prompts if d.requires_auth),
+            ]
+            if others:
+                self._logger.warning(
+                    "%s require authentication but no auth is configured; "
+                    "they will be unreachable",
+                    others,
                 )
             if self.host not in ("127.0.0.1", "localhost", "::1") and not isinstance(
                 self._transport, StdioTransport
@@ -2400,4 +3578,12 @@ class MCPServer:
                     "%d tool(s) are hidden from tokens that lack their scope; clients are "
                     "asked for these scopes up front",
                     len(hidden),
+                )
+            items: list[Guarded] = [*self.resources, *self.resource_templates, *self.prompts]
+            others = [item for item in items if item.scopes]
+            if others:
+                self._logger.info(
+                    "%d resource(s), template(s) or prompt(s) are hidden from tokens that lack "
+                    "their scope; clients are asked for these scopes up front",
+                    len(others),
                 )

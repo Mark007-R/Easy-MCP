@@ -7,10 +7,13 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
   responses get ``202 Accepted``.  The one exception is
   ``subscriptions/listen``, whose answer is a ``text/event-stream``.
 * ``GET`` with a session's ``MCP-Session-Id`` opens that session's stream
-  (``text/event-stream``), which carries ``notifications/tools/list_changed``
-  and nothing else.  One per session: a new one replaces the old.  A change
-  made while none is open is announced when one opens.  Without a session,
-  or for the stateless revision, ``GET`` answers ``405``.
+  (``text/event-stream``), which carries the list-change notifications
+  (tools, prompts, resources) and ``notifications/resources/updated`` for the
+  resources the session subscribed to, and nothing else.  One per session: a
+  new one replaces the old.  A list change made while none is open is
+  announced when one opens, and so is a resource update, with the in-process
+  store.  Without a session, or for the stateless revision, ``GET`` answers
+  ``405``.
 
 Two protocol eras share the endpoint, chosen per request:
 
@@ -162,14 +165,16 @@ class _NotifyStream:
     """A session's ``GET /mcp`` stream, held by this worker.
 
     ``outbox`` feeds the stream, ``sink`` is what tells it about list
-    changes, and ``reason`` says why it ended, once it has.
+    changes, ``kinds`` are the lists the session's ``initialize`` offered
+    changes of, and ``reason`` says why it ended, once it has.
     """
 
-    __slots__ = ("outbox", "reason", "sink", "timer")
+    __slots__ = ("kinds", "outbox", "reason", "sink", "timer")
 
     def __init__(self) -> None:
         self.outbox = Outbox()
         self.sink: _Sink | None = None
+        self.kinds: frozenset[str] = frozenset()
         self.reason: str | None = None
         self.timer: asyncio.TimerHandle | None = None
 
@@ -178,6 +183,11 @@ class _NotifyStream:
         if self.reason is None:
             self.reason = reason
         self.outbox.close()
+
+    def told(self) -> dict[str, str]:
+        """What its client was last told each of ``kinds`` holds; ``""`` where that is not known."""
+        baselines = self.sink.baselines if self.sink is not None else {}
+        return {kind: baselines.get(kind, "") for kind in self.kinds}
 
 
 def _media_type(value: str | None) -> str:
@@ -527,7 +537,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         """The session's stream, replacing any other it has here; holds the session while open.
 
         It starts with a ``list_changed`` for every list that changed since
-        the client was last told (at ``initialize``, or by its last stream).
+        the client was last told (at ``initialize``, or by its last stream),
+        and the updates of subscribed resources made while no stream was
+        open (with the in-process store).  Only the lists the session's
+        ``initialize`` offered changes of are announced: the keys of what
+        its client was told.
         """
         stream = _NotifyStream()
         baselines: dict[str, str] | None = None
@@ -536,7 +550,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # Newest wins, so a message never goes to two streams; what the
             # old one had yet to write goes to the new one.
             if replaced.sink is not None and not replaced.sink.closed:
-                baselines = dict(replaced.sink.baselines)
+                baselines = replaced.told()
             replaced.outbox.drain_into(stream.outbox)
             replaced.close("replaced")
         if baselines is None and session.record.baselines is not None:
@@ -549,8 +563,15 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             identity=identity,
             client_id=client_id,
             baselines=baselines,
+            subscriptions=session.record.subscriptions or (),
         )
         stream.sink = sink
+        # With nothing recorded (a store that keeps no baselines), the lists
+        # announced now stand in for those offered.
+        stream.kinds = frozenset(baselines) if baselines is not None else sink.kinds
+        # The subscriptions it starts with were read before it existed; one
+        # changed on another worker meanwhile was announced to no stream.
+        self._manager.resync_subscriptions(session)
         fields = {
             "session_id": session.session_id,
             "session_ref": session.ref,
@@ -579,9 +600,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # next stream announces that list.
             keep: dict[str, str] | None = None
             if stream.reason != "replaced":
-                keep = dict(sink.baselines)
-                for kind in stream.outbox.pending_kinds():
-                    keep.pop(kind, None)
+                keep = stream.told()
+                for kind in stream.outbox.pending_kinds() & keep.keys():
+                    keep[kind] = ""
             task = asyncio.ensure_future(self._stream_closed(session, keep))
             self._stream_ends.add(task)
             task.add_done_callback(self._stream_ends.discard)
@@ -604,13 +625,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         follows its credential.  Such a list (changed since, or seen with
         another credential's view) may be fetched with this request, so what
         the client holds is no longer known: its next stream announces it.
+        The list stays one the session was offered, with an empty digest.
         """
         told = session.record.baselines
         if session.notify_stream is not None or not told:
             return
         current = self._server._notifier.baselines([kind for kind, _ in told], identity)
-        kept = {kind: digest for kind, digest in told if current.get(kind) == digest}
-        if len(kept) < len(told):
+        kept = {kind: digest if current.get(kind) == digest else "" for kind, digest in told}
+        if kept != dict(told):
             await self._manager.save_baselines(session, kept)
 
     async def _handle_post(self, request: Request) -> Response:
@@ -692,6 +714,14 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         challenge = self._step_up_headers(response, identity, modern=False)
         if challenge is not None:
             return _json_response(response, headers=challenge, status=403)
+        error = response.get("error")
+        if (
+            message.get("method") == "resources/subscribe"
+            and isinstance(error, dict)
+            and error.get("code") == TOO_MANY_SESSIONS
+        ):
+            # The subscription cap, answered as the stream caps are.
+            return _answer(response, status=503)
         return _answer(response)
 
     async def _handle_stateless(
@@ -1030,7 +1060,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             else:
                 try:
                     # What its client is about to see, which the session's GET
-                    # stream, on whichever worker it opens, compares lists with.
+                    # stream, on whichever worker it opens, compares lists with;
+                    # their kinds are the only lists it announces.
                     baselines = self._server._list_baselines(session.context.identity)
                     await self._manager.save_baselines(session, baselines)
                 finally:
