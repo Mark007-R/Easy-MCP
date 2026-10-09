@@ -325,6 +325,7 @@ class Stream:
         self.context = self.client.stream("GET", "/sse", headers={"Authorization": f"Bearer {key}"})
         response = self.context.__enter__()
         assert response.status_code == 200
+        self.response = response
         self.events: list[str] = []
         self.ended = threading.Event()
         lines = response.iter_lines()
@@ -376,6 +377,17 @@ class Stream:
         )
 
     def close(self) -> None:
+        # On Linux, closing a socket that another thread is blocked reading
+        # neither wakes that read nor sends a FIN, so the server would not see
+        # the disconnect until its next keep-alive write.  Shutting it down
+        # first ends the connection at once, as closing it does on Windows.
+        network = self.response.extensions.get("network_stream")
+        raw = network.get_extra_info("socket") if network is not None else None
+        if raw is not None:
+            try:
+                raw.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed
         self.context.__exit__(None, None, None)
         self.client.close()
 
