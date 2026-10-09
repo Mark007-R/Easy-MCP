@@ -35,6 +35,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 from ..exceptions import PARSE_ERROR, PAYLOAD_TOO_LARGE, AuthenticationError
@@ -162,6 +163,7 @@ class StdioTransport(Transport):
         )
         in_flight: set[asyncio.Task[None]] = set()
         ref = session_ref(session_id)
+        t0 = int(time.time() * 1000)
         server._session_event(
             True,
             kind="stdio",
@@ -169,6 +171,7 @@ class StdioTransport(Transport):
             session_id=session_id,
             ref=ref,
             client_id=client_id,
+            t0=t0,
         )
         reader.start()
         try:
@@ -194,6 +197,7 @@ class StdioTransport(Transport):
                 session_id=session_id,
                 ref=ref,
                 client_id=client_id,
+                t0=t0,
             )
 
     def stop(self) -> None:

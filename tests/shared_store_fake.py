@@ -1,7 +1,9 @@
 """A shared store without Redis, for tests: several "workers" in one process.
 
 :class:`FakeHub` holds what Redis would: session records with their expiry,
-call counts, rate-limit windows, and the subscribers of the bus.  Each
+call counts, rate-limit windows, and the subscribers of the bus.  A record
+lapses at its expiry, as a Redis TTL would, while the session's index keeps
+naming it until a create, a refresh or a delete removes it.  Each
 :class:`FakeSharedStore` is one worker's view of it (``shared = True``), so
 one process can serve two ``MCPServer``s, each with its own store on one
 hub and each on its own ``live_server`` thread and event loop, and every
@@ -217,29 +219,30 @@ class FakeSharedStore(Store):
 
     async def refresh_sessions(
         self, kind: SessionKind, refs: Sequence[str], *, ttl: float
-    ) -> set[str]:
+    ) -> tuple[set[str], list[ExpiredSession]]:
         await self._op("refresh")
         hub = self.hub
         gone: set[str] = set()
+        expired: list[ExpiredSession] = []
         with hub.lock:
             now = hub.clock()
             for ref in refs:
                 entry = hub._live(ref, now)
                 if entry is None:
                     gone.add(ref)
+                    if hub.index[kind].pop(ref, None) is not None:
+                        expired.append(ExpiredSession(ref, None))
                 else:
                     entry.expires = now + ttl
                     hub.index[kind][ref] = entry.expires
-        return gone
+        return gone, expired
 
-    async def delete_session(self, kind: SessionKind, ref: str) -> SessionRecord | None:
+    async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         await self._op("delete")
         hub = self.hub
         with hub.lock:
-            entry = hub._live(ref, hub.clock())
             hub.sessions.pop(ref, None)
-            hub.index[kind].pop(ref, None)
-            return entry.record if entry is not None else None
+            return hub.index[kind].pop(ref, None) is not None
 
     async def reserve_session_call(self, ref: str, tool: str, limit: int) -> Reservation:
         await self._op("reserve")

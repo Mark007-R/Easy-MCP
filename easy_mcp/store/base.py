@@ -114,8 +114,9 @@ class SessionRecord:
     principal.  ``owner`` names the worker holding a legacy SSE stream (a
     shared store only).  ``session_id`` is the raw id, which only a store
     that stays in this process keeps; a shared store never writes it.
-    ``t0`` is when the session was opened, in milliseconds since the epoch,
-    by the store's clock.
+    ``t0`` is when the session was opened, in milliseconds since the epoch:
+    by the opening worker's clock in the record it files, and by the
+    store's own clock in a record a shared store returns.
     """
 
     ref: str
@@ -133,13 +134,16 @@ class SessionRecord:
 class ExpiredSession:
     """A session a store found expired and removed.
 
-    ``client_id`` is ``None`` when the store no longer knows it, and
-    ``session_id`` is kept only by a store that stays in this process.
+    ``client_id`` and ``t0`` (when it was opened) are ``None`` when the store
+    no longer knows them: a shared store's record lapses with its TTL, and
+    only the session's ref is left.  ``session_id`` is kept only by a store
+    that stays in this process.
     """
 
     ref: str
     client_id: str | None
     session_id: str | None = None
+    t0: int | None = None
 
 
 class AsyncRateLimiter(Protocol):
@@ -285,16 +289,29 @@ class Store(abc.ABC):
     @abc.abstractmethod
     async def refresh_sessions(
         self, kind: SessionKind, refs: Sequence[str], *, ttl: float
-    ) -> set[str]:
+    ) -> tuple[set[str], list[ExpiredSession]]:
         """Extend the life of sessions still in use here by *ttl*.
 
+        A session that expired meanwhile is removed, as :meth:`create_session`
+        removes the expired sessions it finds.
+
         Returns:
-            The refs of those that no longer exist.
+            The refs of those that no longer exist, and among them the
+            sessions this call found expired and removed.
         """
 
     @abc.abstractmethod
-    async def delete_session(self, kind: SessionKind, ref: str) -> SessionRecord | None:
-        """Remove a session; returns its record, or ``None`` if it was gone."""
+    async def delete_session(self, kind: SessionKind, ref: str) -> bool:
+        """Remove a session.
+
+        Whoever removes a session audits its close, so a store says whether
+        this call did.  An expired session the store still holds counts (a
+        shared store's index outlives the record): :meth:`create_session`
+        would otherwise find it expired, and remove it, later.
+
+        Returns:
+            Whether this call removed it (``False``: it was gone already).
+        """
 
     # ------------------------------------------------- max_calls_per_session
 

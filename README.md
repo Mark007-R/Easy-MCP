@@ -359,8 +359,10 @@ answers but refuses a write it needs (Redis full, read-only or failing to
 persist), while `/healthz`, which checks only that Redis answers, stays
 `200`. Stateless requests that need no store (a call to a tool without
 `max_calls_per_session` when rate limiting is off, say) are still served. A
-session's requests need it, bar a legacy SSE message that reaches the worker
-holding its stream.
+session's requests need it too. A legacy SSE message posted to the worker
+holding its stream is still accepted (`202`), but the answer on the stream
+is the same `-32008` unless rate limiting is off and the tool it calls has
+no `max_calls_per_session`.
 
 Give Redis TLS (`rediss://`), a user limited to the `easy-mcp:` keys and
 channels (the ACL is in [SECURITY.md](SECURITY.md)), and the default
@@ -777,7 +779,8 @@ id that also names the session in the store. On Streamable HTTP,
 stdio sessions are audited as open before their `initialize` arrives, so
 theirs carries none. The raw `session_id` is still there, but is dropped from
 audit events in 0.4: key log processing on `session_ref`. With a shared
-store, session events carry the `worker` that logged them,
+store, session events carry the `worker` that logged them (a session's
+close is logged once, by the worker that removes it from the store),
 `bus_message_rejected` records a message between workers that failed its
 authentication (`reason: "mac"`) or names another identity
 (`reason: "identity"`), and `sse_relay_failed` an answer that could not reach

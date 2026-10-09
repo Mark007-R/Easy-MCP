@@ -113,7 +113,8 @@ if ARGV[4] == '1' then return redis.call('HGETALL', KEYS[1]) end
 return 1
 """
 
-# KEYS: idx, rec1..recN   ARGV: ttl_ms, ref1..refN
+# KEYS: idx, rec1..recN   ARGV: ttl_ms, ref1..refN.  Per session: 1 alive, 0 gone,
+# -1 expired, its ref removed from the index here (as SESSION_CREATE prunes it).
 SESSION_REFRESH_MANY = """
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -124,6 +125,8 @@ for i = 2, #KEYS do
     redis.call('PEXPIRE', KEYS[i], ttl)
     redis.call('ZADD', KEYS[1], now + ttl, ARGV[i])
     alive[#alive + 1] = 1
+  elseif redis.call('ZREM', KEYS[1], ARGV[i]) == 1 then
+    alive[#alive + 1] = -1
   else
     alive[#alive + 1] = 0
   end
@@ -131,12 +134,11 @@ end
 return alive
 """
 
-# KEYS: rec, idx   ARGV: ref
+# KEYS: rec, idx   ARGV: ref.  1 if this call removed the session (an expired one
+# still named by the index included), 0 if it was gone.
 SESSION_DELETE = """
-local rec = redis.call('HGETALL', KEYS[1])
 redis.call('DEL', KEYS[1])
-redis.call('ZREM', KEYS[2], ARGV[1])
-return rec
+return redis.call('ZREM', KEYS[2], ARGV[1])
 """
 
 # KEYS: rec   ARGV: field ('c:<tool>'), limit
@@ -584,7 +586,7 @@ class RedisStore(Store):
         )
         status = int(reply[0])
         # The record of an expired session is gone with its TTL: only its ref
-        # is left in the index.
+        # is left in the index, so neither its client nor its t0 is known.
         expired = [ExpiredSession(_text(ref), None) for ref in (reply[1] or [])]
         if status == -1:
             raise ValueError("a session with this ref exists already")
@@ -629,19 +631,21 @@ class RedisStore(Store):
 
     async def refresh_sessions(
         self, kind: SessionKind, refs: Sequence[str], *, ttl: float
-    ) -> set[str]:
+    ) -> tuple[set[str], list[ExpiredSession]]:
         if not refs:
-            return set()
+            return set(), []
         reply = await self._run(
             "refresh",
             [self._index_key(kind), *(self._session_key(ref) for ref in refs)],
             [_ms(ttl), *refs],
         )
-        return {ref for ref, alive in zip(refs, reply, strict=False) if not int(alive)}
+        states = list(zip(refs, (int(alive) for alive in reply), strict=False))
+        gone = {ref for ref, alive in states if alive <= 0}
+        return gone, [ExpiredSession(ref, None) for ref, alive in states if alive < 0]
 
-    async def delete_session(self, kind: SessionKind, ref: str) -> SessionRecord | None:
+    async def delete_session(self, kind: SessionKind, ref: str) -> bool:
         reply = await self._run("delete", [self._session_key(ref), self._index_key(kind)], [ref])
-        return _record(ref, reply)
+        return int(reply) > 0
 
     # ----------------------------------------------- max_calls_per_session
 

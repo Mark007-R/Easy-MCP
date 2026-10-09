@@ -49,9 +49,11 @@ class MemoryStore(Store):
     It behaves as 0.3.1 did: a session expires once it has been idle for its
     ttl with no request running, and stateless clients' counts are kept for
     the 4096 most recently seen clients.  ``max_sessions`` counts Streamable
-    HTTP and legacy SSE sessions separately; unlike 0.3.1, it counts those of
-    every endpoint serving the server together, when one server is served at
-    several (each endpoint still knows only its own sessions).  Its rate
+    HTTP and legacy SSE sessions separately.  Unlike 0.3.1, when one server is
+    served at several endpoints, it counts those of every endpoint together
+    (each endpoint still knows only its own sessions), and a stateless
+    client's counts are shared between the endpoints too; they lapse after the
+    idle timeout of whichever endpoint the client reached last.  Its rate
     limiter is the server's own in-process one.
 
     No method awaits anything, so each call completes in one step of the
@@ -89,7 +91,7 @@ class MemoryStore(Store):
     @staticmethod
     def _gone(entry: _Session) -> ExpiredSession:
         record = entry.record
-        return ExpiredSession(record.ref, record.client_id, record.session_id)
+        return ExpiredSession(record.ref, record.client_id, record.session_id, record.t0)
 
     def _entry(self, kind: SessionKind, ref: str) -> _Session | None:
         entry = self._sessions.get(ref)
@@ -154,7 +156,9 @@ class MemoryStore(Store):
 
     async def refresh_sessions(
         self, kind: SessionKind, refs: Sequence[str], *, ttl: float
-    ) -> set[str]:
+    ) -> tuple[set[str], list[ExpiredSession]]:
+        # A session in use never expires here: one that is gone was removed
+        # by whoever found it expired or ended it.
         now = self._clock()
         gone: set[str] = set()
         for ref in refs:
@@ -163,14 +167,13 @@ class MemoryStore(Store):
                 gone.add(ref)
             else:
                 entry.last_seen = now
-        return gone
+        return gone, []
 
-    async def delete_session(self, kind: SessionKind, ref: str) -> SessionRecord | None:
-        entry = self._entry(kind, ref)
-        if entry is None:
-            return None
+    async def delete_session(self, kind: SessionKind, ref: str) -> bool:
+        if self._entry(kind, ref) is None:
+            return False
         del self._sessions[ref]
-        return entry.record
+        return True
 
     # ------------------------------------------------- max_calls_per_session
 

@@ -12,6 +12,10 @@ running elsewhere, the end of a session, and a legacy SSE answer for the
 worker that holds the stream.  A heartbeat keeps the sessions this worker is
 busy with alive in the store, and renews the lease of the legacy SSE
 streams it holds.
+
+Whoever removes a session from the store audits its close, so each close is
+audited once: the worker (or endpoint) that ends it, or the one that finds
+it expired.
 """
 
 from __future__ import annotations
@@ -202,8 +206,12 @@ class SessionManager:
         # meanwhile can be checked against them.
         self._pending: dict[str, tuple[str, int]] = {}
         self._ended: OrderedDict[str, float] = OrderedDict()
+        # Sessions ended here that the store could not be told about (an
+        # outage), with why they ended: a heartbeat removes them later.
+        self._unremoved: dict[str, tuple[LocalSession, str | None]] = {}
         self._heartbeat: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[Any]] = set()
+        server._session_managers.add(self)
         if self.store.shared:
             self.store.subscribe(self._on_bus)
 
@@ -353,7 +361,7 @@ class SessionManager:
         if record is None:
             local = self._local.get(ref)
             if local is not None and not self.store.shared:
-                self._end_here(local)  # expired, and removed by another endpoint
+                self._end_here(local)  # gone from a store that told no endpoint
             return Rejection.NOT_FOUND
         if self._recently_ended(ref):
             # Ended while the store was asked: the end has been announced.
@@ -480,8 +488,9 @@ class SessionManager:
         """End *local* everywhere: in the store, on every worker, and here.
 
         Its calls running here are cancelled, those yet to start included.
-        *reason* is audited with ``session_close`` (``None``: nothing to
-        audit, as for a handshake that failed).
+        *reason* is audited with ``session_close`` when this removes the
+        session from the store; whatever removed it first audited it instead
+        (``None``: nothing to audit, as for a handshake that failed).
 
         Args:
             strict: Remove it from the store first, and raise if that fails
@@ -495,32 +504,63 @@ class SessionManager:
         if local.ended:
             return
         if strict:
-            await self.store.delete_session(self._kind, local.ref)
-            if local.ended:
-                return  # ended meanwhile, announced by another worker
-        self._end_here(local)
-        if reason is not None:
-            self._closed(local.session_id, local.ref, local.record, reason)
-        if strict:
-            if self.store.shared:
+            removed = await self.store.delete_session(self._kind, local.ref)
+            ended = local.ended  # meanwhile, announced by another worker
+            if not ended:
+                self._end_here(local)
+            if removed and reason is not None:
+                self._closed(local.session_id, local.ref, local.record, reason)
+            if not ended and self.store.shared:
                 await self._announce_end(local)
             return
-        work = self._forget(local)
+        self._end_here(local)
+        work = self._forget(local, reason)
         if detach and self.store.shared:
             self._spawn(work)
         else:
             await work
 
-    async def _forget(self, local: LocalSession) -> None:
-        """The store's part of ending *local*: remove it and tell the other workers."""
+    async def _forget(self, local: LocalSession, reason: str | None) -> None:
+        """The store's part of ending *local*: remove it, audit it, tell the other workers.
+
+        A store out of reach is told on a later heartbeat (:meth:`_refresh`).
+        """
         try:
-            await self.store.delete_session(self._kind, local.ref)
+            removed = await self.store.delete_session(self._kind, local.ref)
         except StoreUnavailableError:
-            pass  # it expires on its own
+            self._unremoved[local.ref] = (local, reason)
+            removed = False
         except Exception:
             self._server._logger.error("could not remove a session from the store", exc_info=True)
+            removed = True  # its close is audited all the same
+        if removed and reason is not None:
+            self._closed(local.session_id, local.ref, local.record, reason)
         if self.store.shared:
             await self._announce_end(local)
+
+    async def _remove_unremoved(self) -> bool:
+        """Remove the sessions ended here while the store was out of reach.
+
+        Returns:
+            Whether the store could be reached.
+        """
+        for ref, (local, reason) in list(self._unremoved.items()):
+            try:
+                removed = await self.store.delete_session(self._kind, ref)
+            except StoreUnavailableError:
+                return False
+            except Exception:
+                self._server._logger.error(
+                    "could not remove a session from the store", exc_info=True
+                )
+                removed = True  # not tried again; its close is audited all the same
+            if self._unremoved.pop(ref, None) is None:
+                continue  # found expired meanwhile, and audited then (_expire)
+            if removed and reason is not None:
+                self._closed(local.session_id, ref, local.record, reason)
+            if self.store.shared:
+                await self._announce_end(local)
+        return True
 
     async def _announce_end(self, local: LocalSession) -> None:
         payload = _bus.seal(
@@ -558,22 +598,53 @@ class SessionManager:
         )
 
     def _expire(self, expired: Iterable[ExpiredSession]) -> None:
-        """End the sessions a store found expired here too, and audit them."""
+        """End the sessions the store found expired and removed, and audit their close.
+
+        A session ends on whichever endpoint of this server holds it, which
+        knows more of it than the store may: its id, its client and when it
+        opened, or why it ended there before the store could be told.
+        """
+        expired = list(expired)
+        if not expired:
+            return
+        managers = [self] + [
+            manager
+            for manager in self._server._session_managers
+            if manager is not self and manager._kind == self._kind
+        ]
         for gone in expired:
-            local = self._local.get(gone.ref)
-            if local is not None:
-                self._end_here(local)
-            self._server._session_event(
-                False,
-                kind=self._kind,
-                transport=self._transport,
-                session_id=gone.session_id,
-                ref=gone.ref,
-                client_id=gone.client_id,
-                # An SSE session in a shared store expires when its owner
-                # stopped renewing its lease.
-                reason="lease_lost" if self._kind == "sse" else "idle_timeout",
-            )
+            # An SSE session in a shared store expires when its owner
+            # stopped renewing its lease.
+            reason: str | None = "lease_lost" if self._kind == "sse" else "idle_timeout"
+            transport = self._transport
+            session_id, client_id, t0 = gone.session_id, gone.client_id, gone.t0
+            for manager in managers:
+                unremoved = manager._unremoved.pop(gone.ref, None)
+                local = manager._local.get(gone.ref)
+                if unremoved is not None:
+                    local, reason = unremoved
+                elif local is not None:
+                    manager._end_here(local)
+                else:
+                    continue
+                transport = manager._transport
+                session_id, client_id, t0 = (
+                    local.session_id,
+                    local.record.client_id,
+                    local.record.t0,
+                )
+                break
+            if reason is not None:
+                self._server._session_event(
+                    False,
+                    kind=self._kind,
+                    transport=transport,
+                    session_id=session_id,
+                    ref=gone.ref,
+                    client_id=client_id,
+                    t0=t0,
+                    reason=reason,
+                )
 
     async def shutdown(self) -> None:
         """This worker stops serving: end its sessions, or leave them to the others.
@@ -793,30 +864,36 @@ class SessionManager:
                 self._server._logger.error("session heartbeat failed", exc_info=True)
 
     async def _refresh(self) -> None:
+        if not await self._remove_unremoved():
+            return  # tried again on the next beat
         if self._kind == "sse":
             refs = [ref for ref, local in self._local.items() if local.owned]
             ttl = SSE_LEASE_SECONDS
         else:
             refs = [ref for ref, local in self._local.items() if local.active > 0]
             ttl = self._ttl if self._ttl is not None else HTTP_HEARTBEAT_MAX_SECONDS * 3
-        gone: set[str] = set()
         for start in range(0, len(refs), REFRESH_BATCH):
             try:
-                gone |= await self.store.refresh_sessions(
+                gone, expired = await self.store.refresh_sessions(
                     self._kind, refs[start : start + REFRESH_BATCH], ttl=ttl
                 )
             except StoreUnavailableError:
                 return  # tried again on the next beat
-        for ref in gone:
-            local = self._local.get(ref)
-            if local is None or local.ended:
-                continue
-            self._end_here(local)
-            if local.owned:
-                # Its lease ran out (a store outage longer than the lease, or
-                # a record removed): the client must open a new session.
-                self._closed(local.session_id, local.ref, local.record, "lease_lost")
-                await self._announce_end(local)
+            lost: list[LocalSession] = []
+            for ref in gone:
+                local = self._local.get(ref)
+                if local is not None and not local.ended:
+                    lost.append(local)
+            # The expired ones this refresh removed from the store are
+            # audited here; whoever removed any other audited it.
+            self._expire(expired)
+            for local in lost:
+                if not local.ended:
+                    self._end_here(local)
+                if local.owned:
+                    # Its lease ran out (a store outage longer than the lease,
+                    # or a record removed): the client must open a new session.
+                    await self._announce_end(local)
 
     def _spawn(self, work: Any) -> None:
         task = asyncio.ensure_future(work)

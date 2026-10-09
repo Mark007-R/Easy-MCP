@@ -7,12 +7,12 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import rpc
+from conftest import LogCapture, headers_for, modern, rpc
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
 from easy_mcp import MCPServer, MemoryStore, SSETransport, StreamableHTTPTransport
-from easy_mcp.exceptions import TOO_MANY_SESSIONS
+from easy_mcp.exceptions import SESSION_LIMIT_EXCEEDED, TOO_MANY_SESSIONS
 from easy_mcp.security.ratelimit import SlidingWindowRateLimiter
 from easy_mcp.store import Reservation, SessionRecord
 from easy_mcp.store.base import session_ref
@@ -210,7 +210,8 @@ def test_memory_store_records_the_negotiated_version() -> None:
     assert found.protocol_version == "2025-06-18" and found.t0 is not None
     # The kind is part of a session's identity.
     assert run_now(store.acquire_session("sse", rec.ref, ttl=None)) == (None, [])
-    assert run_now(store.delete_session("sse", rec.ref)) is None
+    assert run_now(store.delete_session("sse", rec.ref)) is False
+    assert run_now(store.delete_session("http", rec.ref)) is True
 
 
 def test_memory_sessions_stay_with_the_endpoint_that_opened_them(
@@ -276,6 +277,94 @@ async def test_memory_sessions_expire_by_their_own_endpoints_timeout() -> None:
         # Opening a session on the other endpoint prunes only what has expired.
         assert (await two.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)).is_success
         assert (await one.post("/mcp", json=rpc("ping", msg_id=2), headers=headers)).is_success
+
+
+def asgi_client(transport: StreamableHTTPTransport) -> httpx.AsyncClient:
+    app = httpx.ASGITransport(app=transport.build_app())
+    return httpx.AsyncClient(transport=app, base_url="http://127.0.0.1")
+
+
+async def test_memory_sessions_another_endpoint_prunes_end_where_they_are_held(
+    logs: LogCapture,
+) -> None:
+    # Opening a session prunes the expired sessions of every endpoint, which
+    # max_sessions counts together: the endpoint that held one forgets it
+    # then, rather than keeping it until shutdown, and its close is audited once.
+    clock = Clock()
+    server = MCPServer(port=0, rate_limit_per_minute=None, store=MemoryStore(clock=clock))
+    one = StreamableHTTPTransport(server, session_idle_timeout=1, legacy_sse=False)
+    two = StreamableHTTPTransport(server, session_idle_timeout=1, legacy_sse=False)
+    initialize = rpc("initialize", INIT, "init")
+    async with asgi_client(one) as first, asgi_client(two) as second:
+        for _ in range(3):
+            for _ in range(5):
+                assert (await first.post("/mcp", json=initialize, headers=ACCEPT)).is_success
+            clock.now += 10
+            assert (await second.post("/mcp", json=initialize, headers=ACCEPT)).is_success
+            assert one._manager.local_sessions() == []
+            assert len(two._manager.local_sessions()) == 1
+    await one.close_streams()
+    await two.close_streams()
+    opened = [event["session_ref"] for event in logs.events("session_open")]
+    closed = [event["session_ref"] for event in logs.events("session_close")]
+    assert len(opened) == 18 and sorted(closed) == sorted(opened)
+    reasons = [event["reason"] for event in logs.events("session_close")]
+    assert reasons.count("idle_timeout") == 17 and reasons.count("shutdown") == 1
+
+
+async def test_memory_session_closes_carry_when_the_session_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every close reaches the session hook with the t0 its open had,
+    # an idle expiry (the usual end of a Streamable HTTP session) included.
+    clock = Clock()
+    server = MCPServer(port=0, rate_limit_per_minute=None, store=MemoryStore(clock=clock))
+    events: list[tuple[bool, str | None, int | None]] = []
+    hook = server._session_event
+
+    def record_event(opened: bool, **fields: Any) -> None:
+        events.append((opened, fields.get("reason"), fields.get("t0")))
+        hook(opened, **fields)
+
+    monkeypatch.setattr(server, "_session_event", record_event)
+    transport = StreamableHTTPTransport(server, session_idle_timeout=1, legacy_sse=False)
+    initialize = rpc("initialize", INIT, "init")
+    async with asgi_client(transport) as http:
+        assert (await http.post("/mcp", json=initialize, headers=ACCEPT)).is_success
+        clock.now += 10
+        opened = await http.post("/mcp", json=initialize, headers=ACCEPT)  # prunes the first
+        clock.now += 10
+        headers = {**ACCEPT, "MCP-Session-Id": opened.headers["mcp-session-id"]}
+        expired = await http.post("/mcp", json=rpc("ping", msg_id=2), headers=headers)
+        assert expired.status_code == 404  # found expired by its own lookup
+    assert [(event[0], event[1]) for event in events] == [
+        (True, None),
+        (False, "idle_timeout"),
+        (True, None),
+        (False, "idle_timeout"),
+    ]
+    t0s = [event[2] for event in events]
+    assert None not in t0s and t0s[0] == t0s[1] and t0s[2] == t0s[3]
+
+
+async def test_memory_stateless_counts_are_shared_between_endpoints() -> None:
+    # Unlike 0.3.1, where each transport kept its own: a stateless client's
+    # max_calls_per_session counts are the server's, as with RedisStore.
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+
+    @server.tool(max_calls_per_session=1)
+    def once() -> str:
+        """Once per client."""
+        return "once"
+
+    one = StreamableHTTPTransport(server, legacy_sse=False)
+    two = StreamableHTTPTransport(server, legacy_sse=False)
+    call = modern("tools/call", {"name": "once"})
+    async with asgi_client(one) as first, asgi_client(two) as second:
+        answered = await first.post("/mcp", json=call, headers=headers_for(call))
+        assert answered.json()["result"]["content"][0]["text"] == "once"
+        refused = await second.post("/mcp", json=call, headers=headers_for(call))
+        assert refused.json()["error"]["code"] == SESSION_LIMIT_EXCEEDED
 
 
 def test_a_store_binds_to_one_server() -> None:

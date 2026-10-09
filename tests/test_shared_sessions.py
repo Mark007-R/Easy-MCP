@@ -132,20 +132,41 @@ def make_server(store: Any, signals: Signals, **options: Any) -> MCPServer:
     return server
 
 
+class GracefulServer(uvicorn.Server):
+    """Stops as BaseHTTPTransport.run() does: the streams and running requests first."""
+
+    def __init__(self, config: uvicorn.Config, transport: Any) -> None:
+        super().__init__(config)
+        self.transport = transport
+
+    async def shutdown(self, sockets: Any = None) -> None:
+        await self.transport.close_streams()
+        await super().shutdown(sockets)
+
+
 @pytest.fixture
 def serve() -> Iterator[Callable[..., Worker]]:
     running: list[Worker] = []
 
     def start(
-        store: Any, *, idle: float | None = 3600.0, sse_only: bool = False, **options: Any
+        store: Any,
+        *,
+        idle: float | None = 3600.0,
+        sse_only: bool = False,
+        graceful: bool = False,
+        **options: Any,
     ) -> Worker:
         signals = Signals()
         server = make_server(store, signals, **options)
+        transport: Any
         if sse_only:
-            app = SSETransport(server).build_app()
+            transport = SSETransport(server)
         else:
-            app = StreamableHTTPTransport(server, session_idle_timeout=idle).build_app()
-        uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+            transport = StreamableHTTPTransport(server, session_idle_timeout=idle)
+        config = uvicorn.Config(
+            transport.build_app(), host="127.0.0.1", port=0, log_level="warning"
+        )
+        uv = GracefulServer(config, transport) if graceful else uvicorn.Server(config)
         thread = threading.Thread(target=uv.run, daemon=True)
         thread.start()
         deadline = time.time() + 10
@@ -494,6 +515,28 @@ def test_worker_shutdown_keeps_shared_sessions(
     assert logs.events("session_close") == []
 
 
+def test_worker_shutdown_keeps_the_sessions_it_is_serving(
+    serve: Callable[..., Worker], logs: LogCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A stops while one of the session's calls runs there, so its shutdown
+    # still holds the session: it stops the call and leaves the session to B.
+    monkeypatch.setattr("easy_mcp.transport.streamable_http._SHUTDOWN_GRACE_SECONDS", 0.3)
+    hub = FakeHub()
+    a = serve(hub.store(WORKER_A), graceful=True)
+    b = serve(hub.store(WORKER_B))
+    session = open_session(a)
+    running = Background(lambda: post(a, call("slow", 2), session=session, timeout=20))
+    assert a.signals.started.wait(5)
+    a.stop()
+    answered = running.result()
+    assert answered.status_code == 503
+    assert answered.json()["error"]["code"] == SERVER_BUSY
+    assert a.signals.cancelled.is_set()
+    assert [record.ref for record in records(hub)] == [session_ref(session)]
+    assert text(post(b, call("whoami", 3), session=session)) == WORKER_B
+    assert logs.events("session_close") == []
+
+
 def test_session_events_carry_ref_worker_and_version(
     serve: Callable[..., Worker], logs: LogCapture
 ) -> None:
@@ -603,9 +646,14 @@ def test_sse_lease_loss_closes_the_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(_sessions, "SSE_HEARTBEAT_SECONDS", 0.2)
-    hub, a, _ = pair(serve)
+    clock = Clock()
+    hub = FakeHub(clock=clock)
+    a, b = serve(hub.store(WORKER_A)), serve(hub.store(WORKER_B))
     _, lines, endpoint = sse(a)
-    hub.remove(session_ref(endpoint.split("=", 1)[1]))
+    # Its owner could not renew the lease for longer than it lasts (a store
+    # outage): the record lapses, as a Redis TTL would, and only the index
+    # still names the session.
+    clock.now += _sessions.SSE_LEASE_SECONDS + 1
     ended = threading.Event()
 
     def drain() -> None:
@@ -615,8 +663,90 @@ def test_sse_lease_loss_closes_the_stream(
 
     threading.Thread(target=drain, daemon=True).start()
     assert ended.wait(3), "the stream was not closed"
+    sse(b)  # an open on another worker prunes the index: its close is not audited again
     (closed,) = logs.events("session_close")
-    assert closed["reason"] == "lease_lost"
+    assert closed["reason"] == "lease_lost" and closed["worker"] == WORKER_A
+    assert closed["session_ref"] == session_ref(endpoint.split("=", 1)[1])
+    assert closed["client_id"] == fingerprint(KEY_A)
+
+
+async def test_a_session_close_is_audited_once_by_whoever_removes_it(logs: LogCapture) -> None:
+    # Whichever worker removes what the store still holds of a session audits
+    # its close, in whatever order the owner and the others find it gone.
+    clock = Clock()
+    hub = FakeHub(clock=clock)
+    server_a = make_server(hub.store(WORKER_A), Signals())
+    server_b = make_server(hub.store(WORKER_B), Signals())
+    a, b = SSETransport(server_a)._manager, SSETransport(server_b)._manager
+    http_a = StreamableHTTPTransport(server_a, legacy_sse=False)._manager
+    http_b = StreamableHTTPTransport(server_b, legacy_sse=False)._manager
+    lapse = _sessions.SSE_LEASE_SECONDS + 1
+
+    async def stream(manager: _sessions.SessionManager, name: str) -> _sessions.LocalSession:
+        local = await manager.open(name, client_id=f"ip:{name}", identity=None, owned=True)
+        assert local is not None
+        await manager.finish(local)
+        manager.opened(local)
+        return local
+
+    def closes(local: _sessions.LocalSession) -> list[str]:
+        events = logs.events("session_close")
+        return [event["reason"] for event in events if event["session_ref"] == local.ref]
+
+    async def end_offline(manager: _sessions.SessionManager, name: str) -> _sessions.LocalSession:
+        local = await stream(manager, name)
+        hub.down = True
+        await manager.end(local, reason="stream_closed")  # the store cannot be told
+        hub.down = False
+        assert local.ended and closes(local) == []
+        return local
+
+    try:
+        # The owner finds its lease lost, then another worker's open prunes.
+        first = await stream(a, "first")
+        clock.now += lapse
+        await a._refresh()
+        assert first.ended
+        await stream(b, "b1")
+        assert closes(first) == ["lease_lost"]
+        # Another worker's open prunes it, then its owner finds it gone.
+        second = await stream(a, "second")
+        clock.now += lapse
+        await stream(b, "b2")
+        await a._refresh()
+        assert second.ended and closes(second) == ["lease_lost"]
+        # The stream closes during an outage: the owner's next heartbeat
+        # removes the session and audits its close.
+        third = await end_offline(a, "third")
+        await a._refresh()
+        clock.now += lapse
+        await stream(b, "b3")
+        assert closes(third) == ["stream_closed"]
+        # The lease lapses before that: another worker's open prunes it.
+        fourth = await end_offline(a, "fourth")
+        clock.now += lapse
+        await stream(b, "b4")
+        await a._refresh()
+        assert closes(fourth) == ["lease_lost"]
+        # Or the owner's own open does, which still knows why it ended.
+        fifth = await end_offline(a, "fifth")
+        clock.now += lapse
+        await stream(a, "a5")
+        await a._refresh()
+        assert closes(fifth) == ["stream_closed"]
+        # A failed handshake opened no session, so its removal closes none.
+        handshake = await http_a.open("handshake", client_id="ip:h", identity=None)
+        assert handshake is not None
+        hub.down = True
+        await http_a.end(handshake, reason=None)
+        hub.down = False
+        await http_a._refresh()
+        clock.now += 7200
+        assert await http_b.open("later", client_id="ip:l", identity=None) is not None
+        assert closes(handshake) == []
+    finally:
+        for manager in (a, b, http_a, http_b):
+            await manager.shutdown()
 
 
 def test_sse_relay_of_an_oversized_answer_is_an_error(
@@ -719,6 +849,33 @@ def test_sse_calls_a_stopping_worker_relays_are_answered(
     # The stream lives on, served by A.
     assert post_message(a, endpoint, call("add", 3, a=1, b=2)).status_code == 202
     assert json.loads(next_data(lines))["id"] == 3
+
+
+@pytest.mark.parametrize("limit", [120, None], ids=["rate-limited", "unlimited"])
+def test_sse_message_to_the_stream_worker_during_an_outage(
+    serve: Callable[..., Worker], sse: Callable[[Worker], Any], limit: int | None
+) -> None:
+    # The worker holding the stream accepts the message without the store,
+    # but answers it -32008 on the stream if serving it needs the store:
+    # for the rate limit, or a capped tool.
+    hub = FakeHub()
+    a = serve(hub.store(WORKER_A), rate_limit_per_minute=limit)
+    _, lines, endpoint = sse(a)
+    hub.down = True
+    try:
+        assert post_message(a, endpoint, rpc("ping", msg_id=1)).status_code == 202
+        pinged = json.loads(next_data(lines))
+        assert post_message(a, endpoint, call("scarce", 2)).status_code == 202
+        capped = json.loads(next_data(lines))
+    finally:
+        hub.down = False
+    if limit is None:
+        assert pinged["id"] == 1 and pinged["result"] == {}
+    else:
+        assert pinged["id"] == 1 and pinged["error"]["code"] == SERVER_BUSY
+        assert pinged["error"]["data"] == {"reason": "store_unavailable"}
+    assert capped["id"] == 2 and capped["error"]["code"] == SERVER_BUSY
+    assert capped["error"]["data"] == {"reason": "store_unavailable"}
 
 
 def test_sse_relay_to_a_dead_owner_is_audited(

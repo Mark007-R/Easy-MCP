@@ -106,6 +106,7 @@ from .security.ratelimit import SlidingWindowRateLimiter
 from .store.base import AsyncRateLimiter, Reservation, Store, StoreHandle
 from .store.memory import MemoryStore
 from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
+from .transport._sessions import SessionManager
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
@@ -404,6 +405,9 @@ class MCPServer:
         )
         # The last ping of a shared store, for /healthz: (when, reachable).
         self._store_ping: tuple[float, bool] | None = None
+        # The session managers of every HTTP endpoint serving this server: a
+        # session the store removes ends on whichever endpoint holds it.
+        self._session_managers: weakref.WeakSet[SessionManager] = weakref.WeakSet()
         # Set while an HTTP app of this server is serving (its lifespan runs).
         self._serving = False
         self._transport: Transport | None = None
@@ -782,11 +786,14 @@ class MCPServer:
         return context if same else dataclasses.replace(context, identity=identity)
 
     def check_rate_limit(self, client_id: str) -> None:
-        """Consume one unit of *client_id*'s request budget.
+        """Consume one unit of *client_id*'s request budget, in this process.
 
-        ``dispatch`` calls this for every message; transports call it for
-        work that happens before any message exists (opening an SSE session)
-        so that path cannot sidestep the budget.
+        ``dispatch`` calls this for every message whose context has no
+        ``store_handle``: stdio, and a direct ``dispatch`` call.  The HTTP
+        transports charge their messages, and the opening of a legacy SSE
+        session, through :meth:`acheck_rate_limit` instead, which spends the
+        store's budget (with :class:`~easy_mcp.MemoryStore`, this same one):
+        override that one to change how HTTP requests are limited.
 
         Raises:
             RateLimitError: If the client is over budget.  A no-op when rate
@@ -804,9 +811,10 @@ class MCPServer:
         """Consume one unit of *client_id*'s request budget in the store.
 
         The async counterpart of :meth:`check_rate_limit`, which the HTTP
-        transports use.  With :class:`~easy_mcp.MemoryStore` both spend the
-        same in-process budget; with a shared store this one is shared
-        between the workers and :meth:`check_rate_limit` stays per process.
+        transports use for every message and every legacy SSE session they
+        open.  With :class:`~easy_mcp.MemoryStore` both spend the same
+        in-process budget; with a shared store this one is shared between the
+        workers and :meth:`check_rate_limit` stays per process.
 
         Raises:
             RateLimitError: If the client is over budget.  A no-op when rate
@@ -1879,7 +1887,8 @@ class MCPServer:
             mcp_app = server.build_app()
             app = Starlette(routes=[Mount("/", mcp_app)], lifespan=lifespan)
 
-        At startup it connects the store (a shared store that refuses the
+        At startup it warns about a misconfigured store (plaintext to a
+        remote Redis, say) and connects it (a shared store that refuses the
         credentials stops the startup; one out of reach is retried, and
         ``/healthz`` answers 503 meanwhile), then fetches the OAuth
         authorization servers' metadata and keys (best effort).  At shutdown
@@ -1897,6 +1906,9 @@ class MCPServer:
     async def _lifespan(self, transport: BaseHTTPTransport | None) -> AsyncIterator[None]:
         if transport is not None:
             transport._reopen()  # an app started again serves anew
+        # Here rather than in run(): an app uvicorn serves itself, or one
+        # mounted in another app, never calls run().
+        self._warn_about_store()
         await self._store.start()
         try:
             if self.oauth is not None:
@@ -1991,11 +2003,15 @@ class MCPServer:
                 )
         if self.oauth is not None:
             self._warn_about_oauth(self.oauth)
-        if not isinstance(self._transport, StdioTransport):
-            for warning in self._store.warnings():
-                self._logger.warning("store: %s", warning)
+        # An HTTP transport's app warns about the store as its lifespan starts.
+        if not isinstance(self._transport, StdioTransport | BaseHTTPTransport):
+            self._warn_about_store()
         if self.debug:
             self._logger.warning("debug mode is ON: clients will receive tracebacks")
+
+    def _warn_about_store(self) -> None:
+        for warning in self._store.warnings():
+            self._logger.warning("store: %s", warning)
 
     def _warn_about_oauth(self, oauth: OAuthResourceServer) -> None:
         transport = self._transport

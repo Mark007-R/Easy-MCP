@@ -396,18 +396,23 @@ async def test_script_replies_are_parsed() -> None:
         await store.release_session("http", ref, ttl=60, protocol_version="2025-06-18")
         assert client.calls[-1][2] == [ref, 60_000, "2025-06-18", "0", "http"]
 
-        client.replies["refresh"] = [1, 0, 1]
+        # Alive, gone, and expired with its ref removed from the index here.
+        client.replies["refresh"] = [1, 0, -1]
         refs = [ref, other, session_ref("u")]
-        assert await store.refresh_sessions("http", refs, ttl=30) == {other}
+        gone, expired = await store.refresh_sessions("http", refs, ttl=30)
+        assert gone == {other, refs[2]}
+        assert [(found.ref, found.client_id, found.t0) for found in expired] == [
+            (refs[2], None, None)
+        ]
         assert client.calls[-1][1][0] == store._index_key("http")
         assert client.calls[-1][2] == [30_000, *refs]
-        assert await store.refresh_sessions("http", [], ttl=30) == set()
+        assert await store.refresh_sessions("http", [], ttl=30) == (set(), [])
 
-        client.replies["delete"] = flat
-        deleted = await store.delete_session("sse", ref)
-        assert deleted is not None and deleted.client_id == "ip:x"
-        client.replies["delete"] = []
-        assert await store.delete_session("sse", ref) is None
+        client.replies["delete"] = 1
+        assert await store.delete_session("sse", ref) is True
+        assert client.calls[-1][1] == [store._session_key(ref), store._index_key("sse")]
+        client.replies["delete"] = 0  # gone already
+        assert await store.delete_session("sse", ref) is False
 
         for reply, outcome in (
             (-2, Reservation.GONE),

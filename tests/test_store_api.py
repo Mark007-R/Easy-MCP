@@ -340,6 +340,103 @@ async def test_stdio_never_touches_a_shared_store() -> None:
     assert hub.calls == [] and hub.payloads == [] and store.started == 0
 
 
+async def test_stdio_session_events_carry_when_the_session_opened(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = make_server()
+    events: list[tuple[bool, int | None]] = []
+    hook = server._session_event
+
+    def record_event(opened: bool, **fields: Any) -> None:
+        events.append((opened, fields.get("t0")))
+        hook(opened, **fields)
+
+    monkeypatch.setattr(server, "_session_event", record_event)
+    stdin = io.BytesIO(json.dumps(rpc("initialize", INIT)).encode() + b"\n")
+    await StdioTransport(server, stdin=stdin, stdout=io.BytesIO()).serve()
+    (opened, t0), (closed, t0_again) = events
+    assert opened and not closed
+    assert t0 is not None and t0 == t0_again and abs(t0 - time.time() * 1000) < 60_000
+
+
+async def test_a_shared_store_serves_a_session_at_every_endpoint_of_its_kind() -> None:
+    # A session is the server's, wherever it was opened (with MemoryStore it
+    # stays with its endpoint: tests/test_store_memory.py).
+    server = make_server(FakeHub().store())
+    one = StreamableHTTPTransport(server, legacy_sse=False)
+    two = StreamableHTTPTransport(server, legacy_sse=False)
+
+    def client(transport: StreamableHTTPTransport) -> httpx.AsyncClient:
+        app = httpx.ASGITransport(app=transport.build_app())
+        return httpx.AsyncClient(transport=app, base_url="http://127.0.0.1")
+
+    async with client(one) as first, client(two) as second:
+        opened = await first.post("/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        headers = {**ACCEPT, "MCP-Session-Id": opened.headers["mcp-session-id"]}
+        served = await second.post("/mcp", json=rpc("ping", msg_id=2), headers=headers)
+        assert served.status_code == 200 and served.json()["result"] == {}
+
+
+def test_http_requests_are_charged_through_acheck_rate_limit(live_server: LiveServer) -> None:
+    # check_rate_limit() charges what has no store handle (stdio, a direct
+    # dispatch); a subclass that customises HTTP limiting overrides
+    # acheck_rate_limit().
+    calls: list[str] = []
+
+    class Exempting(MCPServer):
+        def check_rate_limit(self, client_id: str) -> None:
+            calls.append("check")
+            super().check_rate_limit(client_id)
+
+        async def acheck_rate_limit(self, client_id: str) -> None:
+            calls.append("acheck")  # everyone is exempt
+
+    server = Exempting(port=0, rate_limit_per_minute=1)
+    base = live_server(server)
+    with httpx.Client(base_url=base, timeout=10) as client:
+        session = open_session(client)
+        for msg_id in (2, 3):
+            assert session_post(client, rpc("ping", msg_id=msg_id), session).json()["result"] == {}
+        listed = modern("tools/list")
+        assert client.post("/mcp", json=listed, headers=headers_for(listed)).status_code == 200
+        with client.stream("GET", "/sse") as stream:
+            assert stream.status_code == 200
+    assert calls == ["acheck"] * 5
+    assert asyncio.run(server.dispatch(rpc("ping"), make_context())) is not None
+    assert calls[5:] == ["check"]
+
+
+async def test_an_app_served_without_run_warns_about_its_store(
+    logs: LogCapture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The multi-worker recipe (uvicorn app:app --workers 4) and a mounted app
+    # never call run(): the app's lifespan warns, once, however it is served.
+    pytest.importorskip("redis")
+    store = RedisStore("redis://redis.internal:6379/0")
+
+    async def offline() -> None:
+        return None
+
+    monkeypatch.setattr(store, "start", offline)
+    monkeypatch.setattr(store, "aclose", offline)
+    server = MCPServer(port=0, store=store)
+    app = server.build_app()
+
+    def warned() -> int:
+        return sum(
+            "not encrypted" in record.getMessage()
+            for record in logs.records
+            if record.levelname == "WARNING"
+        )
+
+    async with app.router.lifespan_context(app):
+        assert warned() == 1
+    async with server.lifespan():
+        assert warned() == 2
+    server._warn_if_misconfigured()  # run(): an HTTP transport's lifespan warns instead
+    assert warned() == 2
+
+
 async def test_registering_a_tool_while_serving_with_a_shared_store_warns(
     logs: LogCapture,
 ) -> None:

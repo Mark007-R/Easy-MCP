@@ -191,13 +191,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `Retry-After: 1`) rather than served without their limits. No new error
   code: the stateless revision allows none in `-32000..-32019`.
 
-  `MemoryStore` is the default and behaves as 0.3.1 did, bar one change to
-  `max_sessions` (see Changed). The stdio transport keeps its state in
-  process whatever store is configured.
+  `MemoryStore` is the default and behaves as 0.3.1 did, bar two changes for
+  a server served at several endpoints: `max_sessions` and stateless call
+  counts (see Changed). The stdio transport keeps its state in process
+  whatever store is configured.
 - `MCPServer.acheck_rate_limit(client_id)`, the async counterpart of
   `check_rate_limit()` that charges the store's budget, shared between
-  workers with `RedisStore`. `check_rate_limit()` is unchanged and keeps the
-  in-process budget. `MCPServer.store` is the configured store.
+  workers with `RedisStore`. The HTTP transports now charge every request
+  through it (see Changed); `check_rate_limit()` still spends the in-process
+  budget, for stdio and direct `dispatch` calls. `MCPServer.store` is the
+  configured store.
 - `Store`, the interface a store implements, is public and provisional until
   1.0 (`easy_mcp.store`). `ClientContext.store_handle` gives a request's
   dispatch the session's (or stateless client's) state in the store; the HTTP
@@ -210,6 +213,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   before their `initialize` arrives). New events:
   `bus_message_rejected` and `sse_relay_failed`. Legacy SSE `session_close`
   events now carry a `reason` (`stream_closed`, `shutdown`, `lease_lost`).
+  Each session's close is audited once, by the worker that removes it from
+  the store: one that ends while the store is out of reach is audited when
+  its worker reaches the store again, or as `lease_lost` or `idle_timeout`
+  by the worker that finds it expired first.
 - `MCPServer.lifespan()` also connects the store at startup and closes it
   last at shutdown.
 
@@ -278,8 +285,20 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - `max_sessions` caps the sessions of a server, still separately for
   Streamable HTTP and legacy SSE: those of every endpoint serving it count
   together (in 0.3.1 each transport counted its own), and with a shared
-  store those of all workers. A session is still known only to the endpoint
-  that opened it.
+  store those of all workers. With the default `MemoryStore` a session is
+  still known only to the endpoint that opened it; with a shared store every
+  endpoint of the same kind (Streamable HTTP or legacy SSE), on every
+  worker, serves it.
+- With several Streamable HTTP endpoints serving one server, a stateless
+  client's `max_calls_per_session` counts are shared between them (in 0.3.1
+  each transport kept its own), as they are between workers with a shared
+  store. They lapse after the `session_idle_timeout` of whichever endpoint
+  the client reached last.
+- The HTTP transports charge each request, and the opening of a legacy SSE
+  session, through `acheck_rate_limit()`, which spends the store's budget
+  (the same in-process one with `MemoryStore`), rather than through
+  `check_rate_limit()`. A subclass that overrides `check_rate_limit()` to
+  customise HTTP rate limiting must override `acheck_rate_limit()` instead.
 - With a shared store, `session_idle_timeout=None` is refused, because
   sessions in a shared store must expire. Stopping a worker no longer ends
   the sessions it served, except those whose legacy SSE stream it held; the
