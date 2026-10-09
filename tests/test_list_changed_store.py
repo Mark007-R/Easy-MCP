@@ -12,11 +12,14 @@ import asyncio
 import json
 import os
 import secrets
+from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
+from conftest import notification, rpc
 
-from easy_mcp import MemoryStore
+from easy_mcp import MCPServer, MemoryStore
 from easy_mcp.store.base import SessionRecord, Store, session_ref
 
 REDIS_URL = os.environ.get("EASY_MCP_LIVE_REDIS_URL")
@@ -183,4 +186,67 @@ async def test_live_redis_keeps_baselines_in_the_session_record() -> None:
         assert await store.delete_session("http", ref)
     finally:
         await store.aclose()
+        await _drop_namespace(namespace)
+
+
+@live
+async def test_live_redis_get_stream_on_another_worker_announces_changes(
+    live_server: Callable[[Any], str], fast_debounce: float
+) -> None:
+    pytest.importorskip("redis")
+    from easy_mcp import RedisStore
+
+    assert REDIS_URL is not None
+    namespace = "lc-" + secrets.token_hex(6)
+    servers = []
+    bases = []
+    for _ in range(2):
+        server = MCPServer(
+            port=0,
+            name="list-changed-live",
+            rate_limit_per_minute=None,
+            store=RedisStore(REDIS_URL, namespace=namespace),
+        )
+
+        @server.tool
+        def add(a: int, b: int) -> int:
+            """Add two integers."""
+            return a + b
+
+        servers.append(server)
+        bases.append(live_server(server))
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            init = await client.post(
+                f"{bases[0]}/mcp", json=rpc("initialize", INIT), headers=ACCEPT
+            )
+            assert init.status_code == 200, init.text
+            session = init.headers["mcp-session-id"]
+            done = await client.post(
+                f"{bases[0]}/mcp",
+                json=notification("notifications/initialized"),
+                headers={**ACCEPT, "MCP-Session-Id": session},
+            )
+            assert done.status_code == 202
+            for server in servers:  # the change runs in every worker
+
+                def extra() -> str:
+                    """Registered at runtime."""
+                    return "extra"
+
+                server.register_tool(extra, name="extra")
+            headers = {"Accept": "text/event-stream", "MCP-Session-Id": session}
+            async with client.stream("GET", f"{bases[1]}/mcp", headers=headers) as response:
+                assert response.status_code == 200
+                lines = response.aiter_lines()
+
+                async def first_event() -> Any:
+                    async for line in lines:
+                        if line.startswith("data: "):
+                            return json.loads(line[len("data: ") :])
+                    return None
+
+                event = await asyncio.wait_for(first_event(), 10)
+                assert event == {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+    finally:
         await _drop_namespace(namespace)

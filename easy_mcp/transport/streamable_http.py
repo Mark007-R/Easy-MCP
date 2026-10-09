@@ -4,9 +4,13 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
 
 * ``POST`` delivers exactly one JSON-RPC message.  A request is answered in
   the HTTP response body as ``application/json``; notifications and client
-  responses get ``202 Accepted``.
-* ``GET`` answers ``405``: every server message is the reply to a client
-  request, so there is nothing to push on a standalone stream.
+  responses get ``202 Accepted``.  The one exception is
+  ``subscriptions/listen``, whose answer is a ``text/event-stream``.
+* ``GET`` with a session's ``MCP-Session-Id`` opens that session's stream
+  (``text/event-stream``), which carries ``notifications/tools/list_changed``
+  and nothing else.  One per session: a new one replaces the old.  A change
+  made while none is open is announced when one opens.  Without a session,
+  or for the stateless revision, ``GET`` answers ``405``.
 
 Two protocol eras share the endpoint, chosen per request:
 
@@ -16,7 +20,10 @@ Two protocol eras share the endpoint, chosen per request:
   (for ``tools/call``) ``Mcp-Name`` headers must match the body, since a
   proxy may route on the headers while this server executes the body; a
   mismatch is ``400`` with ``-32020``.  Closing the connection cancels the
-  request.
+  request.  A ``subscriptions/listen`` stream starts with its
+  acknowledgment and ends when its client closes it, or with its result
+  when the server ends it (shutdown, the token's expiry); a refused one is
+  answered as JSON (``503`` for ``-32007``).
 * **Session** (``2025-11-25`` and earlier): ``initialize`` opens a session
   whose ``MCP-Session-Id`` response header the client echoes on every later
   request, and ``DELETE`` with that header ends it.
@@ -55,7 +62,9 @@ import base64
 import binascii
 import contextlib
 import json
+import math
 import secrets
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -73,15 +82,18 @@ from ..exceptions import (
     MISSING_REQUIRED_CLIENT_CAPABILITY,
     PARSE_ERROR,
     PAYLOAD_TOO_LARGE,
+    RATE_LIMITED,
     SERVER_BUSY,
     TOO_MANY_SESSIONS,
     UNSUPPORTED_PROTOCOL_VERSION,
     ProtocolError,
+    RateLimitError,
     StoreUnavailableError,
 )
 from ..logging import audit
 from ..middleware import TransportInfo
 from ..protocol import (
+    LISTEN_METHOD,
     META_PROTOCOL_VERSION,
     MODERN_PROTOCOL_VERSIONS,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -96,12 +108,14 @@ from ._http import (
     rpc_error,
     store_unavailable,
 )
+from ._outbox import EventStreamResponse, Outbox, accepts_event_stream, stream_events
 from ._sessions import ClientHandle, LocalSession, Rejection, SessionManager
 from .base import ClientContext
 from .sse import SSETransport
 
 if TYPE_CHECKING:
     from ..server import MCPServer
+    from ..subscriptions import _Sink
 
 SESSION_HEADER = "MCP-Session-Id"
 PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version"
@@ -120,6 +134,10 @@ _STATELESS_ERROR_STATUS: dict[object, int] = {
     UNSUPPORTED_PROTOCOL_VERSION: 400,
 }
 
+# A refused subscriptions/listen is answered like any stateless error, and
+# the stream cap like the session cap.
+_LISTEN_ERROR_STATUS: dict[object, int] = {**_STATELESS_ERROR_STATUS, TOO_MANY_SESSIONS: 503}
+
 # How often a running stateless request checks whether its client hung up.
 _DISCONNECT_POLL_SECONDS = 0.25
 
@@ -132,6 +150,28 @@ _TRANSPORT = "streamable-http"
 
 class _ShuttingDown(Exception):
     """Shutdown stopped a message being dispatched, or refused to start one."""
+
+
+class _NotifyStream:
+    """A session's ``GET /mcp`` stream, held by this worker.
+
+    ``outbox`` feeds the stream, ``sink`` is what tells it about list
+    changes, and ``reason`` says why it ended, once it has.
+    """
+
+    __slots__ = ("outbox", "reason", "sink", "timer")
+
+    def __init__(self) -> None:
+        self.outbox = Outbox()
+        self.sink: _Sink | None = None
+        self.reason: str | None = None
+        self.timer: asyncio.TimerHandle | None = None
+
+    def close(self, reason: str) -> None:
+        """End the stream once what is queued has been written; the first reason stands."""
+        if self.reason is None:
+            self.reason = reason
+        self.outbox.close()
 
 
 def _media_type(value: str | None) -> str:
@@ -301,6 +341,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         )
         # Every message being dispatched, so shutdown can cancel it.
         self._dispatches: set[asyncio.Task[Any]] = set()
+        # The subscriptions/listen streams open here: their context, and the
+        # task dispatching their request.
+        self._listens: dict[ClientContext, asyncio.Task[Any]] = {}
+        # What a closed GET stream leaves to do: record its lists, release its session.
+        self._stream_ends: set[asyncio.Task[None]] = set()
         self._closing = False
 
     _audit_transport = _TRANSPORT
@@ -341,8 +386,16 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         other workers serve them, and the legacy SSE messages relayed here
         for a stream another worker holds get the same grace, then the same
         answer on that stream.
+
+        First of all, each ``subscriptions/listen`` stream gets its
+        completion result and ends, and each session's ``GET`` stream ends.
         """
         self._closing = True
+        for context in list(self._listens):
+            self._server.close_subscriptions(context, reason="shutdown")
+        for local in self._manager.local_sessions():
+            if local.notify_stream is not None:
+                local.notify_stream.close("shutdown")
         relays: set[asyncio.Task[Any]] = set()
         if self._legacy is not None:
             await self._legacy.close_all_sessions()
@@ -385,14 +438,140 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             return await self._handle_post(request)
         if request.method == "DELETE":
             return await self._handle_delete(request)
-        # Every server message answers a client request, so there is nothing
-        # to push on a standalone stream; the spec allows 405 here.
-        return rpc_error(
-            405,
-            INVALID_REQUEST,
-            "Method Not Allowed: this server offers no GET stream; POST JSON-RPC messages",
-            headers={"Allow": "POST, DELETE"},
+        return await self._handle_get(request)
+
+    async def _handle_get(self, request: Request) -> Response:
+        """Open a session's notification stream.
+
+        In order: ``405`` without a session id or for the stateless revision
+        (which has no GET stream), ``406`` unless the client accepts
+        ``text/event-stream``, the credential (``401``), the session
+        (``404``, ``403`` for another credential, ``400`` for an unsupported
+        version), and one unit of the session's rate-limit budget (``429``).
+        """
+        if request.headers.get(SESSION_HEADER) is None or (
+            request.headers.get(PROTOCOL_VERSION_HEADER) in MODERN_PROTOCOL_VERSIONS
+        ):
+            return rpc_error(
+                405,
+                INVALID_REQUEST,
+                f"Method Not Allowed: GET opens a session's stream and needs its "
+                f"{SESSION_HEADER}; POST JSON-RPC messages",
+                headers={"Allow": "GET, POST, DELETE"},
+            )
+        if not accepts_event_stream(request.headers.get("accept")):
+            return rpc_error(
+                406, INVALID_REQUEST, "Not Acceptable: the client must accept text/event-stream"
+            )
+        resolved = await self._resolve_identity(request, modern=False)
+        if isinstance(resolved, Response):
+            return resolved
+        identity = resolved
+        session = await self._session_for(request, identity)
+        if isinstance(session, Response):
+            return session
+        opened = False
+        try:
+            client_id = session.context.client_id
+            try:
+                # Opening a stream costs one request, as GET /sse does.
+                await self._server.acheck_rate_limit(client_id)
+            except RateLimitError as exc:
+                audit("rate_limited", client_id=client_id, method="GET " + self._path)
+                return rpc_error(
+                    429,
+                    RATE_LIMITED,
+                    str(exc),
+                    headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
+                    data=exc.data,
+                )
+            except StoreUnavailableError:
+                return store_unavailable()
+            if self._closing:
+                # A stream opened now would hold shutdown up.
+                return rpc_error(
+                    503,
+                    SERVER_BUSY,
+                    "Server is shutting down; retry shortly",
+                    headers={"Retry-After": "1"},
+                    data={"reason": "shutdown"},
+                )
+            if session.ended:
+                return rpc_error(
+                    404, INVALID_REQUEST, "Session not found; send a new initialize request"
+                )
+            response = self._open_stream(session, identity)
+            opened = True
+            return response
+        finally:
+            if not opened:
+                await self._manager.finish(session)
+
+    def _open_stream(self, session: LocalSession, identity: ClientIdentity | None) -> Response:
+        """The session's stream, replacing any other it has here; holds the session while open.
+
+        It starts with a ``list_changed`` for every list that changed since
+        the client was last told (at ``initialize``, or by its last stream).
+        """
+        stream = _NotifyStream()
+        baselines: dict[str, str] | None = None
+        replaced = session.notify_stream
+        if replaced is not None:
+            # Newest wins, so a message never goes to two streams; what the
+            # old one had yet to write goes to the new one.
+            if replaced.sink is not None and not replaced.sink.closed:
+                baselines = dict(replaced.sink.baselines)
+            replaced.outbox.drain_into(stream.outbox)
+            replaced.close("replaced")
+        if baselines is None and session.record.baselines is not None:
+            baselines = dict(session.record.baselines)
+        session.notify_stream = stream
+        client_id = session.context.client_id
+        sink = self._server._watch_session(
+            session.session_id,
+            push=stream.outbox.put,
+            identity=identity,
+            client_id=client_id,
+            baselines=baselines,
         )
+        stream.sink = sink
+        fields = {
+            "session_id": session.session_id,
+            "session_ref": session.ref,
+            "client_id": client_id,
+            "transport": _TRANSPORT,
+        }
+        audit("stream_open", **fields)
+        deadline = self._server._stream_deadline(identity)
+        if deadline is not None:
+            # A token's stream ends with the token.
+            stream.timer = asyncio.get_running_loop().call_later(
+                max(0.0, deadline - time.time()), stream.close, "token_expired"
+            )
+
+        def on_close() -> None:
+            if stream.timer is not None:
+                stream.timer.cancel()
+            stream.close("client_closed")
+            if session.notify_stream is stream:
+                session.notify_stream = None
+            self._server._notifier.end_session(session.session_id, sink)
+            audit("stream_close", **fields, reason=stream.reason)
+            # The lists it last told its client about are where the next
+            # stream starts from, on whichever worker it opens.
+            keep = None if stream.reason == "replaced" else dict(sink.baselines)
+            task = asyncio.ensure_future(self._stream_closed(session, keep))
+            self._stream_ends.add(task)
+            task.add_done_callback(self._stream_ends.discard)
+
+        return EventStreamResponse(stream_events(stream.outbox), on_close=on_close)
+
+    async def _stream_closed(self, session: LocalSession, baselines: dict[str, str] | None) -> None:
+        try:
+            if baselines is not None:
+                await self._manager.save_baselines(session, baselines)
+        finally:
+            await self._manager.finish(session)
 
     async def _handle_post(self, request: Request) -> Response:
         if not _accepts_json(request.headers.get("accept")):
@@ -515,6 +694,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 return _json_response(
                     _rpc_error_body(msg_id, exc.code, str(exc), exc.data), status=400
                 )
+        if method == LISTEN_METHOD:
+            # Its answer is a stream; it makes no tool call, so it leaves the
+            # client's call counts (and their idle clock) alone.
+            return await self._open_listen(message, identity, request, info, client_id)
 
         # A context of its own, so nothing in flight is shared with other
         # requests; only the per-client call counts are, kept in the store.
@@ -541,6 +724,106 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         error = response.get("error")
         code = error.get("code") if isinstance(error, dict) else None
         return _answer(response, status=_STATELESS_ERROR_STATUS.get(code, 200))
+
+    async def _open_listen(
+        self,
+        message: dict[str, Any],
+        identity: ClientIdentity | None,
+        request: Request,
+        info: TransportInfo,
+        client_id: str,
+    ) -> Response:
+        """Serve ``subscriptions/listen``: its first frame decides the answer.
+
+        The request is dispatched with a context whose channel is this
+        response.  If the acknowledgment comes first, the answer is a
+        ``text/event-stream`` starting with it; if ``dispatch`` finishes
+        first, the listen was refused, and the error is answered as JSON.
+        Closing the stream is the client's cancel.
+        """
+        msg_id = message.get("id")
+        if not accepts_event_stream(request.headers.get("accept")):
+            return _json_response(
+                _rpc_error_body(
+                    msg_id,
+                    INVALID_REQUEST,
+                    "Not Acceptable: subscriptions/listen answers with text/event-stream, "
+                    "which the client must accept",
+                ),
+                status=406,
+            )
+        if self._closing:
+            return _shutting_down(msg_id)
+        outbox = Outbox()
+        context = ClientContext(
+            client_id=client_id,
+            session_id="stateless",
+            identity=identity,
+            store_handle=ClientHandle(self._server.store, client_id, self._idle_timeout),
+            push=outbox.put,
+        )
+        task = asyncio.ensure_future(self._server.dispatch(message, context, transport=info))
+        # The stream ends once the request does and its last frame is written.
+        task.add_done_callback(lambda _: outbox.close())
+        self._dispatches.add(task)
+        streaming = False
+        try:
+            waiter = asyncio.ensure_future(outbox.wait())
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {task, waiter},
+                        timeout=_DISCONNECT_POLL_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if done:
+                        break
+                    if await request.is_disconnected():
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                        audit(
+                            "request_abandoned",
+                            client_id=client_id,
+                            request_id=msg_id,
+                            transport=_TRANSPORT,
+                        )
+                        return Response(status_code=202)
+            finally:
+                waiter.cancel()
+            if len(outbox):
+                streaming = True
+            elif task.cancelled():
+                if self._closing:
+                    return _shutting_down(msg_id)
+                return Response(status_code=202)
+        finally:
+            self._dispatches.discard(task)
+            if not streaming and not task.done():
+                task.cancel()  # our own caller is going away
+        if not streaming:
+            response = task.result()
+            if response is None:
+                return Response(status_code=202)
+            challenge = self._step_up_headers(response, identity, modern=True)
+            if challenge is not None:
+                return _json_response(response, headers=challenge, status=403)
+            error = response.get("error")
+            code = error.get("code") if isinstance(error, dict) else None
+            return _answer(response, status=_LISTEN_ERROR_STATUS.get(code, 200))
+
+        self._listens[context] = task
+        if self._closing:
+            # Shutdown began while it was acknowledged: it ends at once, gracefully.
+            self._server.close_subscriptions(context, reason="shutdown")
+
+        def on_close() -> None:
+            self._listens.pop(context, None)
+            outbox.close()
+            if not task.done():
+                task.cancel()  # the client closed the stream: that is its cancel
+
+        return EventStreamResponse(stream_events(outbox), on_close=on_close)
 
     async def _dispatch_until_disconnect(
         self,
@@ -689,6 +972,10 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                 await self._manager.end(session, reason=None)
                 session.active -= 1
             else:
+                # What its client is about to see, which the session's GET
+                # stream, on whichever worker it opens, compares lists with.
+                baselines = self._server._list_baselines(session.context.identity)
+                await self._manager.save_baselines(session, baselines)
                 await self._manager.finish(
                     session, protocol_version=session.context.protocol_version
                 )

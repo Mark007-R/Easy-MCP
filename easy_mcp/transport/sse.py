@@ -9,6 +9,14 @@ Flow:
    an ``endpoint`` event containing the URL to POST messages to.
 2. The client POSTs JSON-RPC messages to ``/messages?session_id=...``.
 3. Responses are streamed back over the open SSE connection.
+4. The stream also carries the server's own messages:
+   ``notifications/tools/list_changed`` once ``initialize`` has been
+   answered, and the frames of a ``subscriptions/listen`` posted to
+   ``/messages``.  The stream is shared, as stdout is on stdio, so the
+   client ends a listen with ``notifications/cancelled``, and the server
+   ends one with its result followed by ``notifications/cancelled``.  With
+   a shared store, only the worker holding the stream serves such a listen;
+   another answers ``-32601``.
 
 Security handled here (before anything reaches the dispatcher):
 
@@ -66,13 +74,12 @@ from ..exceptions import (
 from ..logging import audit
 from ..middleware import TransportInfo
 from ._http import BaseHTTPTransport, store_unavailable
+from ._outbox import KEEPALIVE_SECONDS, sse_event
 from ._sessions import CLOSE_STREAM, LocalSession, Rejection, SessionManager
 from .base import ClientContext
 
 if TYPE_CHECKING:
     from ..server import MCPServer
-
-KEEPALIVE_SECONDS = 15.0
 
 # How long shutdown lets the messages relayed here for a stream another
 # worker holds finish, as Streamable HTTP does the requests it serves; and
@@ -195,6 +202,8 @@ class SSETransport(BaseHTTPTransport):
         for session in self._manager.local_sessions():
             if not session.owned:
                 continue  # its stream is on another worker
+            # Final frames first, so they reach the stream before it closes.
+            self._server.close_subscriptions(session.context, reason="shutdown")
             for task in list(session.tasks):
                 task.cancel()
             if session.stream is not None:
@@ -273,6 +282,10 @@ class SSETransport(BaseHTTPTransport):
         endpoint = f"{self._messages_path}?session_id={session_id}"
         queue = session.stream
         assert queue is not None
+        # The stream is the session's channel for the server's own messages
+        # too: list changes, and subscriptions/listen streams.
+        session.context.push = queue.put_nowait
+        session.context.multiplexed = True
 
         async def stream() -> Any:
             try:
@@ -285,8 +298,7 @@ class SSETransport(BaseHTTPTransport):
                         continue
                     if item is CLOSE_STREAM:
                         break
-                    payload = json.dumps(item, ensure_ascii=False, default=str)
-                    yield f"event: message\ndata: {payload}\n\n"
+                    yield sse_event(item)
             finally:
                 # Calls still running for this session have nobody left to
                 # answer, on any worker.  Detached: this stream's task may be
@@ -406,6 +418,9 @@ class SSETransport(BaseHTTPTransport):
             await self._manager.record_version(session, version)
         if response is not None and session.stream is not None:
             await session.stream.put(response)
+            if version is not None:
+                # The handshake's answer is queued: list changes may follow it.
+                self._manager.start_notifications(session, context.identity)
 
     async def _relay(
         self,

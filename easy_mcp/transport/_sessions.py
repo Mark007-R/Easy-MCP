@@ -23,12 +23,13 @@ it that finds it gone first.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import enum
 import json
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -115,7 +116,10 @@ class LocalSession:
     requests of the session this worker is serving.  ``opened`` is set once
     its handshake has succeeded here.  ``owned`` marks the session whose
     stream this worker holds, and ``stream`` is the queue of what that
-    stream sends.
+    stream sends.  ``notify_stream`` is a Streamable HTTP session's
+    ``GET /mcp`` stream, when this worker holds it; it holds one of
+    ``active`` while open, so the session neither expires nor is forgotten
+    here meanwhile.
     """
 
     ref: str
@@ -132,6 +136,8 @@ class LocalSession:
     # Background work for it: legacy SSE dispatches and relays.
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     stream: asyncio.Queue[Any] | None = None
+    # The transport's own object, with a close(reason) method.
+    notify_stream: Any = None
 
     @property
     def in_flight(self) -> _InFlight:
@@ -451,6 +457,41 @@ class SessionManager:
             # The store has it all; nothing is left here to keep.
             del self._local[local.ref]
 
+    async def save_baselines(self, local: LocalSession, baselines: Mapping[str, str]) -> None:
+        """Record what *local*'s client was last told its lists hold, here and in the store.
+
+        Never raises: a store that cannot take them leaves the next stream
+        to announce only the changes made while it is open.
+        """
+        if local.ended:
+            return
+        local.record = dataclasses.replace(
+            local.record, baselines=tuple(sorted(baselines.items()))
+        )
+        try:
+            await self.store.save_baselines(self._kind, local.ref, baselines)
+        except StoreUnavailableError:
+            pass  # the store logged the outage
+        except Exception:
+            self._server._logger.error("could not record a session's lists", exc_info=True)
+
+    def start_notifications(self, local: LocalSession, identity: ClientIdentity | None) -> None:
+        """Announce list changes on *local*'s legacy SSE stream from now on.
+
+        Called once its ``initialize`` result is queued on the stream held
+        here, whichever worker dispatched it: nothing can then reach the
+        stream before that result.
+        """
+        if local.ended or not local.owned or local.stream is None:
+            return
+        self._server._watch_session(
+            local.session_id,
+            push=local.stream.put_nowait,
+            identity=identity,
+            client_id=local.record.client_id,
+            multiplexed=True,
+        )
+
     async def record_version(self, local: LocalSession, version: str) -> None:
         """Record in a shared store the version *local*'s handshake negotiated here.
 
@@ -510,13 +551,13 @@ class SessionManager:
             removed = await self.store.delete_session(self._kind, local.ref)
             ended = local.ended  # meanwhile, announced by another worker
             if not ended:
-                self._end_here(local)
+                self._end_here(local, reason)
             if removed and reason is not None:
                 self._closed(local.session_id, local.ref, local.record, reason)
             if not ended and self.store.shared:
                 await self._announce_end(local)
             return
-        self._end_here(local)
+        self._end_here(local, reason)
         work = self._forget(local, reason)
         if detach and self.store.shared:
             self._spawn(work)
@@ -576,12 +617,21 @@ class SessionManager:
         )
         await self._broadcast(payload)
 
-    def _end_here(self, local: LocalSession) -> None:
-        """Forget *local* on this worker and stop its work (no store call)."""
+    def _end_here(self, local: LocalSession, reason: str | None = None) -> None:
+        """Forget *local* on this worker and stop its work (no store call).
+
+        Its subscriptions end first: a listen stream on its legacy SSE
+        stream gets its final frames before the stream closes, and its
+        ``GET /mcp`` stream ends.
+        """
         local.ended = True
         if self._local.get(local.ref) is local:
             del self._local[local.ref]
         self._remember_ended(local.ref)
+        ending = "shutdown" if reason == "shutdown" else "session_closed"
+        self._server.close_subscriptions(local.context, reason=ending)
+        if local.notify_stream is not None:
+            local.notify_stream.close(ending)
         local.stop_work()
         if local.stream is not None:
             local.stream.put_nowait(CLOSE_STREAM)
@@ -840,16 +890,23 @@ class SessionManager:
             self._rejected(envelope, "identity")
             return
         if envelope.op == "cancel":
-            task = local.in_flight.get(envelope.body["rid"])
+            request_id = envelope.body["rid"]
+            # A listen stream on the stream held here ends silently, at once.
+            self._server._cancel_subscription(local.context, request_id)
+            task = local.in_flight.get(request_id)
             if task is not None:
                 task.cancel()
         elif envelope.op == "end":
             self._end_here(local)
         elif local.owned and local.stream is not None:  # deliver, to the stream's owner
             version = envelope.body.get("ver")
+            message = envelope.body["msg"]
+            local.stream.put_nowait(message)
             if isinstance(version, str) and version in SUPPORTED_PROTOCOL_VERSIONS:
+                # The answer to a successful initialize, dispatched on another
+                # worker: its list changes are announced from here on.
                 local.context.protocol_version = version
-            local.stream.put_nowait(envelope.body["msg"])
+                self.start_notifications(local, local.context.identity)
 
     @staticmethod
     def _rejected(envelope: _bus.Envelope, reason: str) -> None:
