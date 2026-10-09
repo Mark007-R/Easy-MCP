@@ -157,8 +157,7 @@ TOOLS_LIST_TTL_MS = 0
 # The same holds for the resources, templates and prompts lists.
 RESOURCES_LIST_TTL_MS = RESOURCE_TEMPLATES_LIST_TTL_MS = PROMPTS_LIST_TTL_MS = 0
 
-# The paginated list methods: (the kind their cursor names, the result
-# field, the change kind whose digest covers them).
+# The paginated list methods: (the kind their cursor names, the result field).
 _LISTS: dict[str, tuple[str, str]] = {
     "resources/list": ("resources", "resources"),
     "resources/templates/list": ("templates", "resourceTemplates"),
