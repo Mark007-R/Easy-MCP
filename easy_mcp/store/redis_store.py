@@ -191,9 +191,10 @@ return 1
 
 # KEYS: rec   ARGV: kind, cap, n_add, add_1..add_n, remove_1..remove_m.  The resource
 # URIs a session is subscribed to, as a JSON array in its 'rs' field: the removed ones
-# taken out, then the added ones put in while fewer than cap are there.  Returns them
-# all, or false for a session that is gone (or of another kind): as for the baselines,
-# a bare HSET on an expired session would create the key again, without a TTL.
+# taken out, then the added ones put in while fewer than cap are there; none is an
+# empty field (no HDEL, which the documented ACL does not grant).  Returns them all, or
+# false for a session that is gone (or of another kind): as for the baselines, a bare
+# HSET on an expired session would create the key again, without a TTL.
 SESSION_SUBSCRIPTIONS = """
 if redis.call('HGET', KEYS[1], 'kind') ~= ARGV[1] then return false end
 local cap = tonumber(ARGV[2])
@@ -222,7 +223,7 @@ for i = 4, 3 + nadd do
   end
 end
 if #kept == 0 then
-  redis.call('HDEL', KEYS[1], 'rs')
+  redis.call('HSET', KEYS[1], 'rs', '')
 else
   redis.call('HSET', KEYS[1], 'rs', cjson.encode(kept))
 end

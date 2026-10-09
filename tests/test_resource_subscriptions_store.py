@@ -2,8 +2,9 @@
 
 The live tests at the end are skipped unless ``EASY_MCP_LIVE_REDIS_URL`` is
 set to an admin-capable URL of a scratch database (CI runs them against its
-``redis:7-alpine`` service); each uses a namespace of its own and removes
-its keys afterwards.
+``redis:7-alpine`` service).  They run as an ACL user holding exactly the
+rights SECURITY.md lists, each in a namespace of its own, and remove their
+keys afterwards.
 """
 
 from __future__ import annotations
@@ -12,8 +13,9 @@ import asyncio
 import json
 import os
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 import pytest
@@ -26,6 +28,15 @@ from easy_mcp.transport import _bus
 REDIS_URL = os.environ.get("EASY_MCP_LIVE_REDIS_URL")
 ACCEPT = {"Accept": "application/json, text/event-stream"}
 INIT = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
+ACL_USER = "easy-mcp-rp-test"
+
+# SECURITY.md's least-privilege rules for the store's user, word for word.
+ACL_RULES = (
+    "resetkeys ~easy-mcp:1:* resetchannels &easy-mcp:1:* nocommands "
+    "+ping +select +evalsha +script|load +publish +subscribe +unsubscribe +client|setinfo "
+    "+exists +hget +hgetall +hset +hincrby +pexpire +del +zadd +zrem +zrange +zrangebyscore "
+    "+zremrangebyscore +zcount +zcard +time"
+)
 
 
 def record(ref: str, kind: Any = "http") -> SessionRecord:
@@ -175,6 +186,26 @@ async def test_redis_store_updates_subscriptions_in_one_script() -> None:
 live = pytest.mark.skipif(not REDIS_URL, reason="EASY_MCP_LIVE_REDIS_URL is not set")
 
 
+@pytest.fixture(scope="module")
+def user_url() -> Iterator[str]:
+    """A URL for a fresh ACL user with exactly the documented rules."""
+    redis = pytest.importorskip("redis")
+    assert REDIS_URL is not None
+    password = secrets.token_hex(16)
+    connection = redis.Redis.from_url(REDIS_URL, decode_responses=True, protocol=2)
+    connection.execute_command("ACL", "SETUSER", ACL_USER, "reset", "on", f">{password}")
+    connection.execute_command("ACL", "SETUSER", ACL_USER, *ACL_RULES.split())
+    parts = urlsplit(REDIS_URL)
+    netloc = f"{quote(ACL_USER)}:{password}@{parts.hostname or '127.0.0.1'}"
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    try:
+        yield urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+    finally:
+        connection.execute_command("ACL", "DELUSER", ACL_USER)
+        connection.close()
+
+
 async def _drop_namespace(namespace: str) -> None:
     redis = pytest.importorskip("redis.asyncio")
     admin = redis.Redis.from_url(REDIS_URL)
@@ -187,13 +218,12 @@ async def _drop_namespace(namespace: str) -> None:
 
 
 @live
-async def test_live_redis_keeps_subscriptions_in_the_session_record() -> None:
+async def test_live_redis_keeps_subscriptions_in_the_session_record(user_url: str) -> None:
     pytest.importorskip("redis")
     from easy_mcp import RedisStore
 
     namespace = "rp-" + secrets.token_hex(6)
-    assert REDIS_URL is not None
-    store = RedisStore(REDIS_URL, namespace=namespace)
+    store = RedisStore(user_url, namespace=namespace)
     store.bind("resources-tests")
     ref = session_ref(secrets.token_urlsafe(24))
     shared = SessionRecord(ref, "http", "ip:x", None)
@@ -224,12 +254,11 @@ async def test_live_redis_keeps_subscriptions_in_the_session_record() -> None:
 
 @live
 async def test_live_redis_subscription_on_one_worker_reaches_the_stream_on_another(
-    live_server: Callable[[Any], str],
+    live_server: Callable[[Any], str], user_url: str
 ) -> None:
     pytest.importorskip("redis")
     from easy_mcp import RedisStore
 
-    assert REDIS_URL is not None
     namespace = "rp-" + secrets.token_hex(6)
     servers = []
     bases = []
@@ -238,7 +267,7 @@ async def test_live_redis_subscription_on_one_worker_reaches_the_stream_on_anoth
             port=0,
             name="resources-live",
             rate_limit_per_minute=None,
-            store=RedisStore(REDIS_URL, namespace=namespace),
+            store=RedisStore(user_url, namespace=namespace),
         )
         server.register_resource(lambda: "app", "config://app", name="config")
         servers.append(server)
