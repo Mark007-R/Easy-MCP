@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import random
+import re
+import time
+
 import pytest
 
 from easy_mcp import RegistrationError
-from easy_mcp.uritemplate import UriTemplate, is_template, validate_uri
+from easy_mcp.uritemplate import MAX_URI_LENGTH, UriTemplate, is_template, validate_uri
+
+MIB = 1024 * 1024
 
 
 def test_parses_simple_and_reserved_expressions() -> None:
@@ -121,6 +127,103 @@ def test_literals_are_matched_literally() -> None:
     template = UriTemplate("a.b+c://{x}")
     assert template.match("a.b+c://1") == {"x": "1"}
     assert template.match("aXb+c://1") is None
+
+
+def test_greedy_splits() -> None:
+    assert UriTemplate("files://{name}.{ext}").match("files://a.b.c") == {
+        "name": "a.b",
+        "ext": "c",
+    }
+    assert UriTemplate("x://{a}.{+b}").match("x://p.q/r.s") == {"a": "p", "b": "q/r.s"}
+    assert UriTemplate("x://{a}{b}.json").match("x://abc.json") == {"a": "ab", "b": "c"}
+    assert UriTemplate("pkg://{n}/{a}.{b}.{c}").match("pkg://x/1.2.3.4") == {
+        "n": "x",
+        "a": "1.2",
+        "b": "3",
+        "c": "4",
+    }
+    assert UriTemplate("x://{a}/b{+c}").match("x://a/bb/bc") == {"a": "a", "c": "b/bc"}
+
+
+def test_may_overlap_compares_the_literal_ends() -> None:
+    docs = UriTemplate("docs://{name}")
+    staff = UriTemplate("docs://staff-{name}")
+    assert docs.may_overlap(staff) and staff.may_overlap(docs)
+    assert not docs.may_overlap(UriTemplate("wiki://{name}"))
+    assert not UriTemplate("x://{a}.md").may_overlap(UriTemplate("x://{a}.txt"))
+    assert UriTemplate("x://{a}.md").may_overlap(UriTemplate("x://{+a}"))
+
+
+def _hostile(prefix: str, body: str, tail: str, length: int) -> str:
+    """*prefix*, then *body* repeated, then *tail*: *length* characters in all."""
+    room = length - len(prefix) - len(tail)
+    return prefix + (body * (room // len(body) + 1))[:room] + tail
+
+
+# Templates whose regular expression would backtrack polynomially on a URI
+# that almost matches, and such URIs: a backtracking matcher takes over 10 s
+# on the first at 2048 characters, and hours at 1 MiB.  The last one makes
+# the linear matcher walk the whole URI (about 0.5 s at 1 MiB).
+HOSTILE = [
+    ("pkg://{n}/{a}.{b}.{c}", "pkg://a/", ".", "/"),
+    ("files://{a}.{b}", "files://", ".", "/"),
+    ("files://{a}.{b}", "files://", "a.", "/"),
+    ("repo://{+a}/{+b}.md", "repo://", "/", "?.md"),
+    ("repo://{+a}/{+b}.md", "repo://", "a/", "b"),
+    ("x://{a}{b}.json", "x://", "a", "/.json"),
+    ("x://{+a}.{b}.{+c}", "x://", "/q.", "q"),
+]
+
+
+@pytest.mark.parametrize(("length", "bound"), [(MAX_URI_LENGTH, 1.0), (MIB, 5.0)])
+def test_hostile_uris_are_refused_in_linear_time(length: int, bound: float) -> None:
+    for text, prefix, body, tail in HOSTILE:
+        template = UriTemplate(text)
+        uri = _hostile(prefix, body, tail, length)
+        assert len(uri) == length
+        started = time.perf_counter()
+        assert template.match(uri) is None, text
+        elapsed = time.perf_counter() - started
+        assert elapsed < bound, f"{text} took {elapsed:.2f}s on {length} characters"
+
+
+def _reference(template: UriTemplate, uri: str) -> list[str] | None:
+    """The split a greedy backtracking regular expression finds: what matching must keep."""
+    parts: list[str] = []
+    position = 0
+    for found in re.finditer(r"\{(\+?)([^{}]*)\}", template.template):
+        parts.append(re.escape(template.template[position : found.start()]))
+        parts.append("([^?#]+)" if found.group(1) else "([^/?#]+)")
+        position = found.end()
+    parts.append(re.escape(template.template[position:]))
+    found = re.fullmatch("".join(parts), uri, re.DOTALL)
+    return None if found is None else list(found.groups())
+
+
+def test_split_is_the_greedy_regular_expression_split() -> None:
+    rng = random.Random(6570)
+    pieces = ["", "", ".", "/", "-", "a", "?", "#", "./", "a."]
+    alphabet = "a./-?#%"
+    for _ in range(4000):
+        count = rng.randint(1, 4)
+        text = "x:" + rng.choice(pieces)
+        for index in range(count):
+            text += "{" + rng.choice(["", "+"]) + f"v{index}" + "}" + rng.choice(pieces)
+        template = UriTemplate(text)
+        for _ in range(10):
+            if rng.random() < 0.5:
+                uri = "x:" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 14)))
+            else:
+                # An expansion, mutated a little, so that many of them match.
+                uri = re.sub(
+                    r"\{\+?[^{}]*\}",
+                    lambda _: "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 4))),
+                    text,
+                )
+                if rng.random() < 0.3:
+                    at = rng.randrange(len(uri) + 1)
+                    uri = uri[:at] + rng.choice(alphabet) + uri[at:]
+            assert template._split(uri) == _reference(template, uri), (text, uri)
 
 
 @pytest.mark.parametrize(

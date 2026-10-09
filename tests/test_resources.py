@@ -582,6 +582,33 @@ async def test_long_uris_are_not_echoed() -> None:
     assert "data" not in response["error"]
 
 
+async def test_hostile_uris_read_as_missing_quickly(logs: LogCapture) -> None:
+    # A backtracking matcher took over 10 s on the first one at 2048
+    # characters (the loop stalled meanwhile), and hours at 1 MiB.
+    server = make_server(auth=APIKeyAuth({READER_KEY: ["reader"]}))
+    server.register_resource(lambda n, a, b, c: n, "pkg://{n}/{a}.{b}.{c}", name="pkg")
+    server.register_resource(
+        lambda name, ext: name, "files://{name}.{ext}", name="files", requires_auth=True
+    )
+    server.register_resource(lambda a, b: a, "repo://{+a}/{+b}.md", name="repo", scopes=("reader",))
+    hostile = [("pkg://a/", ".", "/"), ("files://", ".", "/"), ("repo://", "/", "?.md")]
+    for length in (2048, 2049, 1024 * 1024):
+        for prefix, body, tail in hostile:
+            room = length - len(prefix) - len(tail)
+            uri = prefix + (body * room)[:room] + tail
+            for make, code in ((read, LEGACY_NOT_FOUND), (modern_read, INVALID_PARAMS)):
+                started = time.perf_counter()
+                response = await call(server, make(uri))
+                elapsed = time.perf_counter() - started
+                assert elapsed < 1.0, f"{prefix} took {elapsed:.2f}s on {length} characters"
+                assert response["error"]["code"] == code
+                if length <= 2048:
+                    assert response["error"]["data"] == {"uri": uri}
+                else:
+                    assert "data" not in response["error"]
+                assert logs.events("resource_read")[-1]["status"] == "not_found"
+
+
 async def test_uri_must_be_a_string() -> None:
     server = listing_server()
     for params in ({}, {"uri": 5}, {"uri": None}):
@@ -789,6 +816,34 @@ async def test_read_carries_cache_ttl_and_scope_by_protection() -> None:
     # Legacy results carry no cache hints.
     legacy = await call(server, read("x://cached"))
     assert set(legacy["result"]) == {"contents"}
+
+
+async def test_a_template_a_protected_item_may_shadow_is_read_privately() -> None:
+    server = make_server(auth=APIKeyAuth({READER_KEY: ["staff"]}))
+    server.register_resource(lambda n: f"page {n}", "docs://{n}", name="docs", cache_ttl=300)
+    server.register_resource(lambda: "salaries", "docs://salaries", name="pay", scopes=("staff",))
+    server.register_resource(lambda n: f"wiki {n}", "wiki://{n}", name="wiki", cache_ttl=300)
+    server.register_resource(lambda: "panel", "admin://panel", name="panel", scopes=("staff",))
+    # Staff read another resource at docs://salaries than anonymous callers,
+    # so a shared cache must not hand them the anonymous answer.  Every read
+    # of the template is private alike, so the scope tells nobody which URIs
+    # hide a protected resource.
+    for uri in ("docs://salaries", "docs://other"):
+        anonymous = await call(server, modern_read(uri))
+        assert text_of(anonymous) == f"page {uri[7:]}"
+        assert anonymous["result"]["cacheScope"] == "private", uri
+    staff = await call(server, modern_read("docs://salaries"), identity=identity("staff"))
+    assert text_of(staff) == "salaries" and staff["result"]["cacheScope"] == "private"
+    # Nothing protected can take the place of the wiki template's answers.
+    wiki = await call(server, modern_read("wiki://page"))
+    assert wiki["result"]["cacheScope"] == "public"
+    # A more specific protected template that may match the same URIs can.
+    server.register_resource(lambda n: n, "wiki://staff-{n}", name="sw", scopes=("staff",))
+    wiki = await call(server, modern_read("wiki://page"))
+    assert wiki["result"]["cacheScope"] == "private"
+    server.unregister_resource("wiki://staff-{n}")
+    wiki = await call(server, modern_read("wiki://page"))
+    assert wiki["result"]["cacheScope"] == "public"
 
 
 async def test_read_is_private_with_request_middleware() -> None:

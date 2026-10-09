@@ -292,8 +292,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   whose variables become the function's parameters, converted to `int`,
   `float`, `bool` or a `Literal` from the annotation (`str` without one); a
   value that does not convert does not match. Other RFC 6570 forms are
-  refused at registration. `resources/list`, `resources/templates/list` and
-  `resources/read` are served in both protocol eras. Returning `None` or
+  refused at registration. Matching takes time linear in the URI's length,
+  and a URI over 2048 characters matches nothing. `resources/list`,
+  `resources/templates/list` and `resources/read` are served in both
+  protocol eras. Returning `None` or
   raising `ResourceNotFoundError` answers "resource not found": `-32602` for
   stateless (`2026-07-28`) requests and `-32002` in the handshake era, as
   each revision specifies, with the URI in `data` (up to 2048 characters).
@@ -324,10 +326,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 - Stateless results carry the cache hints the revision requires: the three
   lists `ttlMs: 0`, `private` when auth is configured or request middleware
   is registered; `resources/read` the resource's `cache_ttl=` (seconds,
-  default 0), `private` for a protected resource, with `oauth=`, with
-  request middleware, or for a retry carrying `inputResponses` or
-  `requestState` (then also `ttlMs: 0`). `prompts/get` and
-  `completion/complete` carry none, as the revision specifies.
+  default 0), `private` for a protected resource, for every read of a
+  public template that a protected resource or template may answer for
+  instead, with `oauth=`, with request middleware, or for a retry carrying
+  `inputResponses` or `requestState` (then also `ttlMs: 0`). `prompts/get`
+  and `completion/complete` carry none, as the revision specifies.
 - Resources, prompts and completers run with the same timeouts, cancel
   tokens, `max_sync_workers` cap and sanitized errors as tools, and
   `current_identity()` works inside them; a `ToolError`'s text reaches the
@@ -345,12 +348,14 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `resourceSubscriptions` for stateless clients (tagged with the listen's
   id; the acknowledgment lists the URIs honored, those the caller may read).
   An update still waiting to be written is not queued again. A session may
-  watch 1000 URIs (`-32007`, HTTP `503`, beyond) and a listen name 1000
-  (`-32602`). A session's subscriptions end with it. With the default store,
-  an update made while a Streamable HTTP session has no `GET /mcp` stream
-  open is sent when one opens; with a shared store a session's subscriptions
-  are kept in its record, and the worker that changes them tells the worker
-  holding the session's stream to read them again.
+  watch 1000 URIs and a listen name 1000 (`-32007`, HTTP `503`, beyond; a
+  server without resources ignores the field). A session's subscriptions
+  end with it. With the default store, an update made while a Streamable
+  HTTP session has no `GET /mcp` stream open is sent when one opens; with a
+  shared store a session's subscriptions are kept in its record, and the
+  worker that changes them tells the worker holding the session's stream to
+  read them again (a `GET /mcp` stream also reads them once it is open, and
+  again after changes whose answers may have crossed).
 - The prompts and resources lists are announced like the tool list
   (`notifications/prompts/list_changed`, `notifications/resources/list_changed`,
   which covers templates too, and the listen filter's `promptsListChanged`

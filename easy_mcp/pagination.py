@@ -20,12 +20,17 @@ from collections.abc import Callable, Sequence
 from typing import Any, TypeVar
 
 from .exceptions import INVALID_PARAMS, ProtocolError
+from .uritemplate import MAX_URI_LENGTH
 
 PAGE_SIZE = 100
 
 _T = TypeVar("_T")
 _CURSOR = re.compile(r"[A-Za-z0-9_-]+")
-_MAX_CURSOR = 8192
+# The longest cursor handed out: base64 of the JSON holding the longest key,
+# a URI or template of MAX_URI_LENGTH characters at up to four UTF-8 bytes
+# each (an escaped quote or backslash takes two; URIs hold no control
+# characters), plus room for the rest of the JSON.
+_MAX_CURSOR = 4 * ((4 * MAX_URI_LENGTH + 64 + 2) // 3)
 
 
 def encode_cursor(kind: str, key: str) -> str:

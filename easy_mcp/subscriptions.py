@@ -93,14 +93,16 @@ def _subscription_key(value: Any) -> tuple[str, Any]:
 def parse_filter(value: object) -> tuple[frozenset[str], tuple[str, ...] | None]:
     """The list kinds a ``notifications`` filter asks for, and the resource URIs it names.
 
-    The URIs are ``None`` when the filter has no ``resourceSubscriptions``.
-    Unknown fields are ignored (a later revision may add some).
+    The URIs are ``None`` when the filter has no ``resourceSubscriptions``,
+    and are not counted here: a server without resources ignores them, and
+    one with resources refuses more than :data:`MAX_RESOURCE_SUBSCRIPTIONS`
+    as a limit (``-32007``).  Unknown fields are ignored (a later revision
+    may add some).
 
     Raises:
         ProtocolError: ``-32602`` for a filter that is not an object, a flag
             that is not a boolean, or ``resourceSubscriptions`` that is not
-            an array of strings or names more than
-            :data:`MAX_RESOURCE_SUBSCRIPTIONS`.
+            an array of strings.
     """
     if not isinstance(value, dict):
         raise ProtocolError(
@@ -124,12 +126,6 @@ def parse_filter(value: object) -> tuple[frozenset[str], tuple[str, ...] | None]
     if not (isinstance(resources, list) and all(isinstance(uri, str) for uri in resources)):
         raise ProtocolError(
             "Invalid params: notifications.resourceSubscriptions must be an array of strings",
-            code=INVALID_PARAMS,
-        )
-    if len(resources) > MAX_RESOURCE_SUBSCRIPTIONS:
-        raise ProtocolError(
-            "Invalid params: notifications.resourceSubscriptions names more than "
-            f"{MAX_RESOURCE_SUBSCRIPTIONS} resources",
             code=INVALID_PARAMS,
         )
     return frozenset(kinds), tuple(resources)
@@ -360,13 +356,6 @@ class _Sink:
             return False
         return True
 
-    def _take_updates(self) -> list[str]:
-        """The resource updates still waiting here, which a sink replacing it sends instead."""
-        with self._lock:
-            uris = list(self._updates)
-            self._updates.clear()
-            return uris
-
     def _flush_updates(self) -> None:
         with self._lock:
             uris = list(self._updates)
@@ -384,11 +373,17 @@ class _Sink:
                 return
             logger.debug("told client %s that a resource changed", self.client_id)
 
-    def _close(self) -> None:
-        """Stop for good: no flush runs for it from now on.  On its loop, or once it has closed."""
+    def _close(self) -> list[str]:
+        """Stop for good: no flush runs for it from now on.  On its loop, or once it has closed.
+
+        Returns the resource updates that were still waiting here, taken in
+        the same step, so none can be queued between: a sink that replaces
+        it, or the session's next one, sends them instead.
+        """
         with self._lock:
             self.closed = True
             self._pending.clear()
+            waiting = list(self._updates)
             self._updates.clear()
         timer, self._timer = self._timer, None
         if timer is not None:
@@ -396,6 +391,7 @@ class _Sink:
         finalizer, self._finalizer = self._finalizer, None
         if finalizer is not None:
             finalizer.detach()
+        return waiting
 
     def _set_ended(self) -> None:
         ended = self.ended
@@ -537,10 +533,9 @@ class ChangeNotifier:
             held = list(entry.held) if entry is not None else []
             if entry is not None:
                 entry.held.clear()
-        carried: list[str] = []
-        if replaced is not None:
-            carried = replaced._take_updates()
-            replaced._close()
+        # An update a publisher hands the replaced sink from now on is
+        # refused there, and sent here instead (publish_resource_updated).
+        carried = replaced._close() if replaced is not None else []
         for uri in dict.fromkeys([*carried, *held]):
             sink.request_update(uri)
         return sink
@@ -614,6 +609,22 @@ class ChangeNotifier:
         with self._lock:
             self._set_subscriptions(key, uris, hold)
 
+    def add_subscription(self, key: Hashable, uri: str, *, hold: bool) -> None:
+        """The session *key*, whose store record keeps its subscriptions, watches *uri* too.
+
+        As :meth:`set_subscriptions` takes the record's whole set (with
+        *hold*), but for the one URI a request added: two requests answered
+        out of order then never leave the older set in place.  Any thread.
+        """
+        with self._lock:
+            if not hold and key not in self._sessions:
+                return  # kept only while a sink here delivers (a shared store)
+            entry = self._subscribed.get(key)
+            if entry is None:
+                entry = self._subscribed[key] = _Subscriptions(hold)
+            entry.hold = hold
+            entry.uris.add(uri)
+
     def subscribe(self, key: Hashable, uri: str, *, cap: int) -> bool:
         """Subscribe the session *key*, kept in this process, to *uri*; any thread.
 
@@ -667,7 +678,10 @@ class ChangeNotifier:
         Returns how many subscriptions matched and had the update queued
         (an update for a session with no sink yet waits for one, when the
         session is kept in this process).  Delivery itself happens on each
-        recipient's loop.
+        recipient's loop.  A session sink that closes between being picked
+        here and being handed the update (its stream replaced or ended
+        meanwhile, on its loop) refuses it, and it goes to the session's
+        sink after it, or waits for one, instead.
         """
         count = 0
         sinks: list[_Sink] = []
@@ -684,21 +698,49 @@ class ChangeNotifier:
             for streams in self._channels.values():
                 sinks.extend(sink for sink in streams.values() if uri in sink.uris)
         for sink in sinks:
-            if sink.request_update(uri):
+            if sink.request_update(uri) or (not sink.listen and self._redeliver(sink.key, uri)):
                 count += 1
         return count
 
     def end_session(self, key: Hashable, sink: _Sink | None = None) -> bool:
-        """Stop telling the session *key* (or only its *sink*, if that is still its sink)."""
+        """Stop telling the session *key* (or only its *sink*, if that is still its sink).
+
+        Resource updates it had yet to write wait for the session's next
+        sink, when the session is kept in this process.
+        """
         with self._lock:
             current = self._sessions.get(key)
             if current is None or (sink is not None and current is not sink):
                 return False
             del self._sessions[key]
             self._sink_gone(key)
-        current._close()
+        for uri in current._close():
+            self._redeliver(key, uri)
         logger.debug("session sink %s ended", current.client_id)
         return True
+
+    def _redeliver(self, key: Hashable, uri: str) -> bool:
+        """Pass an update of *uri* that a closed sink of the session *key* never sent on.
+
+        To the session's sink now, or else to the updates waiting for its
+        next one (when the session is kept in this process); nowhere when
+        the session no longer watches *uri*.  Whether it was queued or kept.
+        Any thread.
+        """
+        while True:
+            with self._lock:
+                entry = self._subscribed.get(key)
+                if entry is None or uri not in entry.uris:
+                    return False
+                sink = self._sessions.get(key)
+                if sink is None:
+                    if not entry.hold:
+                        return False
+                    entry.held[uri] = None
+                    return True
+            if sink.request_update(uri):
+                return True
+            # That sink closed meanwhile too, and has left _sessions: look again.
 
     # ------------------------------------------------------- listen streams
 

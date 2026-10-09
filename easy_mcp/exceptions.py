@@ -145,7 +145,8 @@ class SubscriptionLimitError(ProtocolError):
     connection as a session does; over HTTP it is answered ``503``.  A client
     may hold 8 streams in one process, and ``max_sessions`` caps them all.
     A handshake-era session subscribed to 1000 resources gets it too, for
-    ``resources/subscribe``.
+    ``resources/subscribe``, and so does a listen whose
+    ``resourceSubscriptions`` names more than 1000.
     """
 
     code = TOO_MANY_SESSIONS

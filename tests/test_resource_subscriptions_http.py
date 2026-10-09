@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import threading
 import time
 from collections.abc import Callable, Collection
 from typing import Any
@@ -24,7 +25,7 @@ from shared_store_fake import FakeHub, FakeSharedStore, records
 import easy_mcp.server
 from easy_mcp import MCPServer
 from easy_mcp.exceptions import TOO_MANY_SESSIONS
-from easy_mcp.store.base import SessionKind
+from easy_mcp.store.base import ExpiredSession, SessionKind, SessionRecord
 
 LiveServer = Callable[[Any], str]
 
@@ -226,6 +227,25 @@ async def test_the_subscription_cap_is_503_over_http(
 # ------------------------------------------------------- stateless listen
 
 
+async def test_the_listen_resource_cap_is_503_over_http(
+    live_server: LiveServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(easy_mcp.server, "MAX_RESOURCE_SUBSCRIPTIONS", 1)
+    server = make_server()
+    base = live_server(server)
+    message = listen("watch", resourceSubscriptions=["config://app", "config://other"])
+    async with httpx.AsyncClient(timeout=10) as client:
+        over = await open_stream(
+            client, "POST", f"{base}/mcp", json=message, headers=headers_for(message)
+        )
+        if isinstance(over, Stream):
+            await over.aclose()
+            raise AssertionError("the listen was accepted")
+    assert over.status_code == 503, over.text
+    assert over.json()["error"]["code"] == TOO_MANY_SESSIONS
+    assert server._notifier.count() == 0
+
+
 async def test_listen_delivers_tagged_updates(live_server: LiveServer) -> None:
     server = make_server()
     base = live_server(server)
@@ -392,6 +412,163 @@ async def test_sse_subscription_relayed_from_another_worker_reaches_the_owner(
         await asyncio.to_thread(server_a.notify_resource_updated, "config://app")
         assert await opened.next() == updated("config://app")
         await opened.aclose()
+
+
+class GatedStore(SubscribingStore):
+    """A SubscribingStore whose round trips can be held up, as a slow network would.
+
+    ``hold_reply`` names a URI: the subscription change adding it is written
+    at once, but its reply waits until ``release`` is set.  ``hold_rate``
+    holds up the next rate-limit check the same way, and ``hold_read`` the
+    reply to the next read of a session that does not extend it (as a
+    worker reading a session's subscriptions again does).  ``held`` is set
+    once one is waiting.
+    """
+
+    def __init__(self, hub: FakeHub, worker: str) -> None:
+        super().__init__(hub, worker)
+        self.hold_reply: str | None = None
+        self.hold_rate = False
+        self.hold_read = False
+        self.held = threading.Event()
+        self.release = threading.Event()
+
+    async def _wait(self) -> None:
+        self.held.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.01)
+
+    async def _op(self, name: str) -> None:
+        await super()._op(name)
+        if name == "rate" and self.hold_rate:
+            self.hold_rate = False
+            await self._wait()
+
+    async def update_subscriptions(
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        add: Collection[str] = (),
+        remove: Collection[str] = (),
+        cap: int,
+    ) -> tuple[str, ...] | None:
+        subscribed = await super().update_subscriptions(kind, ref, add=add, remove=remove, cap=cap)
+        if self.hold_reply is not None and self.hold_reply in add:
+            self.hold_reply = None
+            await self._wait()
+        return subscribed
+
+    async def acquire_session(
+        self,
+        kind: SessionKind,
+        ref: str,
+        *,
+        ttl: float | None,
+        binding: tuple[str | None, str | None] | None = None,
+    ) -> tuple[SessionRecord | None, list[ExpiredSession]]:
+        found = await super().acquire_session(kind, ref, ttl=ttl, binding=binding)
+        if ttl is None and self.hold_read:
+            self.hold_read = False
+            await self._wait()
+        return found
+
+
+def gated_worker(
+    live_server: LiveServer, hub: FakeHub, name: str, **kwargs: Any
+) -> tuple[MCPServer, GatedStore, str]:
+    store = GatedStore(hub, name)
+    hub.stores.append(store)
+    server = make_server(store=store, **kwargs)
+    return server, store, live_server(server)
+
+
+async def test_concurrent_subscribes_leave_the_stream_watching_every_uri(
+    live_server: LiveServer,
+) -> None:
+    # The first change is written first but answered last: the stream's
+    # worker must not end up with that answer's older set.
+    hub = FakeHub()
+    server, store, base = gated_worker(live_server, hub, "a" * 16)
+    both = {"config://app", "config://other"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base)
+        stream = await get_stream(client, base, session)
+        store.hold_reply = "config://app"
+        first = asyncio.create_task(
+            post(client, base, session, "resources/subscribe", "config://app")
+        )
+        assert await asyncio.to_thread(store.held.wait, 10)
+        second = await post(client, base, session, "resources/subscribe", "config://other", 6)
+        assert second.status_code == 200 and second.json()["result"] == {}
+        store.release.set()
+        assert (await first).json()["result"] == {}
+        assert [set(r.subscriptions or ()) for r in records(hub)] == [both]
+        await until(lambda: server._notifier.subscriptions(session) == both)
+        await asyncio.sleep(0.3)  # and it stays so once every reply is in
+        assert server._notifier.subscriptions(session) == both
+        await asyncio.to_thread(server.notify_resource_updated, "config://app")
+        assert await stream.next() == updated("config://app")
+        await asyncio.to_thread(server.notify_resource_updated, "config://other")
+        assert await stream.next() == updated("config://other")
+        await stream.aclose()
+
+
+async def test_reads_of_the_subscriptions_answered_out_of_order_leave_the_newest(
+    live_server: LiveServer,
+) -> None:
+    # Worker B subscribes twice; worker A, holding the stream, reads the
+    # session's subscriptions again after each, and the first read is
+    # answered (with the older set) after the second.
+    hub = FakeHub()
+    server_a, store_a, base_a = gated_worker(live_server, hub, "a" * 16)
+    _, _, base_b = gated_worker(live_server, hub, "b" * 16)
+    both = {"config://app", "config://other"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base_a)
+        stream = await get_stream(client, base_a, session)
+        await asyncio.sleep(0.3)  # any read of the subscriptions the stream makes is in
+        store_a.hold_read = True
+        first = await post(client, base_b, session, "resources/subscribe", "config://app")
+        assert first.status_code == 200
+        assert await asyncio.to_thread(store_a.held.wait, 10)
+        second = await post(client, base_b, session, "resources/subscribe", "config://other", 6)
+        assert second.status_code == 200
+        await until(lambda: len(hub.published("resub")) == 2)
+        await asyncio.sleep(0.2)  # the second read is in
+        store_a.release.set()
+        await until(lambda: server_a._notifier.subscriptions(session) == both)
+        await asyncio.sleep(0.3)  # and it stays so once every read is in
+        assert server_a._notifier.subscriptions(session) == both
+        await asyncio.to_thread(server_a.notify_resource_updated, "config://other")
+        assert await stream.next() == updated("config://other")
+        await stream.aclose()
+
+
+async def test_a_subscription_made_while_the_stream_opens_reaches_it(
+    live_server: LiveServer,
+) -> None:
+    # Worker A reads the session for GET /mcp, then waits on its rate-limit
+    # round trip; worker B subscribes meanwhile, before A's stream exists.
+    hub = FakeHub()
+    server_a, store_a, base_a = gated_worker(live_server, hub, "a" * 16, rate_limit_per_minute=120)
+    _, _, base_b = gated_worker(live_server, hub, "b" * 16, rate_limit_per_minute=120)
+    async with httpx.AsyncClient(timeout=10) as client:
+        session = await initialize(client, base_a)
+        store_a.hold_rate = True
+        opening = asyncio.create_task(get_stream(client, base_a, session))
+        assert await asyncio.to_thread(store_a.held.wait, 10)
+        subscribed = await post(client, base_b, session, "resources/subscribe", "config://app")
+        assert subscribed.status_code == 200 and subscribed.json()["result"] == {}
+        assert [r.subscriptions for r in records(hub)] == [("config://app",)]
+        await until(lambda: len(hub.published("resub")) == 1)
+        await asyncio.sleep(0.2)  # worker A has heard of it, with no stream open yet
+        store_a.release.set()
+        stream = await opening
+        await until(lambda: server_a._notifier.subscriptions(session) == {"config://app"})
+        await asyncio.to_thread(server_a.notify_resource_updated, "config://app")
+        assert await stream.next() == updated("config://app")
+        await stream.aclose()
 
 
 def _sse_session(server: MCPServer) -> str:

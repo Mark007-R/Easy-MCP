@@ -25,7 +25,7 @@ from easy_mcp.exceptions import (
     METHOD_NOT_FOUND,
     TOO_MANY_SESSIONS,
 )
-from easy_mcp.subscriptions import MAX_RESOURCE_SUBSCRIPTIONS
+from easy_mcp.subscriptions import MAX_RESOURCE_SUBSCRIPTIONS, _Sink
 from easy_mcp.transport.base import ClientContext
 
 SEE_KEY = "subs-see-key-" + "k" * 18
@@ -204,11 +204,15 @@ async def test_listen_validation() -> None:
     bad = [
         {"resourceSubscriptions": "config://app"},
         {"resourceSubscriptions": ["config://app", 3]},
-        {"resourceSubscriptions": [f"items://{i}" for i in range(MAX_RESOURCE_SUBSCRIPTIONS + 1)]},
     ]
     for wanted in bad:
         response = await server.dispatch(listen("l", **wanted), context)
         assert response is not None and response["error"]["code"] == INVALID_PARAMS, wanted
+    # The cap is a limit, as the per-session one is (-32007, HTTP 503).
+    many = [f"items://{i}" for i in range(MAX_RESOURCE_SUBSCRIPTIONS + 1)]
+    response = await server.dispatch(listen("l", resourceSubscriptions=many), context)
+    assert response is not None and response["error"]["code"] == TOO_MANY_SESSIONS
+    assert server._notifier.count() == 0
 
 
 async def open_listen(
@@ -256,14 +260,17 @@ async def test_listen_ack_is_first_and_honors_only_visible_uris(logs: LogCapture
 
 async def test_listen_without_resources_omits_resource_subscriptions() -> None:
     server = MCPServer(port=0, rate_limit_per_minute=None)
-    pushed = Pushed()
-    context = make_context(push=pushed)
-    task = await open_listen(
-        server, context, pushed, toolsListChanged=True, resourceSubscriptions=["config://app"]
-    )
-    assert pushed.frames[0]["params"]["notifications"] == {"toolsListChanged": True}
-    server.close_subscriptions(context, reason="shutdown")
-    await asyncio.wait_for(task, 5)
+    # However many it names: a server without resources ignores the field.
+    many = [f"items://{i}" for i in range(MAX_RESOURCE_SUBSCRIPTIONS + 1)]
+    for asked in (["config://app"], many):
+        pushed = Pushed()
+        context = make_context(push=pushed)
+        task = await open_listen(
+            server, context, pushed, toolsListChanged=True, resourceSubscriptions=asked
+        )
+        assert pushed.frames[0]["params"]["notifications"] == {"toolsListChanged": True}
+        server.close_subscriptions(context, reason="shutdown")
+        await asyncio.wait_for(task, 5)
 
 
 async def test_listen_cancel_stops_everything_for_that_id() -> None:
@@ -320,6 +327,94 @@ async def test_a_resource_reprotected_keeps_its_subscribers() -> None:
     assert await pushed.wait_for(1) == [updated("config://app")]
     read = await server.dispatch(rpc("resources/read", {"uri": "config://app"}), context)
     assert read is not None and read["error"]["code"] == LEGACY_NOT_FOUND
+
+
+class PausedPublisher:
+    """Publish from a thread that stops right after picking the sinks, until resumed.
+
+    That is where a thread switch can come: the loop may replace or end the
+    session's sink before the update is handed to it.
+    """
+
+    def __init__(self, server: MCPServer, uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.picked = threading.Event()
+        self.resume = threading.Event()
+        self.result: int | None = None
+        self.thread = threading.Thread(target=self._publish, args=(server, uri))
+        original = _Sink.request_update
+        paused = self
+
+        def request_update(sink: _Sink, uri: str) -> bool:
+            if threading.current_thread() is paused.thread and not paused.picked.is_set():
+                paused.picked.set()
+                assert paused.resume.wait(10)
+            return original(sink, uri)
+
+        monkeypatch.setattr(_Sink, "request_update", request_update)
+        self.thread.start()
+
+    def _publish(self, server: MCPServer, uri: str) -> None:
+        self.result = server.notify_resource_updated(uri)
+
+    async def finish(self) -> int | None:
+        self.resume.set()
+        await asyncio.to_thread(self.thread.join, 10)
+        return self.result
+
+
+async def test_an_update_racing_a_replaced_sink_reaches_the_new_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = make_server()
+    first = Pushed()
+    context = await initialized(server, first)
+    await subscribe(server, context, "config://app")
+    publisher = PausedPublisher(server, "config://app", monkeypatch)
+    assert await asyncio.to_thread(publisher.picked.wait, 10)
+    # A new stream takes over (as a second GET /mcp does) before the update lands.
+    second = Pushed()
+    server._watch_session(
+        context.session_id, push=second, identity=None, client_id=context.client_id
+    )
+    assert await publisher.finish() == 1
+    assert await second.wait_for(1) == [updated("config://app")]
+    await quiet(second, 1)
+    assert first.frames == []
+
+
+async def test_an_update_racing_a_closing_sink_waits_for_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = make_server()
+    first = Pushed()
+    context = await initialized(server, first)
+    await subscribe(server, context, "config://app")
+    publisher = PausedPublisher(server, "config://app", monkeypatch)
+    assert await asyncio.to_thread(publisher.picked.wait, 10)
+    # The stream closes (the session stays) before the update lands.
+    assert server._notifier.end_session(context.session_id)
+    assert await publisher.finish() == 1
+    second = Pushed()
+    server._watch_session(
+        context.session_id, push=second, identity=None, client_id=context.client_id
+    )
+    assert await second.wait_for(1) == [updated("config://app")]
+
+
+async def test_an_update_queued_on_a_closing_sink_waits_for_the_next() -> None:
+    server = make_server()
+    first = Pushed()
+    context = await initialized(server, first)
+    await subscribe(server, context, "config://app")
+    # Queued, then the stream closes before the loop writes it.
+    assert server.notify_resource_updated("config://app") == 1
+    assert server._notifier.end_session(context.session_id)
+    second = Pushed()
+    server._watch_session(
+        context.session_id, push=second, identity=None, client_id=context.client_id
+    )
+    assert await second.wait_for(1) == [updated("config://app")]
+    assert first.frames == []
 
 
 def test_notify_needs_a_string() -> None:

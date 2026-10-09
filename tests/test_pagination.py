@@ -12,6 +12,7 @@ from conftest import make_context, modern, rpc
 from easy_mcp import APIKeyAuth, ClientIdentity, MCPServer
 from easy_mcp.exceptions import INVALID_PARAMS, ProtocolError
 from easy_mcp.pagination import PAGE_SIZE, decode_cursor, encode_cursor, paginate
+from easy_mcp.uritemplate import MAX_URI_LENGTH
 
 SEE_KEY = "pagination-see-key-" + "s" * 13
 
@@ -78,6 +79,8 @@ def test_cursor_is_stable_across_inserts_and_removals_unit() -> None:
         base64.urlsafe_b64encode(json.dumps({"k": "prompts", "a": 5}).encode()).decode(),
         base64.urlsafe_b64encode(b"\xff\xfe").decode(),
         "a" * 9000,
+        # Well formed, but longer than any cursor this server hands out.
+        encode_cursor("prompts", "p" * 20000),
     ],
 )
 def test_invalid_cursor_is_minus_32602_unit(cursor: Any) -> None:
@@ -85,6 +88,13 @@ def test_invalid_cursor_is_minus_32602_unit(cursor: Any) -> None:
         paginate(keys(3), key=str, kind="prompts", cursor=cursor)
     assert raised.value.code == INVALID_PARAMS
     assert str(raised.value) == "Invalid cursor"
+
+
+def test_cursor_of_the_longest_key_round_trips_unit() -> None:
+    # Four UTF-8 bytes per character, the most any key can take.
+    longest = "x://" + "\U0001f600" * (MAX_URI_LENGTH - 4)
+    for kind in ("resources", "templates"):
+        assert decode_cursor(kind, encode_cursor(kind, longest)) == longest
 
 
 # ------------------------------------------------------------- through dispatch
@@ -136,6 +146,28 @@ async def test_cursor_walks_every_item_once() -> None:
     assert [len(p) for p in await walk(resources, "resources/list", "resources")] == [100, 50]
     templates = await walk(resources, "resources/templates/list", "resourceTemplates")
     assert [len(page) for page in templates] == [100, 50]
+
+
+async def test_the_longest_keys_can_end_a_page() -> None:
+    # The longest URI registration allows, of four-byte characters, last on page 1.
+    wide = "\U0001f600"
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    for index in range(PAGE_SIZE - 1):
+        server.register_resource(lambda: "x", f"a://{index:04d}", name=f"r{index}")
+        server.register_resource(lambda v: v, f"a://{index:04d}/{{v}}", name=f"t{index}")
+    longest = "b://" + wide * (MAX_URI_LENGTH - 4)
+    server.register_resource(lambda: "x", longest, name="long")
+    longest_template = "b://" + wide * (MAX_URI_LENGTH - 8) + "/{v}"
+    assert len(longest) == len(longest_template) == MAX_URI_LENGTH
+    server.register_resource(lambda v: v, longest_template, name="long_template")
+    server.register_resource(lambda: "x", "c://z", name="last")
+    server.register_resource(lambda v: v, "c://{v}", name="last_template")
+    resources = await walk(server, "resources/list", "resources")
+    assert [len(page) for page in resources] == [PAGE_SIZE, 1]
+    assert resources[0][-1] == longest and resources[1] == ["c://z"]
+    templates = await walk(server, "resources/templates/list", "resourceTemplates")
+    assert [len(page) for page in templates] == [PAGE_SIZE, 1]
+    assert templates[0][-1] == longest_template and templates[1] == ["c://{v}"]
 
 
 async def test_cursor_is_stable_across_inserts_and_removals() -> None:

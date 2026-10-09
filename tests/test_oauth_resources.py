@@ -6,6 +6,7 @@ them, except in the HTTP test at the end, which signs real tokens.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from types import MappingProxyType
@@ -13,7 +14,16 @@ from typing import Any, Literal
 
 import httpx
 import pytest
-from conftest import OAUTH_RESOURCE, LogCapture, headers_for, make_context, modern, rpc
+from conftest import (
+    OAUTH_RESOURCE,
+    LogCapture,
+    Pushed,
+    headers_for,
+    listen,
+    make_context,
+    modern,
+    rpc,
+)
 
 from easy_mcp import (
     APIKeyAuth,
@@ -29,6 +39,7 @@ from easy_mcp.security.oauth import principal_fingerprint
 ISSUER = "https://auth.example.com"
 KEY = "oauth-resources-key-" + "k" * 13
 LEGACY_NOT_FOUND = -32002
+INIT = {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t"}}
 
 
 def token_identity(*scopes: str) -> ClientIdentity:
@@ -127,6 +138,42 @@ async def test_tokens_with_step_up_see_everything_and_get_403_on_use() -> None:
         server, rpc("resources/read", {"uri": "files://a"}), token_identity("files:admin")
     )
     assert allowed["result"]["contents"][0]["text"] == "a for user-1"
+
+
+async def test_step_up_subscribe_is_challenged() -> None:
+    server = oauth_server()
+    for scopes, session in ((("other",), "narrow"), (("files:admin",), "admin")):
+        context = make_context(
+            identity=token_identity(*scopes), push=Pushed(), multiplexed=True, session_id=session
+        )
+        init = await server.dispatch(rpc("initialize", INIT), context)
+        assert init is not None and "result" in init
+        response = await server.dispatch(
+            rpc("resources/subscribe", {"uri": "files://a"}, 2), context
+        )
+        assert response is not None
+        if session == "admin":
+            assert response["result"] == {}
+            continue
+        assert response["error"]["code"] == AUTHENTICATION_REQUIRED
+        assert response["error"]["message"] == "Insufficient scope for resource 'files://a'"
+        assert response["error"]["data"] == {"error": "insufficient_scope", "scope": "files:read"}
+    assert server._notifier.subscriptions("narrow") == frozenset()
+    assert server.notify_resource_updated("files://a") == 1  # the admin session only
+
+
+async def test_step_up_listen_leaves_out_what_the_token_cannot_read() -> None:
+    server = oauth_server()
+    pushed = Pushed()
+    context = make_context(identity=token_identity("other"), push=pushed)
+    message = listen("l1", resourceSubscriptions=["files://a", "public://readme"])
+    task = asyncio.create_task(server.dispatch(message, context))
+    (ack,) = await pushed.wait_for(1)
+    assert ack["params"]["notifications"] == {"resourceSubscriptions": ["public://readme"]}
+    assert server.notify_resource_updated("files://a") == 0
+    assert server.notify_resource_updated("public://readme") == 1
+    server.close_subscriptions(context, reason="shutdown")
+    assert await asyncio.wait_for(task, 5) is None
 
 
 async def test_without_step_up_tokens_see_only_what_they_may_use() -> None:

@@ -262,9 +262,10 @@ and one that could walk out of a folder (a `.` or `..` segment, a backslash,
 a control character, a `/` in `{name}`, a leading `/` in `{+name}`) never
 matches, so your function never sees it. A concrete resource with the exact
 URI wins over templates; among templates the one with the most literal
-characters wins. `safe_path(root, path)` is the second layer for code that
-touches files: it resolves symlinks and refuses anything outside `root` by
-raising `ResourceNotFoundError`.
+characters wins. A URI over 2048 characters matches nothing, and matching
+takes time linear in the URI's length. `safe_path(root, path)` is the second
+layer for code that touches files: it resolves symlinks and refuses anything
+outside `root` by raising `ResourceNotFoundError`.
 
 A missing resource is `-32602` for stateless (`2026-07-28`) clients and
 `-32002` in the handshake era, as each revision specifies, with the URI in
@@ -272,7 +273,10 @@ A missing resource is `-32602` for stateless (`2026-07-28`) clients and
 resource or template is left out of the lists, and reads as missing to a
 caller who cannot use it. `cache_ttl` (seconds, default 0) is the `ttlMs` a
 stateless client may cache a read for; reads of protected resources are
-`cacheScope: "private"`. A resource that reads `current_identity()` to tailor
+`cacheScope: "private"`, and so are all reads of a public template that a
+protected resource or template may answer for instead (a protected
+`docs://salaries` under a public `docs://{name}`, or a more specific
+protected template). A resource that reads `current_identity()` to tailor
 its content should keep `cache_ttl=0` or require authentication.
 `ToolError("message")` raised in a resource is `-32603` with your message;
 anything else is `-32603` with an `error_id`.
@@ -473,10 +477,12 @@ meanwhile starts the session's notifications anew).
 When a resource changes, tell the clients watching it:
 
 ```python
-server.notify_resource_updated("config://app")   # any thread; returns how many were told
+server.notify_resource_updated("config://app")   # any thread
 ```
 
-Clients get the URI only, and read the resource again. Handshake-era clients
+It returns how many subscriptions matched and had the update queued; the
+update is written later, on the event loop. Clients get the URI only, and
+read the resource again. Handshake-era clients
 watch a resource with `resources/subscribe` (and stop with
 `resources/unsubscribe`), and the update arrives as
 `notifications/resources/updated` on the same channel as list changes:
@@ -497,11 +503,11 @@ request's id:
 URIs match exactly: to tell the watchers of a "directory" URI, notify that
 URI too. An update still waiting to be written is not queued again, so a burst
 of updates reaches a client as one. A session may watch 1000 URIs and a
-listen stream name 1000 (`-32007`, HTTP `503`, and `-32602` respectively,
-beyond); a URI over 2048 characters cannot be watched. Subscriptions end with
-the session (or the listen stream), and a resource re-registered as
-protected keeps its watchers: they are told its URI, which they knew, but
-cannot read it.
+listen stream name 1000 (`-32007`, HTTP `503`, beyond; a server without
+resources ignores `resourceSubscriptions` however long it is); a URI over
+2048 characters cannot be watched. Subscriptions end with the session (or
+the listen stream), and a resource re-registered as protected keeps its
+watchers: they are told its URI, which they knew, but cannot read it.
 
 ### Launching from the command line
 
@@ -580,7 +586,8 @@ worker. What a session's client was last told is kept in the store, so its
 `GET /mcp` stream, on whichever worker it opens, announces exactly the
 changes since then. So are the resources a session subscribed to: a
 `resources/subscribe` served by one worker reaches the stream another holds
-(the store tells it to read them again). `notify_resource_updated` tells the
+(the store tells it to read them again, and a stream reads them once more
+as it opens). `notify_resource_updated` tells the
 streams of its own worker only, so call it in every worker, and an update
 made while a session has no stream open is lost (its next stream may open on
 any worker). Stateless (`2026-07-28`) requests
@@ -985,7 +992,7 @@ caller.
 | Unknown or hidden prompt, bad prompt arguments, invalid cursor | `-32602` (arguments: every violation in `data.errors`) |
 | Resource, prompt or completer raises `ToolError("msg")` | `-32603` with your message verbatim |
 | Resource, prompt or completer raises anything else, or returns what cannot be sent | `-32603` with `error_id` |
-| A session watches 1000 resources already (`resources/subscribe`) | `-32007`; HTTP `503` |
+| A session watches 1000 resources already (`resources/subscribe`), or a listen names more than 1000 | `-32007`; HTTP `503` |
 | Rate limit exceeded | `-32003` with `retry_after_seconds` |
 | Session cap reached | `-32006` |
 | Too many open `subscriptions/listen` streams | `-32007`; HTTP `503` |

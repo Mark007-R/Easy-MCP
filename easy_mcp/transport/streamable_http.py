@@ -557,6 +557,9 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             subscriptions=session.record.subscriptions or (),
         )
         stream.sink = sink
+        # The subscriptions it starts with were read before it existed; one
+        # changed on another worker meanwhile was announced to no stream.
+        self._manager.resync_subscriptions(session)
         fields = {
             "session_id": session.session_id,
             "session_ref": session.ref,

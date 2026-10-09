@@ -13,6 +13,10 @@ value that is refused means the URI does not match, so it reads as "not
 found" and the resource function never sees it.  Empty values never match.
 Every other RFC 6570 operator, list, prefix and explode modifier is refused
 at registration.
+
+When a URI could be split in several ways, each value is as long as it can
+be, the first one first: ``{name}.{ext}`` binds ``a.b.c`` as ``a.b`` and
+``c``.  Matching takes time linear in the URI's length, whatever it holds.
 """
 
 from __future__ import annotations
@@ -32,8 +36,13 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _EXPRESSION = re.compile(r"\{([^{}]*)\}")
 _VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-_SIMPLE_VALUE = r"[^/?#]+"
-_RESERVED_VALUE = r"[^?#]+"
+# The characters a value cannot hold: {name} stays in one path segment,
+# {+name} may span several; neither reaches the query or the fragment.
+_SIMPLE_STOPS = "/?#"
+_RESERVED_STOPS = "?#"
+_STOP_PATTERNS = {
+    stops: re.compile(f"[{re.escape(stops)}]") for stops in (_SIMPLE_STOPS, _RESERVED_STOPS)
+}
 
 
 def is_template(uri: str) -> bool:
@@ -89,7 +98,15 @@ class UriTemplate:
         RegistrationError: An unsupported or malformed template.
     """
 
-    __slots__ = ("_pattern", "literal_length", "reserved", "template", "variables")
+    __slots__ = (
+        "_literals",
+        "_shortest",
+        "_stops",
+        "literal_length",
+        "reserved",
+        "template",
+        "variables",
+    )
 
     def __init__(self, template: str) -> None:
         validate_uri(template, what="resource template")
@@ -97,7 +114,10 @@ class UriTemplate:
             raise RegistrationError(f"invalid resource template {template!r}: unbalanced braces")
         variables: list[str] = []
         reserved: set[str] = set()
-        pattern: list[str] = []
+        # The text around the expressions, one more than there are of them,
+        # and the characters each expression's value cannot hold.
+        literals: list[str] = []
+        stops: list[str] = []
         literal_length = 0
         position = 0
         for match in _EXPRESSION.finditer(template):
@@ -106,7 +126,7 @@ class UriTemplate:
                 raise RegistrationError(
                     f"invalid resource template {template!r}: unbalanced braces"
                 )
-            pattern.append(re.escape(literal))
+            literals.append(literal)
             literal_length += len(literal)
             position = match.end()
             expression = match.group(1)
@@ -129,11 +149,11 @@ class UriTemplate:
             variables.append(name)
             if is_reserved:
                 reserved.add(name)
-            pattern.append(f"(?P<{name}>{_RESERVED_VALUE if is_reserved else _SIMPLE_VALUE})")
+            stops.append(_RESERVED_STOPS if is_reserved else _SIMPLE_STOPS)
         tail = template[position:]
         if "{" in tail or "}" in tail:
             raise RegistrationError(f"invalid resource template {template!r}: unbalanced braces")
-        pattern.append(re.escape(tail))
+        literals.append(tail)
         literal_length += len(tail)
         if not variables:
             raise RegistrationError(f"invalid resource template {template!r}: no variables")
@@ -141,7 +161,11 @@ class UriTemplate:
         self.variables = tuple(variables)
         self.reserved = frozenset(reserved)
         self.literal_length = literal_length
-        self._pattern = re.compile("".join(pattern), re.DOTALL)
+        self._literals = tuple(literals)
+        self._stops = tuple(stops)
+        # The shortest URI that can match, less the head and the tail: one
+        # character per value and every literal between two of them.
+        self._shortest = len(variables) + sum(len(literal) for literal in literals[1:-1])
 
     def match(self, uri: str) -> dict[str, str] | None:
         """The decoded value of each variable when *uri* matches the whole template.
@@ -149,12 +173,11 @@ class UriTemplate:
         ``None`` when it does not match, or when a value is not valid
         percent-encoded UTF-8 or fails the traversal guard.
         """
-        found = self._pattern.fullmatch(uri)
-        if found is None:
+        raws = self._split(uri)
+        if raws is None:
             return None
         values: dict[str, str] = {}
-        for name in self.variables:
-            raw = found.group(name)
+        for name, raw in zip(self.variables, raws, strict=True):
             try:
                 value = unquote(raw, encoding="utf-8", errors="strict")
             except UnicodeDecodeError:
@@ -162,6 +185,103 @@ class UriTemplate:
             if _bad_escape(raw) or _unsafe(value, name in self.reserved):
                 return None
             values[name] = value
+        return values
+
+    def may_overlap(self, other: UriTemplate) -> bool:
+        """Whether a URI might match both templates.
+
+        ``False`` only when none can: the literal text before their first
+        expressions, or after their last ones, disagree.
+        """
+        head, tail = self._literals[0], self._literals[-1]
+        other_head, other_tail = other._literals[0], other._literals[-1]
+        heads_agree = head.startswith(other_head) or other_head.startswith(head)
+        tails_agree = tail.endswith(other_tail) or other_tail.endswith(tail)
+        return heads_agree and tails_agree
+
+    def _split(self, uri: str) -> list[str] | None:
+        """Each variable's raw value when *uri* matches the whole template, else ``None``.
+
+        The split is the one a regular expression with a greedy ``[^/?#]+``
+        or ``[^?#]+`` group per expression finds, each value ending as late
+        as it can, the first one first, but found without backtracking, so
+        in time linear in the URI's length.  A *point* is where the literal
+        between two values starts.  Each point starts as late as it could
+        be and only ever moves left, to the previous occurrence of its
+        literal, when a rule forces it: a value holds at least one
+        character (so the point after it bounds the one before it), and
+        none of its stop characters (so the point before it bounds the one
+        after it).  Both rules only push points left, so once they all hold,
+        every point is as late as any split allows, which is the greedy
+        split; a point pushed below the earliest it could be means there is
+        none.  As points never move right, each stretch of the URI is
+        searched about once per value.
+        """
+        head, *inner, tail = self._literals
+        start = len(head)
+        end = len(uri) - len(tail)
+        if end - start < self._shortest or not uri.startswith(head) or not uri.endswith(tail):
+            return None
+        stops = self._stops
+        count = len(inner)
+        if not count:
+            if _STOP_PATTERNS[stops[0]].search(uri, start, end) is not None:
+                return None
+            return [uri[start:end]]
+        sizes = [len(literal) for literal in inner]
+        # The earliest each point can be: every value before it holds a character.
+        low: list[int] = []
+        floor = start
+        for size in sizes:
+            low.append(floor + 1)
+            floor += size + 1
+        # The last value runs to the tail, so it starts after the last of its stops.
+        last = max(uri.rfind(char, start, end) for char in stops[-1])
+        low[-1] = max(low[-1], last + 1 - sizes[-1])
+        points = [end] * count
+        # [clean[i], points[i]) holds none of value i's stops (empty to begin with).
+        clean = [end] * count
+        # The values (but the last) whose stops are to be looked for, as their
+        # start moved left; the first one is looked at first.
+        queue = list(range(count - 1, -1, -1))
+        queued = [True] * count
+
+        def push_left(index: int, cap: int) -> bool:
+            # Move point index to the last occurrence of its literal at or
+            # before cap, and the points before it as far as that pushes them.
+            while cap < points[index]:
+                if cap < low[index]:
+                    return False
+                found = uri.rfind(inner[index], start, cap + sizes[index])
+                if found < low[index]:
+                    return False
+                points[index] = found
+                after = index + 1
+                if after < count and not queued[after]:
+                    queued[after] = True
+                    queue.append(after)
+                if index == 0:
+                    break
+                index -= 1
+                cap = found - sizes[index] - 1
+            return True
+
+        if not push_left(count - 1, end - sizes[-1] - 1):
+            return None
+        while queue:
+            index = queue.pop()
+            queued[index] = False
+            begin = start if index == 0 else points[index - 1] + sizes[index - 1]
+            unchecked = min(clean[index], points[index])
+            if begin < unchecked:
+                stop = _STOP_PATTERNS[stops[index]].search(uri, begin, unchecked)
+                if stop is not None and not push_left(index, stop.start()):
+                    return None
+            clean[index] = begin
+        values = [uri[start : points[0]]]
+        for index in range(1, count):
+            values.append(uri[points[index - 1] + sizes[index - 1] : points[index]])
+        values.append(uri[points[-1] + sizes[-1] : end])
         return values
 
     def __repr__(self) -> str:

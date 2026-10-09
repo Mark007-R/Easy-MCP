@@ -140,6 +140,7 @@ from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
 from .transport.stdio import StdioTransport
 from .transport.streamable_http import StreamableHTTPTransport
+from .uritemplate import MAX_URI_LENGTH
 
 # The newest revision spoken; see protocol.SUPPORTED_PROTOCOL_VERSIONS for all.
 PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
@@ -566,6 +567,9 @@ class MCPServer:
         # -> (the registry version it was computed at, digest).
         self._digests: OrderedDict[tuple[str, Hashable], tuple[int, str]] = OrderedDict()
         self._digests_lock = threading.Lock()
+        # The public templates a protected resource or template may answer
+        # for instead (see _shadowed), and the registry version they are of.
+        self._shadowed_templates: tuple[int, frozenset[str]] = (-1, frozenset())
         # Who is told when a list changes: sessions and listen streams.
         self._notifier = ChangeNotifier(
             self._list_digest, view=self._visibility_class, final=self._listen_final
@@ -1833,7 +1837,9 @@ class MCPServer:
         ``resources/read`` of *item* is not when the resource is protected,
         ``oauth`` is set, request middleware is registered, or it is a retry
         carrying ``inputResponses``/``requestState`` (*retry*), whose result
-        must not be cached at all.
+        must not be cached at all; nor when *item* is a template a protected
+        resource or template may answer for instead, for a caller who may
+        use it (:meth:`_shadowed`).
         """
         if method == DISCOVER_METHOD:
             return "public"
@@ -1841,10 +1847,41 @@ class MCPServer:
             protected = item is not None and item.requires_auth
             if retry or protected or self.oauth is not None or self._request_middleware:
                 return "private"
+            if isinstance(item, ResourceTemplateDefinition) and self._shadowed(item):
+                return "private"
             return "public"
         if self.auth_configured or self._request_middleware:
             return "private"
         return "public"
+
+    def _shadowed(self, template: ResourceTemplateDefinition) -> bool:
+        """Whether a protected item may answer a URI *template* answers anonymous callers.
+
+        It may when a protected concrete resource's URI binds the template,
+        or a protected template tried before it may match the same URIs.  A
+        caller who may use that item reads other bytes at that URI, so no
+        read of the template is the same for everyone.  Decided per
+        template, never per URI, so a read's scope does not tell which URIs
+        hide a protected resource.  Kept until the resources change.
+        """
+        version, shadowed = self._shadowed_templates
+        current = self._resources.version
+        if version != current:
+            # Read after the version: a change meanwhile is seen next time.
+            resources = self._resources.list_resources()
+            protected = [r.uri for r in resources if r.requires_auth]
+            earlier: list[ResourceTemplateDefinition] = []  # protected, tried first
+            found: set[str] = set()
+            for candidate in self._resources.templates_by_specificity():
+                if candidate.requires_auth:
+                    earlier.append(candidate)
+                elif any(t.template.may_overlap(candidate.template) for t in earlier) or any(
+                    candidate.bind(uri) is not None for uri in protected
+                ):
+                    found.add(candidate.uri_template)
+            shadowed = frozenset(found)
+            self._shadowed_templates = (current, shadowed)
+        return template.uri_template in shadowed
 
     def _modern_result(self, result: dict[str, Any]) -> dict[str, Any]:
         """Stamp a stateless result with its ``resultType`` and our identity."""
@@ -1902,7 +1939,12 @@ class MCPServer:
         most specific first, whose pattern matches and whose variables
         convert.  Items *identity* cannot see are skipped as if they did not
         exist; *hidden* says one of them matched (for the audit log only).
+        A URI over :data:`~.uritemplate.MAX_URI_LENGTH` characters (the
+        longest a resource or template may be written as) resolves to
+        nothing, before any template is tried.
         """
+        if len(uri) > MAX_URI_LENGTH:
+            return None, {}, False
         hidden = False
         concrete = self._resources.get(uri)
         if concrete is not None:
@@ -2476,7 +2518,9 @@ class MCPServer:
             ProtocolError: ``-32600`` for an id that is no string or number,
                 or one open on this channel already; ``-32602`` for a
                 malformed filter.
-            SubscriptionLimitError: Too many streams are open.
+            SubscriptionLimitError: Too many streams are open, or (on a
+                server with resources) the filter names more than
+                :data:`MAX_RESOURCE_SUBSCRIPTIONS` resources.
         """
         msg_id = request.request_id
         push = context.push
@@ -2496,6 +2540,11 @@ class MCPServer:
         # the caller may read: a missing and a protected one look the same.
         honored: tuple[str, ...] | None = None
         if asked is not None and "resources" in self._capabilities():
+            if len(asked) > MAX_RESOURCE_SUBSCRIPTIONS:
+                raise SubscriptionLimitError(
+                    "Too many resources for one subscriptions/listen stream (at most "
+                    f"{MAX_RESOURCE_SUBSCRIPTIONS} in notifications.resourceSubscriptions)"
+                )
             honored = self._honored_resources(asked, context.identity)
         sink = self._notifier.open(
             channel=push,
@@ -2635,8 +2684,11 @@ class MCPServer:
             added = self._notifier.subscribe(key, uri, cap=MAX_RESOURCE_SUBSCRIPTIONS)
         else:
             subscribed = await self._update_subscriptions(handle, add=(uri,))
-            self._notifier.set_subscriptions(key, subscribed, hold=not self._store.shared)
             added = uri in subscribed
+            if added:
+                # This request's change only: with a shared store, another
+                # request's answer, holding an older set, may come after it.
+                self._notifier.add_subscription(key, uri, hold=not self._store.shared)
         if not added:
             raise SubscriptionLimitError(
                 f"Too many resource subscriptions for this session (at most "
@@ -2656,11 +2708,10 @@ class MCPServer:
         uri = self._subscription_uri(request)
         key = context.session_id
         handle = context.store_handle
-        if handle is None:
-            self._notifier.unsubscribe(key, uri)
-        else:
-            subscribed = await self._update_subscriptions(handle, remove=(uri,))
-            self._notifier.set_subscriptions(key, subscribed, hold=not self._store.shared)
+        if handle is not None:
+            await self._update_subscriptions(handle, remove=(uri,))
+        # This request's change only, as for resources/subscribe.
+        self._notifier.unsubscribe(key, uri)
         self._audit_subscription("resource_unsubscribe", uri, context)
         return {}
 
