@@ -842,7 +842,7 @@ async def test_a_listen_its_token_ended_gets_no_second_answer(
     server = make_server(oauth=oauth)
     server.middleware(overrule_listen)
     base = live_server(server)
-    short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 2})
+    short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 3})
     async with httpx.AsyncClient(base_url=base, timeout=10) as client:
         stream = await listen_stream(client, 5, bearer(short))
         assert (await stream.next())["method"] == "notifications/subscriptions/acknowledged"
@@ -1010,11 +1010,12 @@ async def test_sse_listen_its_token_ended_gets_no_second_answer(
     server = make_server(oauth=oauth)
     server.middleware(overrule_listen)
     base = live_server(server)
-    short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 2})
     async with httpx.AsyncClient(base_url=base, timeout=10) as client:
         opened = await open_stream(client, "GET", "/sse", headers=bearer(fake_as.mint()))
         assert isinstance(opened, Stream)
         endpoint = await opened.next()
+        # Minted only now, so a slow stream open cannot use up its 2 to 3 seconds.
+        short = fake_as.mint(claims={"exp": int(time.time()) - LEEWAY_SECONDS + 3})
         posted = await client.post(
             endpoint, json=listen(5, toolsListChanged=True), headers=bearer(short)
         )
