@@ -1351,7 +1351,9 @@ class MCPServer:
         known: up to its last activity for a session found idle, which had
         been idle for *idle_ms*.  A shared store's session found idle has no
         *t0* (its record lapsed with its TTL, and no worker holds it between
-        requests), so it is counted closed but not measured.
+        requests), so it is counted closed but not measured.  A session that
+        ended with an error (*reason* ``store_lost`` or ``lease_lost``) is
+        measured with that reason as its ``error.type``.
         """
         if opened:
             self._telemetry.session_opened(transport)
@@ -1365,6 +1367,7 @@ class MCPServer:
                 duration_s=duration,
                 protocol_version=protocol_version,
                 http=kind != "stdio",
+                reason=reason,
             )
         fields: dict[str, Any] = {}
         if session_id is not None:

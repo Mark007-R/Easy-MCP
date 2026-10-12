@@ -71,9 +71,9 @@ Consequences:
 | Stream exhaustion | `subscriptions/listen`: 8 streams per client and `max_sessions` per process, each opening one rate-limit unit, refused with `-32007` (HTTP 503) beyond; `GET /mcp`: one stream per session (a new one replaces the old) and one rate-limit unit per open, with sessions capped by `max_sessions`. Change notifications waiting to be written coalesce on every stream (`GET /mcp`, listen streams, legacy `/sse`), so a client that stops reading cannot grow a backlog of them (on `/sse`, answers to its own requests still queue); keep-alives every 15 s find dead peers, and a stream opened with an OAuth token ends when the token expires |
 | Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
-| Metrics disclosure | `/metrics` is off unless `metrics=True`. With auth configured it needs an API key or token holding `metrics:read` (a key's `*` too; a token's `*` is no wildcard). Without auth only a loopback peer that addressed a loopback `Host` gets it, so neither a remote host (which can forge `Host`) nor a DNS-rebinding page in a local browser (which cannot) can read it. The `Origin` allowlist applies, scrapes spend the rate limit, and refusals are audited (`metrics_denied`). Metrics carry no client ids, key fingerprints, session ids, addresses or request ids |
+| Metrics disclosure | `/metrics` is off unless `metrics=True`. With auth configured it needs an API key or token holding `metrics:read` (a key's `*` too; a token's `*` is no wildcard). Without auth only a loopback peer that addressed a loopback `Host`, with no proxy forwarding header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`), gets it, so neither a remote host connecting directly (which can forge `Host`) nor a DNS-rebinding page in a local browser (which cannot) can read it. Behind a proxy that check is not enough: uvicorn's proxy-header trust (`--proxy-headers` with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all) makes the peer address client-controlled, so a server behind any proxy, local or remote, needs auth before it serves `/metrics`. The `Origin` allowlist applies, scrapes spend the rate limit, and refusals are audited (`metrics_denied`). Metrics carry no client ids, key fingerprints, session ids, addresses or request ids |
 | Telemetry injection and cardinality | Method names outside the MCP method set are recorded as `_OTHER`, tool and prompt names only for registered ones, request ids cut to 128 characters and resource URIs to 512 (spans only, never span names or metric labels); trace-context values are read only from `traceparent`, `tracestate` and `baggage`, capped at 8192 characters and parsed only by the W3C parser, which ignores malformed ones. Each metric keeps at most 2000 series, folding the rest into `_OTHER`. Rate-limited and transport-refused messages create no span. Spans hold no arguments, results, exception text, headers or raw session ids (a SHA-256 digest stands in), not even with `debug=True`; a failed call carries its `error_id` |
-| Telemetry failures | Every telemetry step is guarded: a broken span processor, exporter or SDK never changes an answer (the first failure is logged as a warning, later ones at debug level), and the server never waits on an exporter |
+| Telemetry failures | Every telemetry step is guarded: a broken span processor, exporter or SDK never changes an answer (the first failure is logged as a warning, later ones at debug level), and easy_mcp itself never awaits an exporter; but span processors run inside `span.end()` on the event loop, so use `BatchSpanProcessor` (a `SimpleSpanProcessor` makes every request wait for the export) |
 
 ## Transport trust boundaries
 
@@ -94,7 +94,8 @@ Consequences:
   Resource Metadata and `/healthz` serve anything without a credential.
   `/metrics` (with `metrics=True`) follows the same `Origin` and credential
   rules, needs the `metrics:read` scope, and without auth answers only
-  local requests addressed to a loopback host.
+  local requests addressed to a loopback host that carry no proxy
+  forwarding header.
 - **Shared store** — Redis sits inside your trust boundary. Anyone who can
   write to it can end sessions and reset rate limits and call caps; they
   cannot take over a session, gain a scope, or inject messages into one.
@@ -385,7 +386,10 @@ the client is untrusted, the credential in the environment is trusted.
   stays visible. Client baggage reaches tool code and anything it calls with
   an instrumented client. Use `ParentBased(remote_parent_sampled=...)` to cap
   sampling and `OTEL_PROPAGATORS=tracecontext` to drop client baggage. A
-  malformed value is ignored, never echoed, and never an error.
+  malformed value is ignored, never echoed, and never an error. Log lines
+  carry the `trace_id` and `span_id` only of a span this process made: with
+  no SDK configured they carry none, so a client's own ids never appear in
+  the audit log as the server's.
 - **A hidden tool's call leaves no audit event.** A call of a protected tool
   the caller cannot see is answered "Unknown tool", as for a missing one, and
   audited nowhere (the audit log's `tool_denied` events are unchanged in
@@ -397,9 +401,16 @@ the client is untrusted, the credential in the environment is trusted.
   shared store, an HTTP session that expires idle is counted closed but gets
   no `mcp_server_session_duration_seconds` sample: its record, with the time
   it opened, lapsed with its TTL.
-- **A local reverse proxy can open `/metrics` without auth.** It connects
-  from loopback; one that also rewrites `Host` to `localhost` passes the
-  local-only check for anyone who reaches it. Configure auth behind a proxy.
+- **A proxy can open `/metrics` without auth.** A request carrying a
+  forwarding header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Real-IP`) is refused, but a reverse proxy on the same machine that
+  sends none connects from loopback, and one that also rewrites `Host` to
+  `localhost` passes the local-only check for anyone who reaches it. And
+  uvicorn's proxy-header trust (`--proxy-headers` with
+  `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all) makes the
+  peer address whatever the client's `X-Forwarded-For` says, wherever the
+  proxy runs. Configure auth on any server behind a proxy, local or remote,
+  before it serves `/metrics`.
 - **A scrape key is a key.** One holding only `metrics:read` still
   authenticates on `/mcp`: it can call public tools and `requires_auth` tools
   that name no scopes. Give the tools a scraper must not reach scopes.
@@ -437,7 +448,7 @@ easy_mcp for sandboxing:
 - [ ] Completers return only what every caller allowed to see their prompt or template may see.
 - [ ] Middleware that calls other services bounds each call with a timeout and exports no arguments, results or credentials without review.
 - [ ] Multiple workers: a shared store, TLS to it (`rediss://`), a dedicated ACL user, `noeviction`, and a distinct server `name` (or `namespace=`) per server sharing it.
-- [ ] If `/metrics` is on: the scraper has its own key holding only `metrics:read`, tools it must not call have scopes, and behind a reverse proxy auth is configured.
+- [ ] If `/metrics` is on: the scraper has its own key holding only `metrics:read`, tools it must not call have scopes, and behind any proxy, local or remote (or with uvicorn's `--proxy-headers`/`FORWARDED_ALLOW_IPS`), auth is configured.
 - [ ] Trace and metric exporters use batch/periodic processors; over stdio nothing writes to stdout (`ConsoleSpanExporter(out=sys.stderr)`).
 - [ ] Decide whether client trace context may choose your sampling (`ParentBased(remote_parent_sampled=...)`) and carry baggage into tools (`OTEL_PROPAGATORS=tracecontext` drops it).
 

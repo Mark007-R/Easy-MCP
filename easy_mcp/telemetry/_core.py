@@ -161,6 +161,12 @@ REJECT_REASONS: Final = frozenset(
     }
 )
 
+# Why a session ended, when that was an error: its session duration carries
+# the reason as error.type.  The shared store lost it (a failover, a restart),
+# or an SSE session's lease there lapsed or was lost.  The other reasons
+# (client_terminated, idle_timeout, stream_closed, shutdown) are no error.
+ABNORMAL_SESSION_ENDS: Final = frozenset({"store_lost", "lease_lost"})
+
 # How much of a client-chosen value a span carries.
 REQUEST_ID_MAX: Final = 128
 RESOURCE_URI_MAX: Final = 512
@@ -629,15 +635,23 @@ class Telemetry:
         except Exception:
             self._step_failed()
 
-    @staticmethod
     def _classify(
-        plan: _Plan, response: dict[str, Any], attributes: dict[str, Any], error_id: str | None
+        self,
+        plan: _Plan,
+        response: dict[str, Any],
+        attributes: dict[str, Any],
+        error_id: str | None,
     ) -> tuple[str | None, str | None]:
         """``(error.type, status description)`` for an answer; sets ``rpc.response.status_code``.
 
-        The description is the error's message, except for ``-32603``: in
-        debug mode its message carries the exception and its traceback, so
-        the span says only which ``error_id`` the log has them under.
+        The description is the error's message, cut to
+        :data:`STATUS_DESCRIPTION_MAX`, except for a ``-32603`` that may hold
+        exception text.  With an ``error_id`` (in debug mode its message
+        carries the exception and its traceback) the span says only which
+        ``error_id`` the log has them under; in debug mode without one, only
+        ``Internal server error``.  Any other ``-32603``, such as a
+        ``ToolError`` raised outside ``tools/call``, was answered with a
+        message meant for the client, which the span keeps.
         """
         error = response.get("error")
         if isinstance(error, dict):
@@ -648,9 +662,10 @@ class Telemetry:
             if not is_error_code(code):
                 return None, None
             if code == INTERNAL_ERROR:
-                if error_id is None:
+                if error_id is not None:
+                    return str(code), f"Internal server error (error_id={error_id})"
+                if self._server.debug:
                     return str(code), "Internal server error"
-                return str(code), f"Internal server error (error_id={error_id})"
             message = error.get("message")
             description = message[:STATUS_DESCRIPTION_MAX] if isinstance(message, str) else None
             return str(code), description
@@ -769,8 +784,13 @@ class Telemetry:
         duration_s: float | None,
         protocol_version: str | None,
         http: bool,
+        reason: str | None = None,
     ) -> None:
-        """A session ended; its duration is recorded when known."""
+        """A session ended; its duration is recorded when known.
+
+        A session that ended with an error (*reason* one of
+        :data:`ABNORMAL_SESSION_ENDS`) carries it as ``error.type``.
+        """
         if not self.active:
             return
         self._add(
@@ -787,6 +807,8 @@ class Telemetry:
         attributes["network.transport"] = "tcp" if http else "pipe"
         if http:
             attributes["network.protocol.name"] = "http"
+        if reason in ABNORMAL_SESSION_ENDS:
+            attributes["error.type"] = reason
         self._record(
             self._session_duration,
             "session_duration",

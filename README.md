@@ -1152,8 +1152,10 @@ def report(query: str) -> list[dict]:
         ...
 ```
 
-JSON log lines written during a request carry `trace_id` and `span_id`, so an
-audit event leads to its trace and a trace to its log lines.
+With an SDK configured, JSON log lines written during a request carry the
+`trace_id` and `span_id` of its server span, so an audit event leads to its
+trace and a trace to its log lines. Without one they carry none: the trace
+context a client sends is never logged as the server's.
 
 A tool call's span also carries `easy_mcp.status` (the outcome, as in the
 metrics below) and, when the client was given one, the `easy_mcp.error_id`
@@ -1173,7 +1175,7 @@ exporter writes to stdout unless told otherwise, so pass `out=sys.stderr`
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `mcp_server_operation_duration_seconds` | histogram | `mcp_method_name`, `gen_ai_operation_name`, `gen_ai_tool_name`, `gen_ai_prompt_name`, `error_type`, `rpc_response_status_code`, `mcp_protocol_version`, `network_transport`, `network_protocol_name` | time from receiving a message to its answer; cancelled requests and established `subscriptions/listen` streams are not sampled |
-| `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name` | how long handshake-era sessions lasted (an idle one up to its last activity); with a shared store, a session that expires idle is counted closed in `easy_mcp_sessions_open` but not sampled here, since the store no longer knows when it opened |
+| `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name`, `error_type` | how long handshake-era sessions lasted (an idle one up to its last activity); `error_type` marks one that ended with an error: `store_lost` (the shared store lost it, in a failover or restart) or `lease_lost` (an SSE session whose lease in the shared store lapsed or was lost); with a shared store, a session that expires idle is counted closed in `easy_mcp_sessions_open` but not sampled here, since the store no longer knows when it opened |
 | `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, `refused` (before the tool ran: by middleware, or because the session was gone or the shared store out of reach) and `internal_error` (a middleware failed) |
 | `easy_mcp_tool_calls_active` | gauge | `gen_ai_tool_name` | calls between their validation and their answer |
 | `easy_mcp_sync_workers_in_use` | gauge | | threads of sync tools, resources, prompts and completers holding a `max_sync_workers` slot, those a timed-out call still holds included |
@@ -1198,8 +1200,13 @@ With auth configured, `/metrics` needs an API key or token that holds the
 Give your scraper a key of its own. It is still a key: it can call public
 tools and `requires_auth` tools that name no scopes, so give protected tools
 scopes. Without auth, `/metrics` answers only requests from this machine
-addressed to `localhost`, `127.0.0.1` or `[::1]`. Scrapes count against the
-rate limit (at a 15 s interval, 4 of the default 120 a minute).
+addressed to `localhost`, `127.0.0.1` or `[::1]` that carry no proxy
+forwarding header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`,
+`X-Real-IP`). Behind a proxy, local or remote, configure auth: uvicorn's
+proxy-header trust (`--proxy-headers` with `--forwarded-allow-ips` or
+`FORWARDED_ALLOW_IPS`, `*` above all) makes the peer address whatever the
+client says. Scrapes count against the rate limit (at a 15 s interval, 4 of
+the default 120 a minute).
 
 ```python
 auth = APIKeyAuth({
@@ -1477,9 +1484,12 @@ prefer returning compact structures over huge strings.
   `mcp_server_session_duration_seconds`: no worker knows when it opened any
   more. Trace and metric exporters
   run in your process: use batch span processors and a periodic metric
-  reader. With `metrics=True` behind a reverse proxy on the same machine,
-  configure auth: the proxy connects from loopback, and one that also sends
-  `Host: localhost` would get `/metrics` for anyone who reaches it.
+  reader. With `metrics=True` behind any proxy, local or remote, configure
+  auth: a proxy on the same machine connects from loopback, and one that
+  also sends `Host: localhost` and no forwarding header would get `/metrics`
+  for anyone who reaches it; uvicorn's proxy-header trust (`--proxy-headers`
+  with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all)
+  makes the peer address client-controlled.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
 
 ## Development

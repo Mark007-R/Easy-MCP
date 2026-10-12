@@ -772,6 +772,8 @@ async def test_metrics_endpoint_with_auth_requires_scope(logs: LogCapture) -> No
         assert anonymous.headers["www-authenticate"] == "Bearer"
         wrong = await http.get("/metrics", headers=bearer(WRONG_KEY))
         assert wrong.status_code == 401
+        assert wrong.headers["www-authenticate"] == "Bearer"
+        assert wrong.json() == {"error": "invalid API key"}
         unscoped = await http.get("/metrics", headers=bearer(APP_KEY))
         assert unscoped.status_code == 403
         assert unscoped.json() == {"error": "the credential lacks the 'metrics:read' scope"}
@@ -786,6 +788,26 @@ async def test_metrics_endpoint_with_auth_requires_scope(logs: LogCapture) -> No
     reasons = [event["reason"] for event in logs.events("metrics_denied")]
     assert reasons == ["unauthenticated", "unauthenticated", "insufficient_scope"]
     assert all(APP_KEY not in record.getMessage() for record in logs.records)
+
+
+async def test_metrics_endpoint_answers_an_invalid_key_with_a_challenge(
+    logs: LogCapture,
+) -> None:
+    # Every 401 carries a challenge (RFC 9110 15.5.2), and /metrics is no
+    # JSON-RPC endpoint: the same answer on the combined app and SSE alone,
+    # whichever header held the key.
+    server = make_server(auth=APIKeyAuth({SCRAPE_KEY: [METRICS_SCOPE]}))
+    for app in (server.build_app(), SSETransport(server).build_app()):
+        async with asgi(app) as http:
+            for headers in (bearer(WRONG_KEY), {"X-API-Key": WRONG_KEY}):
+                refused = await http.get("/metrics", headers=headers)
+                assert refused.status_code == 401
+                assert refused.headers["www-authenticate"] == "Bearer"
+                assert refused.json() == {"error": "invalid API key"}
+            assert (await http.get("/metrics", headers=bearer(SCRAPE_KEY))).status_code == 200
+    reasons = [event["reason"] for event in logs.events("metrics_denied")]
+    assert reasons == ["unauthenticated"] * 4
+    assert metrics_of(server)['easy_mcp_rejected_total{easy_mcp_reason="unauthenticated"}'] == 4
 
 
 def test_metrics_endpoint_with_oauth_needs_the_scope(
@@ -860,6 +882,38 @@ def test_local_request_predicate() -> None:
     assert not is_local_request(scope("127.0.0.1", "::1"))  # an IPv6 host needs brackets
     # A digit, but not an ASCII one (superscript two).
     assert not is_local_request(scope("127.0.0.1", "127.0.0.1:²"))
+
+
+def test_forwarded_request_is_not_local() -> None:
+    # A proxy names the client it forwards in one of these headers, and
+    # uvicorn's proxy-header trust can make that client's X-Forwarded-For
+    # the peer address: a forwarded request is never this machine's own.
+    for name in (b"x-forwarded-for", b"forwarded", b"x-real-ip", b"x-forwarded-host"):
+        scope = {
+            "type": "http",
+            "client": ("127.0.0.1", 50000),
+            "headers": [(b"host", b"127.0.0.1:8000"), (name, b"127.0.0.1")],
+        }
+        assert not is_local_request(scope), name
+
+
+async def test_metrics_endpoint_without_auth_refuses_a_forged_forwarded_peer(
+    logs: LogCapture,
+) -> None:
+    # Served behind uvicorn's proxy headers with FORWARDED_ALLOW_IPS="*", the
+    # peer address is the leftmost X-Forwarded-For entry, which a remote
+    # client chooses, even when a load balancer appends the real one.
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    server = make_server()
+    app = ProxyHeadersMiddleware(server.build_app(), trusted_hosts="*")
+    transport = httpx.ASGITransport(app=app, client=("10.0.0.5", 50000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as http:
+        plain = await http.get("/metrics")
+        forged = await http.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1"})
+        appended = await http.get("/metrics", headers={"X-Forwarded-For": "127.0.0.1, 203.0.113.9"})
+    assert [plain.status_code, forged.status_code, appended.status_code] == [403, 403, 403]
+    assert [event["reason"] for event in logs.events("metrics_denied")] == ["not_local"] * 3
 
 
 async def test_metrics_endpoint_is_rate_limited(logs: LogCapture) -> None:
@@ -1013,6 +1067,43 @@ async def test_shared_store_idle_expiry_has_no_session_duration(
     assert samples[gauge] == 0
     assert total(samples, f"{SESSION_DURATION}_count") == 1
     assert total(samples, f"{SESSION_DURATION}_sum") == pytest.approx(3.0, abs=0.01)
+
+
+async def test_session_lost_by_the_store_has_an_error_type() -> None:
+    # The conventions make error.type conditionally required on the session
+    # duration of a session that ended with an error: one the shared store
+    # lost (a failover, a restart) or an SSE session whose lease was lost.
+    # A session its client ended has none.
+    hub = FakeHub()
+    server = make_server(store=hub.store("worker-a"))
+    sse = SSETransport(server)._manager
+    http = StreamableHTTPTransport(server, legacy_sse=False)._manager
+    try:
+        stream = await sse.open("stream", client_id="ip:stream", identity=None, owned=True)
+        assert stream is not None
+        await sse.finish(stream)
+        sse.opened(stream)
+        sessions = []
+        for name in ("held", "ended"):
+            local = await http.open(name, client_id=f"ip:{name}", identity=None)
+            assert local is not None
+            http.opened(local)
+            sessions.append(local)
+        held, ended = sessions
+        for local in (stream, held):
+            hub.remove(local.ref)
+        for manager in (sse, http):
+            await manager._refresh()
+        assert stream.ended and held.ended and not ended.ended
+        await http.end(ended, reason="client_terminated")
+    finally:
+        for manager in (sse, http):
+            await manager.shutdown()
+    counts = {
+        labels.get("error_type"): value
+        for labels, value in find(metrics_of(server), f"{SESSION_DURATION}_count")
+    }
+    assert counts == {"lease_lost": 1, "store_lost": 1, None: 1}
 
 
 def _next_data(lines: Iterator[str]) -> str:

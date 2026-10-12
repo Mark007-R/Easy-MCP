@@ -405,7 +405,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   HTTP transports, with no new dependency:
   `mcp_server_operation_duration_seconds` and
   `mcp_server_session_duration_seconds` histograms (the conventions'
-  buckets), and `easy_mcp_tool_calls_total` (by outcome: `ok`,
+  buckets; a session the shared store lost has `error_type="store_lost"`,
+  and an SSE session whose lease there lapsed `"lease_lost"`), and
+  `easy_mcp_tool_calls_total` (by outcome: `ok`,
   `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`,
   `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, `refused`
   before the tool ran, by middleware or for a session gone or a shared store
@@ -417,14 +419,17 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   reason). With auth configured the endpoint needs a key or token holding
   the `metrics:read` scope (`easy_mcp.METRICS_SCOPE`), or a key holding `*`,
   and a token without it gets an `insufficient_scope` challenge; without
-  auth it answers only local requests addressed to a loopback host. Scrapes
+  auth it answers only local requests addressed to a loopback host that
+  carry no proxy forwarding header (configure auth behind any proxy). Scrapes
   count against the rate limit, and refusals are audited as
   `metrics_denied`. With OpenTelemetry installed the same metrics are also
   recorded through its metrics API, which is how a stdio server exports
   them; over stdio no port is opened, and `server.render_metrics()` returns
   the text. `--metrics` enables it on `easy-mcp run` and on the connectors.
-- JSON log lines written while a traced request is handled carry `trace_id`
-  and `span_id`.
+- JSON log lines written while a request is handled carry the `trace_id`
+  and `span_id` of its server span when an OpenTelemetry SDK is configured.
+  Without one they carry none, as before: the trace context a client sends
+  is never logged as the server's.
 - The startup log event carries `metrics` and `tracing`.
 - For custom stores: `ExpiredSession.idle_ms`, how long a session found
   expired had been idle, so its duration ends at its last activity.

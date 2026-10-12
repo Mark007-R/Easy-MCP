@@ -839,6 +839,49 @@ async def test_debug_mode_puts_no_exception_text_in_spans(otel: Otel) -> None:
         assert f"error_id={error_id}" in answer["error"]["message"]
 
 
+async def test_tool_error_outside_tools_call_describes_its_span(otel: Otel) -> None:
+    # A ToolError's message is meant for the client: raised by a resource, a
+    # prompt or request middleware, it answers -32603 as written, and the
+    # span's description is that message, as for any other code.  In debug
+    # mode a -32603 without an error_id still says only "Internal server error".
+    for debug in (False, True):
+        otel.exporter.clear()
+        server = otel.server(debug=debug)
+
+        @server.resource("config://app")
+        def app_config() -> str:
+            """Its backend is down."""
+            raise ToolError("the configuration service is down")
+
+        @server.prompt
+        def greet() -> str:
+            """Its backend is down."""
+            raise ToolError("the prompt backend is down")
+
+        @server.middleware
+        async def gate(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+            if request.method == "ping":
+                raise ToolError("pings are paused for maintenance")
+            return await call_next()
+
+        context = make_context()
+        answers = {
+            "1": await server.dispatch(rpc("resources/read", {"uri": "config://app"}, 1), context),
+            "2": await server.dispatch(rpc("prompts/get", {"name": "greet"}, 2), context),
+            "3": await server.dispatch(rpc("ping", msg_id=3), context),
+        }
+        by_id = {span.attributes["jsonrpc.request.id"]: span for span in otel.spans()}
+        for msg_id, answer in answers.items():
+            assert answer is not None and answer["error"]["code"] == INTERNAL_ERROR
+            span = by_id[msg_id]
+            assert span.status.status_code is StatusCode.ERROR
+            assert span.attributes["error.type"] == "-32603"
+            assert "easy_mcp.error_id" not in span.attributes
+            expected = "Internal server error" if debug else answer["error"]["message"]
+            assert span.status.description == expected, (debug, msg_id)
+            assert "error_id" not in answer["error"]["message"]
+
+
 async def test_session_id_is_hashed(otel: Otel) -> None:
     server = otel.server()
     add_tool(server)
@@ -1042,6 +1085,61 @@ async def test_log_lines_carry_trace_ids_inside_a_request(otel: Otel) -> None:
     for line in (*inside, *audit):
         assert (line["trace_id"], line["span_id"]) == (trace_id, span_id)
     assert inside and audit
+
+
+async def chatty_lines(server: MCPServer) -> list[dict[str, Any]]:
+    """The JSON log lines of one call carrying the client's trace context, from inside and audit."""
+    formatted: list[dict[str, Any]] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            formatted.append(json.loads(JSONLogFormatter().format(record)))
+
+    @server.tool
+    def chatty() -> str:
+        """Logs from inside a call."""
+        logging.getLogger("easy_mcp.app").warning("inside the tool")
+        return "ok"
+
+    message = call("chatty")
+    message["params"]["_meta"] = {"traceparent": TRACEPARENT}
+    handler = Capture()
+    logger = logging.getLogger("easy_mcp")
+    logger.addHandler(handler)
+    try:
+        answer = await server.dispatch(message, make_context())
+    finally:
+        logger.removeHandler(handler)
+    assert answer is not None and answer["result"]["content"][0]["text"] == "ok"
+    lines = [line for line in formatted if line["message"] in ("inside the tool", "tool_call")]
+    assert sorted(line["message"] for line in lines) == ["inside the tool", "tool_call"]
+    return lines
+
+
+async def test_log_lines_name_no_client_span_without_an_sdk() -> None:
+    # opentelemetry-api with no SDK configured, as next to the official MCP
+    # SDK: the server's spans are no-ops, so the only valid span context in
+    # the request is the client's own, from its _meta.  Log lines name only
+    # spans this process made, and so carry no ids, as in 0.3.1.
+    from opentelemetry.trace import NoOpTracerProvider
+
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    server._telemetry_state = Telemetry(
+        server, metrics=False, otel=OtelBridge(tracer_provider=NoOpTracerProvider())
+    )
+    for line in await chatty_lines(server):
+        assert "trace_id" not in line and "span_id" not in line, line
+
+
+async def test_log_lines_name_the_server_span_under_a_client_parent(otel: Otel) -> None:
+    # With an SDK the client's trace holds the server span, and the lines name it.
+    lines = await chatty_lines(otel.server())
+    request = only(otel, "tools/call chatty")
+    assert hex_id(request.context.trace_id, 32) == TRACE_ID
+    span_id = hex_id(request.context.span_id, 16)
+    assert span_id != CLIENT_SPAN
+    for line in lines:
+        assert (line["trace_id"], line["span_id"]) == (TRACE_ID, span_id), line
 
 
 async def test_baggage_from_meta_reaches_the_tool(otel: Otel) -> None:

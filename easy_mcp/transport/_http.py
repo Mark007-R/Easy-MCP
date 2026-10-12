@@ -56,6 +56,11 @@ if TYPE_CHECKING:
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
+# Headers a proxy adds for the client it forwards (ASGI header names).
+FORWARDING_HEADERS = frozenset(
+    {b"forwarded", b"x-forwarded-for", b"x-forwarded-host", b"x-real-ip"}
+)
+
 
 def normalize_origins(origins: Iterable[str]) -> frozenset[str]:
     """Validate and normalize an ``allowed_origins`` setting.
@@ -196,12 +201,21 @@ def is_local_request(scope: Scope) -> bool:
     will not let it change.  The peer must be a loopback address
     (``::ffff:127.0.0.1`` included) and the only ``Host`` header must name
     ``localhost``, ``127.0.0.1`` or ``[::1]``, with any port.
+
+    A request carrying a proxy's forwarding header (``Forwarded``,
+    ``X-Forwarded-For``, ``X-Forwarded-Host``, ``X-Real-IP``) is never
+    local: it came through a proxy, and uvicorn's proxy-header trust
+    (``FORWARDED_ALLOW_IPS``) may have made the peer address one the client
+    chose.  Those headers stay in the scope when uvicorn rewrites ``client``.
     """
+    headers = scope.get("headers", ())
+    if any(key in FORWARDING_HEADERS for key, _ in headers):
+        return False
     client = scope.get("client")
     peer = client[0] if client else None
     if not isinstance(peer, str) or not _is_loopback_address(peer):
         return False
-    hosts = [value for key, value in scope.get("headers", ()) if key == b"host"]
+    hosts = [value for key, value in headers if key == b"host"]
     if len(hosts) != 1:
         return False
     return _host_name(hosts[0].decode("latin-1")) in LOOPBACK_HOSTS
@@ -596,14 +610,16 @@ class BaseHTTPTransport(Transport):
     async def _handle_metrics(self, request: Request) -> Response:
         """Serve the server's metrics in the Prometheus text format.
 
-        In order: the credential, as on the MCP endpoint (``401``); one unit
+        In order: the credential, as on the MCP endpoint (``401``, with a
+        ``Bearer`` challenge and, for an API key that matches none, the body
+        ``{"error": "invalid API key"}`` on every transport); one unit
         of the caller's rate-limit budget (``429``); then, with auth
         configured, a credential holding ``metrics:read`` or ``*`` (``401``
         without one, ``403`` without the scope, with an ``insufficient_scope``
         challenge for an OAuth token), and without auth, a request
-        from this machine addressed to a loopback host (``403`` otherwise).
-        The ``Origin`` check has run before all of them.  Refusals are
-        audited as ``metrics_denied``.
+        from this machine addressed to a loopback host, through no proxy
+        (``403`` otherwise).  The ``Origin`` check has run before all of
+        them.  Refusals are audited as ``metrics_denied``.
         """
         server = self._server
         peer = request.client.host if request.client else "unknown"
@@ -612,6 +628,15 @@ class BaseHTTPTransport(Transport):
             denied = {401: "unauthenticated", 403: "insufficient_scope"}.get(resolved.status_code)
             if denied is not None:
                 audit("metrics_denied", reason=denied, client_id=f"ip:{peer}")
+            if resolved.status_code == 401 and server.oauth is None:
+                # The MCP endpoint's answer to a key that matches none is a
+                # JSON-RPC error without a challenge; every 401 needs one
+                # (RFC 9110 15.5.2).  OAuth's 401s carry theirs.
+                return JSONResponse(
+                    {"error": "invalid API key"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
             return resolved
         identity = resolved
         client_id = identity.fingerprint if identity is not None else f"ip:{peer}"

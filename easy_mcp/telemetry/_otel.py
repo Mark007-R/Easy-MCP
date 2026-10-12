@@ -280,9 +280,14 @@ class OtelBridge:
         self._context_api.detach(token)
 
     def current_trace_ids(self) -> tuple[str, str] | None:
-        """``(trace_id, span_id)`` of the current span in lower-case hex, if it is valid."""
+        """``(trace_id, span_id)`` of the current span in lower-case hex, if this process made it.
+
+        ``None`` for an invalid span, and for a remote one: without an SDK
+        the server's span is a no-op that stands for the client's own span
+        from ``_meta``, whose ids a log line must not carry as the server's.
+        """
         span_context = self._trace.get_current_span().get_span_context()
-        if not span_context.is_valid:
+        if not span_context.is_valid or span_context.is_remote:
             return None
         return (
             self._format_trace_id(span_context.trace_id),
