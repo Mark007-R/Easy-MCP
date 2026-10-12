@@ -145,7 +145,8 @@ class OtelBridge:
         self.sync_workers_in_use: Any = meter.create_up_down_counter(
             "easy_mcp.sync_workers.in_use",
             unit="{thread}",
-            description="Sync tool threads holding a max_sync_workers slot.",
+            description="Threads of sync tools, resources, prompts and completers holding a "
+            "max_sync_workers slot.",
         )
         self.sessions_open: Any = meter.create_up_down_counter(
             "easy_mcp.sessions.open",

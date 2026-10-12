@@ -497,8 +497,10 @@ class MCPServer:
             it answers only requests from this machine addressed to a
             loopback host.  Over stdio there is no endpoint:
             :meth:`render_metrics` returns the text, and with OpenTelemetry
-            installed the same metrics reach your metrics exporter.  Read
-            when serving starts, like ``debug``.  Tracing needs no switch:
+            installed the same metrics reach your metrics exporter.  Fixed
+            once the server has built its app or dispatched a message;
+            :meth:`run` still picks up a change made before it serves.
+            Tracing needs no switch:
             with ``opentelemetry-api`` installed every request is a span,
             which costs nothing until your application configures an
             OpenTelemetry SDK (``OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp``
@@ -1303,7 +1305,9 @@ class MCPServer:
         """The server's spans and metrics, built on first use and fixed from then on.
 
         Built when the server first dispatches, builds its app, runs or
-        renders its metrics: setting ``metrics`` later has no effect.
+        renders its metrics: setting ``metrics`` later has no effect, except
+        that :meth:`run` still turns metrics on while nothing has been served
+        (``easy-mcp run --metrics`` on a module that built its app).
         """
         telemetry = self._telemetry_state
         if telemetry is None:
@@ -1345,7 +1349,9 @@ class MCPServer:
         ``"http"``, ``"sse"`` or ``"stdio"``.  Telemetry counts the session
         open or closed here, and records a closed one's duration when *t0* is
         known: up to its last activity for a session found idle, which had
-        been idle for *idle_ms*.
+        been idle for *idle_ms*.  A shared store's session found idle has no
+        *t0* (its record lapsed with its TTL, and no worker holds it between
+        requests), so it is counted closed but not measured.
         """
         if opened:
             self._telemetry.session_opened(transport)
@@ -1657,6 +1663,10 @@ class MCPServer:
                     ended = "disconnected" if ours else "client_cancelled"
                 elif request.method == "tools/call":
                     audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
+                    # Wherever the call was: request middleware and the
+                    # store's call count come before anything the
+                    # tool-level processing reports.
+                    self._telemetry.tool_cancelled()
                 else:
                     audit(
                         "request_cancelled",
@@ -1692,6 +1702,10 @@ class MCPServer:
         final one included, went through ``context.push``.
         """
         outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
+        if request.method == "tools/call":
+            # A call that request middleware refused, or failed on, before
+            # call_next() has no status yet: it is counted by its answer.
+            self._telemetry.note_request_outcome(outcome)
         if request.method == "initialize" and outcome.error_code is None:
             # Only a handshake the client is answered with negotiates a
             # version; later requests on this connection or session are
@@ -3618,6 +3632,13 @@ class MCPServer:
                 over stdin/stdout.  A :class:`Transport` instance can be
                 passed for custom configuration.
         """
+        built = self._telemetry_state
+        if self.metrics and built is not None and built.registry is None and not self._started:
+            # metrics turned on after the telemetry was built, but before
+            # anything was served: a module that built its app at import,
+            # run with ``easy-mcp run --metrics``.  Built anew, keeping its
+            # OpenTelemetry bridge (and so its instruments).
+            self._telemetry_state = Telemetry(self, metrics=True, otel=built.otel)
         self._transport = self._resolve_transport(transport)
         self._warn_if_misconfigured()
         telemetry = self._telemetry

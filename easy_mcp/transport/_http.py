@@ -599,7 +599,8 @@ class BaseHTTPTransport(Transport):
         In order: the credential, as on the MCP endpoint (``401``); one unit
         of the caller's rate-limit budget (``429``); then, with auth
         configured, a credential holding ``metrics:read`` or ``*`` (``401``
-        without one, ``403`` without the scope), and without auth, a request
+        without one, ``403`` without the scope, with an ``insufficient_scope``
+        challenge for an OAuth token), and without auth, a request
         from this machine addressed to a loopback host (``403`` otherwise).
         The ``Origin`` check has run before all of them.  Refusals are
         audited as ``metrics_denied``.
@@ -639,8 +640,18 @@ class BaseHTTPTransport(Transport):
             # A token's scopes never hold "*" (it is no wildcard there).
             if "*" not in identity.scopes and METRICS_SCOPE not in identity.scopes:
                 audit("metrics_denied", reason="insufficient_scope", client_id=client_id)
+                challenge: dict[str, str] | None = None
+                if server.oauth is not None and identity.issuer is not None:
+                    # A token is told which scope to ask for (RFC 6750 3.1).
+                    challenge = {
+                        "WWW-Authenticate": self._scope_challenge(
+                            [METRICS_SCOPE], identity.scopes, modern=False
+                        )
+                    }
                 return JSONResponse(
-                    {"error": f"the key lacks the {METRICS_SCOPE!r} scope"}, status_code=403
+                    {"error": f"the credential lacks the {METRICS_SCOPE!r} scope"},
+                    status_code=403,
+                    headers=challenge,
                 )
         elif not is_local_request(request.scope):
             audit("metrics_denied", reason="not_local", client_id=client_id)

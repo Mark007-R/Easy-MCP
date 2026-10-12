@@ -397,9 +397,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   request is no error and has no duration sample; JSON-RPC codes the
   conventions call the caller's (`-32700`, `-32600`, `-32601`, `-32602`,
   and `-32002` "resource not found") are not errors either. Spans never
-  record arguments, results or exception text, and session ids appear only
-  hashed. A `subscriptions/listen` span lasts as long as its stream and
-  records why it ended (`easy_mcp.subscription.end`).
+  record arguments, results or exception text, not even with `debug=True`,
+  and session ids appear only hashed. A `subscriptions/listen` span lasts as
+  long as its stream and records why it ended (`easy_mcp.subscription.end`).
   `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns tracing off.
 - `MCPServer(metrics=True)` serves Prometheus text at `GET /metrics` on the
   HTTP transports, with no new dependency:
@@ -407,25 +407,30 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `mcp_server_session_duration_seconds` histograms (the conventions'
   buckets), and `easy_mcp_tool_calls_total` (by outcome: `ok`,
   `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`,
-  `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, and
-  `refused` or `internal_error` from tool middleware),
+  `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, `refused`
+  before the tool ran, by middleware or for a session gone or a shared store
+  out of reach, and `internal_error` when a middleware failed),
   `easy_mcp_tool_calls_active`, `easy_mcp_tool_finished_after_cancel_total`,
-  `easy_mcp_sync_workers_in_use`, `easy_mcp_sessions_open`,
-  `easy_mcp_subscriptions_open` and `easy_mcp_rejected_total` (requests
-  refused before dispatch, by reason). With auth configured the endpoint
-  needs a key or token holding the `metrics:read` scope
-  (`easy_mcp.METRICS_SCOPE`), or a key holding `*`; without auth it answers
-  only local requests addressed to a loopback host. Scrapes count against
-  the rate limit, and refusals are audited as `metrics_denied`. With
-  OpenTelemetry installed the same metrics are also recorded through its
-  metrics API, which is how a stdio server exports them; over stdio no port
-  is opened, and `server.render_metrics()` returns the text. `--metrics`
-  enables it on `easy-mcp run` and on the connectors.
+  `easy_mcp_sync_workers_in_use` (threads of sync tools, resources, prompts
+  and completers), `easy_mcp_sessions_open`, `easy_mcp_subscriptions_open`
+  and `easy_mcp_rejected_total` (requests refused before dispatch, by
+  reason). With auth configured the endpoint needs a key or token holding
+  the `metrics:read` scope (`easy_mcp.METRICS_SCOPE`), or a key holding `*`,
+  and a token without it gets an `insufficient_scope` challenge; without
+  auth it answers only local requests addressed to a loopback host. Scrapes
+  count against the rate limit, and refusals are audited as
+  `metrics_denied`. With OpenTelemetry installed the same metrics are also
+  recorded through its metrics API, which is how a stdio server exports
+  them; over stdio no port is opened, and `server.render_metrics()` returns
+  the text. `--metrics` enables it on `easy-mcp run` and on the connectors.
 - JSON log lines written while a traced request is handled carry `trace_id`
   and `span_id`.
 - The startup log event carries `metrics` and `tracing`.
 - For custom stores: `ExpiredSession.idle_ms`, how long a session found
   expired had been idle, so its duration ends at its last activity.
+  `RedisStore` knows neither its `t0` nor its idle time for a session found
+  expired (its record lapsed with its TTL), so with it an HTTP session that
+  expires idle is counted closed but has no session duration sample.
 
 ### Changed
 

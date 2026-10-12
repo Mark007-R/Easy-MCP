@@ -72,7 +72,7 @@ Consequences:
 | Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
 | Metrics disclosure | `/metrics` is off unless `metrics=True`. With auth configured it needs an API key or token holding `metrics:read` (a key's `*` too; a token's `*` is no wildcard). Without auth only a loopback peer that addressed a loopback `Host` gets it, so neither a remote host (which can forge `Host`) nor a DNS-rebinding page in a local browser (which cannot) can read it. The `Origin` allowlist applies, scrapes spend the rate limit, and refusals are audited (`metrics_denied`). Metrics carry no client ids, key fingerprints, session ids, addresses or request ids |
-| Telemetry injection and cardinality | Method names outside the MCP method set are recorded as `_OTHER`, tool and prompt names only for registered ones, request ids cut to 128 characters and resource URIs to 512 (spans only, never span names or metric labels); trace-context values are read only from `traceparent`, `tracestate` and `baggage`, capped at 8192 characters and parsed only by the W3C parser, which ignores malformed ones. Each metric keeps at most 2000 series, folding the rest into `_OTHER`. Rate-limited and transport-refused messages create no span. Spans hold no arguments, results, exception text, headers or raw session ids (a SHA-256 digest stands in); a failed call carries its `error_id` |
+| Telemetry injection and cardinality | Method names outside the MCP method set are recorded as `_OTHER`, tool and prompt names only for registered ones, request ids cut to 128 characters and resource URIs to 512 (spans only, never span names or metric labels); trace-context values are read only from `traceparent`, `tracestate` and `baggage`, capped at 8192 characters and parsed only by the W3C parser, which ignores malformed ones. Each metric keeps at most 2000 series, folding the rest into `_OTHER`. Rate-limited and transport-refused messages create no span. Spans hold no arguments, results, exception text, headers or raw session ids (a SHA-256 digest stands in), not even with `debug=True`; a failed call carries its `error_id` |
 | Telemetry failures | Every telemetry step is guarded: a broken span processor, exporter or SDK never changes an answer (the first failure is logged as a warning, later ones at debug level), and the server never waits on an exporter |
 
 ## Transport trust boundaries
@@ -393,7 +393,10 @@ the client is untrusted, the credential in the environment is trusted.
   and its span names the tool, so probing for protected tools shows there.
 - **Metrics are per process.** With several workers behind one port, a
   scrape reaches one of them; `easy_mcp_sessions_open` can go negative on a
-  worker that ends a session another opened (sum it across workers).
+  worker that ends a session another opened (sum it across workers). With a
+  shared store, an HTTP session that expires idle is counted closed but gets
+  no `mcp_server_session_duration_seconds` sample: its record, with the time
+  it opened, lapsed with its TTL.
 - **A local reverse proxy can open `/metrics` without auth.** It connects
   from loopback; one that also rewrites `Host` to `localhost` passes the
   local-only check for anyone who reaches it. Configure auth behind a proxy.

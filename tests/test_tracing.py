@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -36,6 +37,7 @@ from conftest import (
 from easy_mcp import APIKeyAuth, MCPServer, ToolError
 from easy_mcp.cancellation import current_cancel_token
 from easy_mcp.exceptions import (
+    FORBIDDEN,
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -44,6 +46,8 @@ from easy_mcp.exceptions import (
     SERVER_BUSY,
     SESSION_LIMIT_EXCEEDED,
     TOOL_TIMEOUT,
+    AuthorizationError,
+    ProtocolError,
 )
 from easy_mcp.logging import JSONLogFormatter
 from easy_mcp.middleware import RequestInfo, RequestNext, RequestOutcome, TransportInfo
@@ -60,7 +64,7 @@ from opentelemetry.trace import SpanKind, StatusCode  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KEY = "tracing-test-key-" + "k" * 15
-SECRET = "do-not-leak-" + "s" * 10
+CANARY = "do-not-leak-" + "s" * 10
 
 TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 CLIENT_SPAN = "00f067aa0ba902b7"
@@ -496,6 +500,67 @@ async def test_internal_error_carries_its_error_id(otel: Otel, logs: LogCapture)
     assert any(error_id in record.getMessage() for record in logs.records)
 
 
+async def test_calls_ended_by_request_middleware_carry_a_status(otel: Otel) -> None:
+    server = otel.server()
+    entered = asyncio.Event()
+
+    @server.tool
+    def denied() -> str:
+        """Refused by the gate."""
+        return "ran"
+
+    @server.tool
+    def forbidden() -> str:
+        """Not this caller's, says the gate."""
+        return "ran"
+
+    @server.tool
+    def broken() -> str:
+        """The gate fails on it."""
+        return "ran"
+
+    @server.tool
+    def stalled() -> str:
+        """The gate holds it until it is cancelled."""
+        return "ran"
+
+    @server.middleware
+    async def gate(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        tool = request.tool.name if request.tool is not None else None
+        if tool == "denied":
+            raise ProtocolError("not today", code=INVALID_REQUEST)
+        if tool == "forbidden":
+            raise AuthorizationError("not yours")
+        if tool == "broken":
+            raise RuntimeError("gate bug")
+        if tool == "stalled":
+            entered.set()
+            await asyncio.sleep(30)
+        return await call_next()
+
+    context = make_context()
+    for msg_id, name in enumerate(["denied", "forbidden", "broken"], start=1):
+        await server.dispatch(call(name, {}, msg_id), context)
+    task = asyncio.create_task(server.dispatch(call("stalled", {}, 4), context))
+    await asyncio.wait_for(entered.wait(), 10)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 4}), context)
+    assert await asyncio.wait_for(task, 10) is None
+    by_id = {
+        span.attributes["jsonrpc.request.id"]: span
+        for span in otel.spans()
+        if span.name.startswith("tools/call")
+    }
+    error, unset = StatusCode.ERROR, StatusCode.UNSET
+    refused = str(INVALID_REQUEST)
+    assert classification(by_id["1"]) == (None, refused, unset, "refused")
+    # -32002 is never an error (it is also "resource not found"); the call
+    # still counts as unauthorized.
+    assert classification(by_id["2"]) == (None, str(FORBIDDEN), unset, "unauthorized")
+    internal = str(INTERNAL_ERROR)
+    assert classification(by_id["3"]) == (internal, internal, error, "internal_error")
+    assert classification(by_id["4"]) == (None, None, unset, "cancelled")
+
+
 async def test_minus_32002_is_never_an_error(otel: Otel) -> None:
     server = otel.server()
 
@@ -549,6 +614,68 @@ async def test_resource_and_prompt_spans(otel: Otel) -> None:
     assert "gen_ai.prompt.name" not in by_id["4"].attributes
     assert by_id["5"].name == "completion/complete greet"
     assert by_id["5"].attributes["gen_ai.prompt.name"] == "greet"
+
+
+async def test_prompt_name_labels_the_duration_histogram(otel: Otel) -> None:
+    # The conventions make gen_ai.prompt.name conditionally required on
+    # mcp.server.operation.duration, as gen_ai.tool.name is.
+    server = otel.server(metrics=True)
+
+    @server.prompt(complete={"topic": ["alpha", "beta"]})
+    def greet(topic: str) -> str:
+        """Greets about a topic."""
+        return f"Hello about {topic}"
+
+    @server.prompt
+    def bye() -> str:
+        """Says goodbye."""
+        return "Goodbye"
+
+    context = make_context()
+    stdio = TransportInfo("stdio")
+    for msg_id, params in enumerate(
+        [
+            {"name": "greet", "arguments": {"topic": "x"}},
+            {"name": "bye"},
+            {"name": "greet", "arguments": {"topic": "y"}},
+            {"name": "nobody"},
+        ]
+    ):
+        await server.dispatch(rpc("prompts/get", params, msg_id), context, transport=stdio)
+    complete = {
+        "ref": {"type": "ref/prompt", "name": "greet"},
+        "argument": {"name": "topic", "value": "a"},
+    }
+    await server.dispatch(rpc("completion/complete", complete, 9), context, transport=stdio)
+
+    counts: dict[tuple[str, str | None], float] = {}
+    for series, value in parse_exposition(server.render_metrics()).items():
+        if series.startswith(f"{DURATION}_count{{"):
+            labels = dict(re.findall(r'(\w+)="([^"]*)"', series))
+            key = (labels["mcp_method_name"], labels.get("gen_ai_prompt_name"))
+            counts[key] = counts.get(key, 0) + value
+    assert counts == {
+        ("prompts/get", "greet"): 2,
+        ("prompts/get", "bye"): 1,
+        ("prompts/get", None): 1,  # an unregistered prompt is no label value
+        ("completion/complete", "greet"): 1,
+    }
+
+    data = otel.reader.get_metrics_data()
+    points = [
+        point
+        for resource in data.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == "mcp.server.operation.duration"
+        for point in metric.data.data_points
+    ]
+    mirrored: dict[tuple[str, str | None], int] = {}
+    for point in points:
+        attributes = point.attributes
+        key = (attributes["mcp.method.name"], attributes.get("gen_ai.prompt.name"))
+        mirrored[key] = mirrored.get(key, 0) + point.count
+    assert mirrored == counts
 
 
 async def test_listen_stream_span_and_gauge(otel: Otel) -> None:
@@ -660,17 +787,56 @@ async def test_no_arguments_results_or_exception_text_in_spans(
         return text
 
     context = make_context()
-    failed = await server.dispatch(call("leak", {"password": SECRET}, 1), context)
-    echoed = await server.dispatch(call("echo", {"text": SECRET}, 2), context)
-    assert echoed is not None and echoed["result"]["content"][0]["text"] == SECRET
+    failed = await server.dispatch(call("leak", {"password": CANARY}, 1), context)
+    echoed = await server.dispatch(call("echo", {"text": CANARY}, 2), context)
+    assert echoed is not None and echoed["result"]["content"][0]["text"] == CANARY
     for span in otel.spans():
-        assert SECRET not in span.to_json()
+        assert CANARY not in span.to_json()
         assert span.events == ()
     span = only(otel, "tools/call leak")
     error_id = span.attributes["easy_mcp.error_id"]
     assert failed is not None
     assert f"error_id={error_id}" in failed["result"]["content"][0]["text"]
     assert any(f"error_id={error_id}" in record.getMessage() for record in logs.records)
+
+
+async def test_debug_mode_puts_no_exception_text_in_spans(otel: Otel) -> None:
+    # In debug mode the client's -32603 message carries the exception and,
+    # for user code, its traceback; the span's status description must not.
+    server = otel.server(debug=True)
+
+    @server.resource("config://app")
+    def app_config() -> str:
+        """Fails with detail in its message."""
+        raise RuntimeError(f"cannot connect with {CANARY}")
+
+    @server.prompt
+    def greet() -> str:
+        """Fails with detail in its message."""
+        raise RuntimeError(f"cannot render with {CANARY}")
+
+    @server.middleware
+    async def gate(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        if request.method == "ping":
+            raise ValueError(f"middleware saw {CANARY}")
+        return await call_next()
+
+    context = make_context()
+    answers = {
+        "1": await server.dispatch(rpc("resources/read", {"uri": "config://app"}, 1), context),
+        "2": await server.dispatch(rpc("prompts/get", {"name": "greet"}, 2), context),
+        "3": await server.dispatch(rpc("ping", msg_id=3), context),
+    }
+    by_id = {span.attributes["jsonrpc.request.id"]: span for span in otel.spans()}
+    for msg_id, answer in answers.items():
+        assert answer is not None and answer["error"]["code"] == INTERNAL_ERROR
+        assert CANARY in answer["error"]["message"]  # debug mode: the client is told
+        span = by_id[msg_id]
+        assert CANARY not in span.to_json() and "Traceback" not in span.to_json()
+        assert span.status.status_code is StatusCode.ERROR
+        error_id = span.attributes["easy_mcp.error_id"]
+        assert span.status.description == f"Internal server error (error_id={error_id})"
+        assert f"error_id={error_id}" in answer["error"]["message"]
 
 
 async def test_session_id_is_hashed(otel: Otel) -> None:

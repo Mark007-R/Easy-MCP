@@ -1158,7 +1158,8 @@ audit event leads to its trace and a trace to its log lines.
 A tool call's span also carries `easy_mcp.status` (the outcome, as in the
 metrics below) and, when the client was given one, the `easy_mcp.error_id`
 the log has the traceback under. Spans never contain tool arguments, results
-or exception text, and session ids appear only as a hash. A cancelled request
+or exception text, not even with `debug=True`, and session ids appear only as
+a hash. A cancelled request
 is not an error (its status stays unset); a timeout is. Set
 `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` to turn tracing off.
 
@@ -1171,23 +1172,26 @@ exporter writes to stdout unless told otherwise, so pass `out=sys.stderr`
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `mcp_server_operation_duration_seconds` | histogram | `mcp_method_name`, `gen_ai_operation_name`, `gen_ai_tool_name`, `error_type`, `rpc_response_status_code`, `mcp_protocol_version`, `network_transport`, `network_protocol_name` | time from receiving a message to its answer; cancelled requests and established `subscriptions/listen` streams are not sampled |
-| `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name` | how long handshake-era sessions lasted (an idle one up to its last activity) |
-| `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, and `refused` or `internal_error` from tool middleware |
+| `mcp_server_operation_duration_seconds` | histogram | `mcp_method_name`, `gen_ai_operation_name`, `gen_ai_tool_name`, `gen_ai_prompt_name`, `error_type`, `rpc_response_status_code`, `mcp_protocol_version`, `network_transport`, `network_protocol_name` | time from receiving a message to its answer; cancelled requests and established `subscriptions/listen` streams are not sampled |
+| `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name` | how long handshake-era sessions lasted (an idle one up to its last activity); with a shared store, a session that expires idle is counted closed in `easy_mcp_sessions_open` but not sampled here, since the store no longer knows when it opened |
+| `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, `refused` (before the tool ran: by middleware, or because the session was gone or the shared store out of reach) and `internal_error` (a middleware failed) |
 | `easy_mcp_tool_calls_active` | gauge | `gen_ai_tool_name` | calls between their validation and their answer |
-| `easy_mcp_sync_workers_in_use` | gauge | | sync tool threads holding a `max_sync_workers` slot, those a timed-out tool still holds included |
+| `easy_mcp_sync_workers_in_use` | gauge | | threads of sync tools, resources, prompts and completers holding a `max_sync_workers` slot, those a timed-out call still holds included |
 | `easy_mcp_tool_finished_after_cancel_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | sync tools that finished after their call was cancelled or timed out |
 | `easy_mcp_sessions_open` | gauge | `easy_mcp_transport` | handshake-era sessions this process holds |
 | `easy_mcp_subscriptions_open` | gauge | `easy_mcp_transport` | open `subscriptions/listen` streams |
 | `easy_mcp_rejected_total` | counter | `easy_mcp_reason` | requests refused before dispatch: `rate_limited`, `unauthenticated`, `origin`, `credential_mismatch`, `header_mismatch`, `payload_too_large`, `too_many_sessions`, `auth_rate_limited`, `store_unavailable` |
 
 Labels hold only bounded, server-chosen values: method names outside the MCP
-method set are `_OTHER`, tools only registered ones. No client ids, key
-fingerprints, session ids, addresses or request ids. Alert on
+method set are `_OTHER`, tools and prompts only registered ones. No client
+ids, key fingerprints, session ids, addresses or request ids. Alert on
 `rate(easy_mcp_tool_calls_total{easy_mcp_status="busy"}[5m]) > 0` to see
-`max_sync_workers` saturating; the gap between `easy_mcp_tool_calls_active`
-and `easy_mcp_sync_workers_in_use` is the threads tools that ignore their
-cancel token left behind.
+`max_sync_workers` saturating. `easy_mcp_sync_workers_in_use` counts the
+threads of sync tools, resources, prompts and completers, those tools that
+ignore their cancel token left behind included, while
+`easy_mcp_tool_calls_active` counts tool calls only (async ones too, which
+hold no thread): threads in use with no tool call active are such leftovers,
+or a sync resource, prompt or completion call in flight.
 
 With auth configured, `/metrics` needs an API key or token that holds the
 `metrics:read` scope (`easy_mcp.METRICS_SCOPE`; a key holding `*` passes too).
@@ -1468,7 +1472,10 @@ prefer returning compact structures over huge strings.
   nothing caps its size: serve large data in pieces through a template.
 - Metrics are per process: with several workers behind one port, each scrape
   reaches one of them. Give each worker a scrape target of its own, or push
-  with OpenTelemetry and a per-instance resource. Trace and metric exporters
+  with OpenTelemetry and a per-instance resource. With a shared store, a
+  session that expires idle is counted closed but not sampled in
+  `mcp_server_session_duration_seconds`: no worker knows when it opened any
+  more. Trace and metric exporters
   run in your process: use batch span processors and a periodic metric
   reader. With `metrics=True` behind a reverse proxy on the same machine,
   configure auth: the proxy connects from loopback, and one that also sends

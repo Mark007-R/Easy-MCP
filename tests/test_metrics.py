@@ -30,6 +30,7 @@ from conftest import (
     rpc,
     scrape,
 )
+from shared_store_fake import FakeHub
 
 from easy_mcp import (
     METRICS_SCOPE,
@@ -41,11 +42,14 @@ from easy_mcp import (
 )
 from easy_mcp.exceptions import (
     INVALID_PARAMS,
+    INVALID_REQUEST,
     RATE_LIMITED,
     SERVER_BUSY,
     TOOL_TIMEOUT,
+    AuthorizationError,
+    ProtocolError,
 )
-from easy_mcp.middleware import TransportInfo
+from easy_mcp.middleware import RequestInfo, RequestNext, RequestOutcome, TransportInfo
 from easy_mcp.telemetry.prometheus import (
     CONTENT_TYPE,
     DURATION_BUCKETS,
@@ -319,6 +323,72 @@ async def exercise(
     assert await asyncio.wait_for(held, 10) is not None
 
 
+def add_gate(server: MCPServer) -> asyncio.Event:
+    """Tools a request middleware ends before ``call_next()``, one way each.
+
+    Returns the event set once the middleware holds ``stalled``.
+    """
+    entered = asyncio.Event()
+
+    @server.tool
+    def denied() -> str:
+        """Refused by the gate."""
+        return "ran"
+
+    @server.tool
+    def forbidden() -> str:
+        """Not this caller's, says the gate."""
+        return "ran"
+
+    @server.tool
+    def broken() -> str:
+        """The gate fails on it."""
+        return "ran"
+
+    @server.tool
+    def scolded() -> str:
+        """The gate answers it with a ToolError."""
+        return "ran"
+
+    @server.tool
+    def stalled() -> str:
+        """The gate holds it until it is cancelled."""
+        return "ran"
+
+    @server.middleware
+    async def gate(request: RequestInfo, call_next: RequestNext) -> RequestOutcome:
+        tool = request.tool.name if request.tool is not None else None
+        if tool == "denied":
+            raise ProtocolError("not today", code=INVALID_REQUEST)
+        if tool == "forbidden":
+            raise AuthorizationError("not yours")
+        if tool == "broken":
+            raise RuntimeError("gate bug")
+        if tool == "scolded":
+            raise ToolError("ask nicely")
+        if tool == "stalled":
+            entered.set()
+            await asyncio.sleep(30)
+        return await call_next()
+
+    return entered
+
+
+async def exercise_gate(server: MCPServer, entered: asyncio.Event) -> dict[int, str]:
+    """Call each tool of add_gate() once; returns the tool each request id named."""
+    context = make_context()
+    called = dict(enumerate(["denied", "forbidden", "broken", "scolded", "stalled"], start=60))
+    for msg_id, name in list(called.items())[:-1]:
+        response = await server.dispatch(rpc("tools/call", {"name": name}, msg_id), context)
+        assert response is not None
+    task = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "stalled"}, 64), context))
+    await asyncio.wait_for(entered.wait(), 10)
+    cancel = notification("notifications/cancelled", {"requestId": 64})
+    assert await server.dispatch(cancel, context) is None
+    assert await asyncio.wait_for(task, 10) is None
+    return called
+
+
 async def test_tool_call_statuses_are_counted() -> None:
     server, holding, release = outcome_server()
     await exercise(server, holding, release, hidden=True)
@@ -341,14 +411,85 @@ async def test_tool_call_statuses_are_counted() -> None:
 
 async def test_status_counts_match_audit_events(logs: LogCapture) -> None:
     server, holding, release = outcome_server()
+    entered = add_gate(server)
+    # A hidden tool's call is never audited (a known limitation), so it is
+    # the one outcome left out here.
     await exercise(server, holding, release, hidden=False)
+    called = await exercise_gate(server, entered)
     audited: Counter[tuple[str, str]] = Counter()
     for event in logs.events("tool_call"):
         audited[(event["tool"], event["status"])] += 1
     denial = {"ValidationError": "invalid_arguments", "SessionLimitError": "session_limit"}
     for event in logs.events("tool_denied"):
         audited[(event["tool"], denial[event["reason"]])] += 1
+    # What request middleware ended before the tool-level processing.
+    refusal = {
+        "ProtocolError": "refused",
+        "AuthorizationError": "unauthorized",
+        "ToolError": "tool_error",
+    }
+    for event in logs.events("request_denied"):
+        audited[(event["tool"], refusal[event["reason"]])] += 1
+    for event in logs.events("middleware_failed"):
+        audited[(event["tool"], "internal_error")] += 1
+    for event in logs.events("tool_cancelled"):
+        audited[(called[event["request_id"]], "cancelled")] += 1
     assert tool_calls(server) == audited
+    assert len(audited) == 15  # every outcome above, the gate's five included
+
+
+async def test_calls_ended_by_request_middleware_are_counted(logs: LogCapture) -> None:
+    server, _, _ = outcome_server()
+    entered = add_gate(server)
+    await exercise_gate(server, entered)
+    assert tool_calls(server) == Counter(
+        {
+            ("denied", "refused"): 1,
+            ("forbidden", "unauthorized"): 1,
+            ("broken", "internal_error"): 1,
+            ("scolded", "tool_error"): 1,
+            ("stalled", "cancelled"): 1,
+        }
+    )
+    samples = metrics_of(server)
+    # Answered ones are sampled; the cancelled one sent no answer.
+    calls = find(samples, f"{DURATION}_count", mcp_method_name="tools/call")
+    assert {found["gen_ai_tool_name"] for found, _ in calls} == {
+        "denied",
+        "forbidden",
+        "broken",
+        "scolded",
+    }
+    assert len(logs.events("tool_cancelled")) == 1
+
+
+async def test_call_cancelled_while_its_unit_is_reserved_is_counted() -> None:
+    hub = FakeHub()
+    server = make_server(store=hub.store("worker-a"))
+    reserving = asyncio.Event()
+
+    @server.tool(max_calls_per_session=3)
+    def scarce() -> str:
+        """Three calls a session."""
+        return "ran"
+
+    async def stall() -> None:
+        reserving.set()
+        await asyncio.sleep(30)
+
+    transport = StreamableHTTPTransport(server, legacy_sse=False)
+    async with asgi(transport.build_app()) as http:
+        opened = await http.post("/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        headers = {**ACCEPT, "MCP-Session-Id": opened.headers["mcp-session-id"]}
+        hub.before_reserve = stall
+        message = rpc("tools/call", {"name": "scarce"}, 2)
+        pending = asyncio.create_task(http.post("/mcp", json=message, headers=headers))
+        await asyncio.wait_for(reserving.wait(), 10)
+        cancel = notification("notifications/cancelled", {"requestId": 2})
+        assert (await http.post("/mcp", json=cancel, headers=headers)).status_code == 202
+        await asyncio.wait_for(pending, 10)
+    # Cancelled before the tool-level processing began: counted all the same.
+    assert tool_calls(server) == Counter({("scarce", "cancelled"): 1})
 
 
 async def test_hidden_tool_is_counted_as_unauthorized(logs: LogCapture) -> None:
@@ -527,6 +668,41 @@ async def test_active_and_worker_gauges_track_a_blocked_sync_tool() -> None:
     assert await server.wait_for_tool_threads(10) == 0
 
 
+async def test_sync_workers_gauge_counts_every_sync_callable() -> None:
+    server = make_server()
+    entered = threading.Event()
+    release = threading.Event()
+
+    @server.resource("file:///blocked.txt")
+    def blocked() -> str:
+        """Holds its worker thread until released."""
+        entered.set()
+        release.wait(30)
+        return "done"
+
+    read = rpc("resources/read", {"uri": "file:///blocked.txt"})
+    task = asyncio.create_task(server.dispatch(read, make_context()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        samples = metrics_of(server)
+        # A sync resource takes a max_sync_workers slot as a sync tool does,
+        # and is no tool call.
+        assert samples["easy_mcp_sync_workers_in_use"] == 1
+        assert find(samples, "easy_mcp_tool_calls_active") == []
+    finally:
+        release.set()
+    response = await asyncio.wait_for(task, 10)
+    assert response is not None and "result" in response
+    await wait_until(lambda: metrics_of(server)["easy_mcp_sync_workers_in_use"] == 0)
+    text = server.render_metrics()
+    (described,) = [
+        line
+        for line in text.splitlines()
+        if line.startswith("# HELP easy_mcp_sync_workers_in_use ")
+    ]
+    assert "resources, prompts and completers" in described
+
+
 async def test_late_finish_is_counted() -> None:
     server = make_server()
     entered = threading.Event()
@@ -598,7 +774,7 @@ async def test_metrics_endpoint_with_auth_requires_scope(logs: LogCapture) -> No
         assert wrong.status_code == 401
         unscoped = await http.get("/metrics", headers=bearer(APP_KEY))
         assert unscoped.status_code == 403
-        assert unscoped.json() == {"error": "the key lacks the 'metrics:read' scope"}
+        assert unscoped.json() == {"error": "the credential lacks the 'metrics:read' scope"}
         scraper = await http.get("/metrics", headers=bearer(SCRAPE_KEY))
         assert scraper.status_code == 200
         admin = await http.get("/metrics", headers={"X-API-Key": ADMIN_KEY})
@@ -628,6 +804,13 @@ def test_metrics_endpoint_with_oauth_needs_the_scope(
         # A token's "*" is a scope like any other, not a wildcard.
         star = client.get("/metrics", headers=bearer(fake_as.mint(claims={"scope": "*"})))
         assert star.status_code == 403
+        # Either way the token is told which scope to ask for (RFC 6750 3.1).
+        for refused in (plain, star):
+            challenge = refused.headers["www-authenticate"]
+            assert challenge.startswith("Bearer ")
+            assert 'error="insufficient_scope"' in challenge
+            assert METRICS_SCOPE in challenge
+            assert refused.json() == {"error": "the credential lacks the 'metrics:read' scope"}
         scoped = fake_as.mint(claims={"scope": f"mcp:access {METRICS_SCOPE}"})
         allowed = client.get("/metrics", headers=bearer(scoped))
         assert allowed.status_code == 200
@@ -790,6 +973,46 @@ async def test_idle_expired_session_duration_uses_last_seen(
     assert total(samples, f"{SESSION_DURATION}_count") == 1
     # Up to its last activity (2 s in), not to when the expiry was found (62 s).
     assert total(samples, f"{SESSION_DURATION}_sum") == pytest.approx(2.0, abs=0.01)
+
+
+async def test_shared_store_idle_expiry_has_no_session_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With a shared store a worker keeps nothing about an idle HTTP session,
+    # and the store's record, its open time with it, lapses with its TTL: a
+    # session found expired is counted closed, but its duration is unknown.
+    # One ended by DELETE is measured.
+    idle_clock = Clock(1000.0)
+    wall = Clock(1_800_000_000.0)
+    monkeypatch.setattr(time, "time", wall)
+    server = make_server(store=FakeHub(clock=idle_clock).store("worker-a"))
+    transport = StreamableHTTPTransport(server, session_idle_timeout=5, legacy_sse=False)
+    gauge = 'easy_mcp_sessions_open{easy_mcp_transport="streamable-http"}'
+    async with asgi(transport.build_app()) as http:
+        first = await http.post("/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        idle = {**ACCEPT, "MCP-Session-Id": first.headers["mcp-session-id"]}
+        idle_clock.now += 2
+        wall.now += 2
+        assert (await http.post("/mcp", json=rpc("ping", msg_id=2), headers=idle)).is_success
+        idle_clock.now += 60
+        wall.now += 60
+        # Another client's initialize sweeps the expired session.
+        second = await http.post("/mcp", json=rpc("initialize", INIT, "init"), headers=ACCEPT)
+        assert second.status_code == 200
+        samples = metrics_of(server)
+        assert samples[gauge] == 1
+        assert find(samples, f"{SESSION_DURATION}_count") == []
+        assert (
+            await http.post("/mcp", json=rpc("ping", msg_id=3), headers=idle)
+        ).status_code == 404
+        idle_clock.now += 3
+        wall.now += 3
+        ending = {**ACCEPT, "MCP-Session-Id": second.headers["mcp-session-id"]}
+        assert (await http.delete("/mcp", headers=ending)).status_code == 204
+    samples = metrics_of(server)
+    assert samples[gauge] == 0
+    assert total(samples, f"{SESSION_DURATION}_count") == 1
+    assert total(samples, f"{SESSION_DURATION}_sum") == pytest.approx(3.0, abs=0.01)
 
 
 def _next_data(lines: Iterator[str]) -> str:

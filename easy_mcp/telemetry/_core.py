@@ -31,6 +31,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from ..exceptions import (
+    AUTHENTICATION_REQUIRED,
+    FORBIDDEN,
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
@@ -177,6 +180,7 @@ _DURATION_LABELS: Final[tuple[str, ...]] = (
     "mcp.method.name",
     "gen_ai.operation.name",
     "gen_ai.tool.name",
+    "gen_ai.prompt.name",
     "error.type",
     "rpc.response.status_code",
     "mcp.protocol.version",
@@ -310,7 +314,8 @@ class Telemetry:
             )
             self._sync_workers = registry.gauge(
                 "easy_mcp_sync_workers_in_use",
-                "Sync tool threads holding a max_sync_workers slot, abandoned ones included.",
+                "Threads of sync tools, resources, prompts and completers holding a "
+                "max_sync_workers slot, abandoned ones included.",
             )
             self._sessions_open = registry.gauge(
                 "easy_mcp_sessions_open", "Handshake-era sessions this process holds."
@@ -572,13 +577,17 @@ class Telemetry:
                 # middleware after it began still says what it answered.
                 sample = False
                 if response is not None:
-                    error_type, description = self._classify(plan, response, attributes)
+                    error_type, description = self._classify(
+                        plan, response, attributes, observation.error_id
+                    )
             elif cancelled or (response is None and not plan.notification):
                 # The client (or our caller) gave up on it: no result was
                 # sent, so there is no duration to sample, and no error.
                 sample = False
             elif response is not None:
-                error_type, description = self._classify(plan, response, attributes)
+                error_type, description = self._classify(
+                    plan, response, attributes, observation.error_id
+                )
             if error_type is not None:
                 attributes["error.type"] = error_type
             if observation.tool is not None and observation.tool_status is not None:
@@ -622,9 +631,14 @@ class Telemetry:
 
     @staticmethod
     def _classify(
-        plan: _Plan, response: dict[str, Any], attributes: dict[str, Any]
+        plan: _Plan, response: dict[str, Any], attributes: dict[str, Any], error_id: str | None
     ) -> tuple[str | None, str | None]:
-        """``(error.type, status description)`` for an answer; sets ``rpc.response.status_code``."""
+        """``(error.type, status description)`` for an answer; sets ``rpc.response.status_code``.
+
+        The description is the error's message, except for ``-32603``: in
+        debug mode its message carries the exception and its traceback, so
+        the span says only which ``error_id`` the log has them under.
+        """
         error = response.get("error")
         if isinstance(error, dict):
             code = error.get("code")
@@ -633,6 +647,10 @@ class Telemetry:
             attributes["rpc.response.status_code"] = str(code)
             if not is_error_code(code):
                 return None, None
+            if code == INTERNAL_ERROR:
+                if error_id is None:
+                    return str(code), "Internal server error"
+                return str(code), f"Internal server error (error_id={error_id})"
             message = error.get("message")
             description = message[:STATUS_DESCRIPTION_MAX] if isinstance(message, str) else None
             return str(code), description
@@ -660,6 +678,28 @@ class Telemetry:
             observation.tool_status = DENIAL_STATUSES.get(outcome._denial, "refused")
         elif outcome.tool is not None:
             observation.tool_status = outcome.tool.status
+
+    def note_request_outcome(self, outcome: RequestOutcome) -> None:
+        """Record what a ``tools/call`` was answered with once its request middleware returned.
+
+        Counts a call tool-level processing never reported on: one request
+        middleware refused (``unauthorized`` for ``-32001``/``-32002``, a
+        ``ToolError``'s ``tool_error``, ``refused`` otherwise) or failed on
+        (``internal_error``) before ``call_next()``.  A call already
+        reported keeps its status.
+        """
+        observation = _observation.get()
+        if observation is None or observation.tool is None or observation.tool_status is not None:
+            return
+        code = outcome.error_code
+        if outcome.tool is not None:
+            observation.tool_status = outcome.tool.status
+        elif code in (AUTHENTICATION_REQUIRED, FORBIDDEN):
+            observation.tool_status = "unauthorized"
+        elif code == INTERNAL_ERROR:
+            observation.tool_status = "internal_error"
+        elif code is not None:
+            observation.tool_status = "refused"
 
     def tool_cancelled(self) -> None:
         """The ``tools/call`` being served was cancelled wherever it was."""
@@ -818,6 +858,7 @@ class Telemetry:
         """
         if self.registry is None:
             raise RuntimeError(
-                "metrics are off: build the server with MCPServer(metrics=True) to collect them"
+                "metrics are off: build the server with MCPServer(metrics=True) to collect them "
+                "(setting server.metrics once it has built its app or dispatched has no effect)"
             )
         return self.registry.render()
