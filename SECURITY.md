@@ -225,7 +225,7 @@ Where they meet:
   broader token widens what it hears and a narrower one narrows it. A listen
   stream keeps the identity it opened with. Both end when the OAuth token
   they opened with expires; the legacy `/sse` stream does not, since every
-  POST to it is verified again.
+  message posted to its session (`POST /messages`) is verified again.
 - **Everything that streams, counts or traces is per process.** A scrape
   sees one worker; a listen hears the changes made in its own worker; a
   probe for hidden tools shows in telemetry (`easy_mcp_status="unauthorized"`
