@@ -473,11 +473,9 @@ middleware's error, over HTTP as the stream's last event. Once a stream has
 had its result, or its client cancelled it, an error raised after
 `call_next()` is not sent: a request gets one answer.
 
-A custom transport takes part by setting `ClientContext.push` (how the server
-sends on the client's channel) and `ClientContext.multiplexed`, and by calling
-`server.close_subscriptions(context)` when the channel ends, and again once
-the requests it was still running have finished (an `initialize` answered
-meanwhile starts the session's notifications anew).
+A custom transport takes part through `ClientContext.push`,
+`ClientContext.multiplexed` and `server.close_subscriptions()`; see
+[Custom transports](#custom-transports).
 
 ### Resource updates
 
@@ -1468,9 +1466,7 @@ The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
 so Streamable HTTP, SSE, and stdio all get the same checks, and a future
-WebSocket transport cannot silently bypass one. A custom transport should pass
-`transport=TransportInfo(name=..., headers=...)` to `dispatch`, so middleware
-knows how a message arrived.
+WebSocket transport cannot silently bypass one.
 
 **Determinism:** tool, resource and prompt listings are sorted, JSON output
 uses sorted keys, and identical inputs produce byte-identical responses — useful for reproducible
@@ -1482,6 +1478,67 @@ tools run natively. Schema validation is a small
 hand-written walker (no dependency, ~microseconds for typical payloads). The
 per-message overhead is dominated by JSON encode/decode; for large results
 prefer returning compact structures over huge strings.
+
+### Custom transports
+
+A transport moves messages; the server does everything else. A custom one (a
+WebSocket, a message queue) subclasses `Transport` and keeps this contract:
+
+- **A `ClientContext` per connection or session.** `client_id` is the
+  rate-limit key: the caller's `identity.fingerprint` when it authenticated,
+  an address such as `"ip:203.0.113.7"` otherwise. `session_id` names the
+  session the channel carries, uniquely. `tool_calls` and `in_flight` belong
+  to the server: a `notifications/cancelled` you dispatch cancels what
+  `in_flight` holds. `protocol_version` is set by the server when it answers
+  `initialize` (`None` before, and for stateless requests, which carry their
+  own); read it, never set it.
+- **Credentials.** `await server.authenticate_request(bearer=..., api_key=...,
+  client="ip:...")` resolves an API key or an OAuth token to a
+  `ClientIdentity` (`None` for anonymous access). It raises
+  `TokenRequiredError` or `InvalidTokenError` (answer `401`),
+  `InsufficientScopeError` (`403`) or `AuthServerUnavailableError` (`503`).
+  `server.authenticate_key(key)` checks an API key alone.
+- **Per-request identity.** When every request of a session carries its own
+  credential, resolve it on every request, refuse one whose
+  `identity.fingerprint` is not the session's (for a token that is its
+  principal's, so a refreshed token keeps the session), and dispatch the
+  request with `dataclasses.replace(context, identity=identity)` when the
+  identity differs from the context's. The copy shares the session's call
+  counts, calls in flight and channel, so caps, cancels and notifications
+  stay the session's, while scopes come from the request's own credential.
+- **Dispatch.** `await server.dispatch(message, context, transport=info)`
+  for each decoded message, each in a task of its own, and write back what
+  it returns (`None`: nothing to send). Cancelling that task is how a closed
+  connection cancels a call. `TransportInfo(name, client_address=...,
+  client_port=..., http_version=..., headers=...)` tells middleware how the
+  message arrived and drops credential headers itself. Telemetry adds network
+  attributes, and reads a `traceparent` header, only for the built-in names
+  (`"stdio"`, `"streamable-http"`, `"sse"`); without `transport=`,
+  middleware sees `"custom"`.
+- **Server-initiated messages.** Set `push` to a function that queues one
+  message on the channel. The server calls it on the event loop only; it
+  must not block, and it raises once the channel can take no more. The
+  contexts of one channel share one `push`. Set `multiplexed=True` when all
+  of the channel's subscriptions share it, as on stdio and `/sse`: a
+  subscription the server ends is then also announced with
+  `notifications/cancelled`. Without `push`, `subscriptions/listen` answers
+  `-32601` and the channel hears no list changes or resource updates. With
+  `push` and no `store_handle`, a successful `initialize` starts the
+  session's notifications as `dispatch` returns its result, so write that
+  result before awaiting anything else. A listen's `dispatch` returns only
+  when its stream ends: its acknowledgment and notifications go through
+  `push`, and whatever `dispatch` returns at the end is sent like any answer.
+- **Ending.** Call `server.close_subscriptions(context, reason=...)` when the
+  channel ends, and again once the requests it was still running have
+  finished (an `initialize` answered meanwhile starts the session's
+  notifications anew); it is idempotent. Serve inside
+  `async with server.lifespan(): ...`, which connects the store, fetches
+  OAuth keys and, at the end, gives tool threads 5 s.
+- **`store_handle`.** Leave it `None`: call counts, cancels and the rate
+  limit then stay in the process (`dispatch` charges `check_rate_limit()`),
+  as on stdio. The built-in HTTP transports set it from the store's session
+  records, which is what lets workers share them; `Store` and `StoreHandle`
+  are provisional until 1.0.
 
 ## Production deployment
 
