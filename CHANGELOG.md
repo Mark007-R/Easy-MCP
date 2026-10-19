@@ -130,7 +130,9 @@ change for existing servers, each listed under Changed; the README's
   `required_scopes` are needed by every request; on Streamable HTTP a
   `tools/call` whose token lacks them is also asked for the tool's scope, in
   the same challenge. Legacy SSE `POST /messages` checks the credential
-  before it reads the body, so its `403` asks only for `required_scopes`; a
+  before it reads the body, so its `403` never asks for the tool's scope: it
+  asks for `required_scopes` and, as every handshake-era challenge does,
+  lists the scopes the token already holds that this server checks; a
   missing tool scope arrives there as a `-32001` JSON-RPC error on the
   stream (`data.error = "insufficient_scope"`), not a `403`. A token's `*`
   scope is never a wildcard. The `401` and `insufficient_scope`

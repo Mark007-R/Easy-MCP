@@ -730,7 +730,11 @@ What clients see:
   asks the user for it; the broader token works at once, in the same session.
   Over legacy SSE the call is answered on the stream instead, with a `-32001`
   JSON-RPC error whose `data.error` is `"insufficient_scope"`, and the SSE
-  `403` (sent before the body is read) names only `required_scopes`.
+  `403` (sent before the body is read) never names a tool's scope: it asks
+  for `required_scopes` and, as every handshake-era `403` does, also lists
+  the scopes the token already holds that this server checks, so a client
+  asking again keeps them (its JSON-RPC `data.scope` lists only the missing
+  `required_scopes`).
   Pass `step_up=False` to keep protected tools invisible to
   tokens that cannot call them, as with API keys. A token's `*` scope is never
   a wildcard. Resources, templates and prompts follow the same rule: a
@@ -1051,7 +1055,10 @@ user's), `ip:<address>` for an anonymous HTTP client, or `stdio`. No event
 ever holds a key, a token, a secret, arguments, results, contents, prompt
 argument values, `_meta` or header values other than a refused `Origin`
 (`origin_rejected`, cut to 200 characters), and URIs are cut to 512
-characters. The last column says what changed since 0.3.1.
+characters (to 256, ending in `...`, in the `*_finished_after_cancel` events
+and in `cancel_callback_failed`'s `name`, so a URI longer than that is not
+spelled the same there as in its `resource_read`). The last column says what
+changed since 0.3.1.
 
 | Event | Logged when | Fields | 0.3.2 |
 |---|---|---|---|

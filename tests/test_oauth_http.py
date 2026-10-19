@@ -953,26 +953,34 @@ def test_legacy_sse_with_oauth(served: Any, fake_as: FakeAuthorizationServer) ->
             assert json.loads(next_data(lines))["result"]["content"][0]["text"] == "wrote a"
 
 
-def test_legacy_sse_door_403_asks_only_for_the_required_scopes(
+def test_legacy_sse_door_403_never_names_the_tools_scope(
     served: Any, fake_as: FakeAuthorizationServer
 ) -> None:
     # Streamable HTTP reads the call before its door check, so its 403 also
     # names the tool's scope.  Legacy SSE checks the credential before it
-    # reads the body: its 403 asks for required_scopes only (as the docs say).
+    # reads the body: its 403 asks for required_scopes and, as every
+    # handshake-era challenge does, lists the scopes the token holds that
+    # this server checks (an unrelated one is left out), as the docs say.
     base, _ = served()
-    lacking = bearer(fake_as.mint(claims={"scope": "files:read"}))
+    lacking = bearer(fake_as.mint(claims={"scope": "files:read email"}))
+    expected = (
+        'Bearer error="insufficient_scope", scope="mcp:access files:read", '
+        f'{RM}, error_description="Additional scope required"'
+    )
     with httpx.Client(base_url=base, timeout=10) as client:
         modern_door = stateless(client, modern_call("write_file", path="a"), lacking)
         assert modern_door.status_code == 403
         assert 'scope="mcp:access files:write"' in challenge(modern_door)
+        with client.stream("GET", "/sse", headers=lacking) as refused:
+            assert refused.status_code == 403
+            assert challenge(refused) == expected
         signed_in = bearer(fake_as.mint(claims={"scope": "mcp:access files:read"}))
         with client.stream("GET", "/sse", headers=signed_in) as stream:
             lines = stream.iter_lines()  # kept: dropping it would close the stream
             endpoint = next_data(lines)
             door = client.post(endpoint, json=call("write_file", 5, path="a"), headers=lacking)
             assert door.status_code == 403
-            assert 'error="insufficient_scope"' in challenge(door)
-            assert "files:write" not in challenge(door)
+            assert challenge(door) == expected
             assert rpc_body(door)["error"]["data"]["scope"] == "mcp:access"
 
 
