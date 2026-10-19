@@ -134,7 +134,7 @@ from .subscriptions import (
     parse_filter,
     valid_subscription_id,
 )
-from .telemetry._core import Telemetry, note_error_id
+from .telemetry._core import Telemetry, note_error_id, unobserved
 from .telemetry._otel import load_bridge
 from .transport._http import (
     LOOPBACK_HOSTS,
@@ -1466,20 +1466,16 @@ class MCPServer:
 
         # Telemetry is the outermost layer of what follows: built in, around
         # the user's middleware, so it measures and classifies every answer.
+        serve = functools.partial(
+            self._dispatch_message, method, params, msg_id, is_notification, context, transport
+        )
         if not telemetry.active:
-            return await self._dispatch_message(
-                method, params, msg_id, is_notification, context, transport
-            )
+            # Nothing is recorded here, and nothing this message reports may
+            # land on an enclosing one (another server's tool dispatching
+            # to this server in-process).
+            return await unobserved(serve)
         return await telemetry.observe(
-            method,
-            params,
-            msg_id,
-            is_notification,
-            context,
-            transport,
-            functools.partial(
-                self._dispatch_message, method, params, msg_id, is_notification, context, transport
-            ),
+            method, params, msg_id, is_notification, context, transport, serve
         )
 
     async def _dispatch_message(

@@ -249,6 +249,22 @@ def note_error_id(error_id: str) -> None:
         observation.error_id = error_id
 
 
+async def unobserved(
+    call: Callable[[], Awaitable[dict[str, Any] | None]],
+) -> dict[str, Any] | None:
+    """Serve a message through *call* with no observation of its own.
+
+    For a message the server records nothing about.  A tool may dispatch to
+    another server in-process: what that server's code reports (its tool's
+    status, its ``error_id``) must not land on the enclosing message.
+    """
+    reset = _observation.set(None)
+    try:
+        return await call()
+    finally:
+        _observation.reset(reset)
+
+
 @dataclass(slots=True, eq=False)
 class _Plan:
     """What is known about a message before it is served."""
@@ -401,7 +417,7 @@ class Telemetry:
             plan = self._plan(method, params, msg_id, is_notification, context, transport)
         except Exception:
             self._step_failed()
-            return await call()
+            return await unobserved(call)
         observation.tool = plan.attributes.get("gen_ai.tool.name")
         reset = _observation.set(observation)
         span: Any = None

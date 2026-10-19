@@ -42,8 +42,9 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--metrics",
         action="store_true",
-        help="serve GET /metrics (http/sse); needs a key with the metrics:read scope when "
-        "EASY_MCP_API_KEYS is set",
+        help="serve GET /metrics (http/sse); with EASY_MCP_API_KEYS or EASY_MCP_OAUTH_RESOURCE "
+        "set, needs a key or token holding the metrics:read scope; otherwise only local "
+        "requests are answered",
     )
     return parser
 

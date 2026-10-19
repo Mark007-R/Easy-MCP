@@ -174,6 +174,18 @@ def bearer_challenge(
     return value
 
 
+def _metrics_invalid_key() -> Response:
+    """``GET /metrics``' answer to an API key that matches none, on every transport.
+
+    No JSON-RPC body (it is no MCP endpoint), and a challenge, as every
+    ``401`` needs (RFC 9110 15.5.2).  With ``oauth``, the challenge is
+    replaced by the one saying where to sign in.
+    """
+    return JSONResponse(
+        {"error": "invalid API key"}, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+    )
+
+
 def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get("headers", ()):
         if key == name:
@@ -381,7 +393,12 @@ class BaseHTTPTransport(Transport):
         return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
 
     async def _resolve_identity(
-        self, request: Request, *, modern: bool, tool: str | None = None
+        self,
+        request: Request,
+        *,
+        modern: bool,
+        tool: str | None = None,
+        invalid_key: Callable[[], Response] | None = None,
     ) -> ClientIdentity | None | Response:
         """The request's identity, or the response that rejects its credential.
 
@@ -391,7 +408,9 @@ class BaseHTTPTransport(Transport):
         credential is challenged.  *modern* says which revision's challenge
         to send; *tool* is the tool a ``tools/call`` names, whose scope a
         token refused for ``required_scopes`` is asked for in the same
-        challenge.
+        challenge.  *invalid_key* builds the answer to an API key that
+        matches none (:meth:`_invalid_key_response` by default); with
+        ``oauth``, its ``WWW-Authenticate`` says where to sign in.
         """
         server = self._server
         if server.oauth is None:
@@ -405,11 +424,16 @@ class BaseHTTPTransport(Transport):
                 return server.authenticate_key(key)
             except AuthenticationError:
                 server._telemetry.rejected("unauthenticated")
-                return self._invalid_key_response()
-        return await self._resolve_oauth(request, modern=modern, tool=tool)
+                return (invalid_key or self._invalid_key_response)()
+        return await self._resolve_oauth(request, modern=modern, tool=tool, invalid_key=invalid_key)
 
     async def _resolve_oauth(
-        self, request: Request, *, modern: bool, tool: str | None = None
+        self,
+        request: Request,
+        *,
+        modern: bool,
+        tool: str | None = None,
+        invalid_key: Callable[[], Response] | None = None,
     ) -> ClientIdentity | None | Response:
         server = self._server
         oauth = server.oauth
@@ -528,7 +552,7 @@ class BaseHTTPTransport(Transport):
             # An X-API-Key that matches no key: the 0.3.1 answer, plus where
             # to sign in instead.
             server._telemetry.rejected("unauthenticated")
-            response = self._invalid_key_response()
+            response = (invalid_key or self._invalid_key_response)()
             response.headers["WWW-Authenticate"] = bearer_challenge(
                 metadata_url, scope=server._initial_scopes()
             )
@@ -612,9 +636,9 @@ class BaseHTTPTransport(Transport):
 
         In order: the credential, as on the MCP endpoint (``401``, with a
         ``Bearer`` challenge and, for an API key that matches none, the body
-        ``{"error": "invalid API key"}`` on every transport); one unit
-        of the caller's rate-limit budget (``429``); then, with auth
-        configured, a credential holding ``metrics:read`` or ``*`` (``401``
+        ``{"error": "invalid API key"}`` on every transport, with ``oauth``
+        too); one unit of the caller's rate-limit budget (``429``); then, with
+        auth configured, a credential holding ``metrics:read`` or ``*`` (``401``
         without one, ``403`` without the scope, with an ``insufficient_scope``
         challenge for an OAuth token), and without auth, a request
         from this machine addressed to a loopback host, through no proxy
@@ -623,20 +647,13 @@ class BaseHTTPTransport(Transport):
         """
         server = self._server
         peer = request.client.host if request.client else "unknown"
-        resolved = await self._resolve_identity(request, modern=False)
+        resolved = await self._resolve_identity(
+            request, modern=False, invalid_key=_metrics_invalid_key
+        )
         if isinstance(resolved, Response):
             denied = {401: "unauthenticated", 403: "insufficient_scope"}.get(resolved.status_code)
             if denied is not None:
                 audit("metrics_denied", reason=denied, client_id=f"ip:{peer}")
-            if resolved.status_code == 401 and server.oauth is None:
-                # The MCP endpoint's answer to a key that matches none is a
-                # JSON-RPC error without a challenge; every 401 needs one
-                # (RFC 9110 15.5.2).  OAuth's 401s carry theirs.
-                return JSONResponse(
-                    {"error": "invalid API key"},
-                    status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
             return resolved
         identity = resolved
         client_id = identity.fingerprint if identity is not None else f"ip:{peer}"

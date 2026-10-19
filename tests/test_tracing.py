@@ -59,8 +59,17 @@ from easy_mcp.transport.streamable_http import StreamableHTTPTransport
 
 pytest.importorskip("opentelemetry.sdk")
 
-from opentelemetry import baggage  # noqa: E402
+from opentelemetry import baggage, propagate  # noqa: E402
+from opentelemetry.context import Context  # noqa: E402
+from opentelemetry.propagators.textmap import (  # noqa: E402
+    TextMapPropagator,
+    default_getter,
+    default_setter,
+)
 from opentelemetry.trace import SpanKind, StatusCode  # noqa: E402
+from opentelemetry.trace.propagation.tracecontext import (  # noqa: E402
+    TraceContextTextMapPropagator,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KEY = "tracing-test-key-" + "k" * 15
@@ -299,6 +308,43 @@ async def test_repeated_traceparent_header_is_ignored(otel: Otel) -> None:
     assert span.parent is None and span.links == ()
 
 
+class MixedCaseField(TextMapPropagator):
+    """W3C trace context carried in one header whose name has capitals, as X-Ray's is."""
+
+    FIELD = "X-Test-Trace"
+
+    def extract(self, carrier: Any, context: Any = None, getter: Any = default_getter) -> Context:
+        values = getter.get(carrier, self.FIELD)
+        if not values:
+            return context if context is not None else Context()
+        return TraceContextTextMapPropagator().extract({"traceparent": values[0]}, context)
+
+    def inject(self, carrier: Any, context: Any = None, setter: Any = default_setter) -> None:
+        pass
+
+    @property
+    def fields(self) -> set[str]:
+        return {self.FIELD}
+
+
+async def test_header_of_a_propagator_with_capitals_is_parent(otel: Otel) -> None:
+    # Header names arrive lowercased; a propagator names its fields as it
+    # likes (X-Ray's is X-Amzn-Trace-Id), and HTTP header names have no case.
+    server = otel.server()
+    add_tool(server)
+    message = modern("tools/call", {"name": "add", "arguments": {"a": 1, "b": 2}})
+    previous = propagate.get_global_textmap()
+    propagate.set_global_textmap(MixedCaseField())
+    try:
+        answer = await post_stateless(server, message, **{"X-Test-Trace": HEADER_TRACEPARENT})
+    finally:
+        propagate.set_global_textmap(previous)
+    assert answer.status_code == 200
+    span = only(otel, "tools/call add")
+    assert hex_id(span.context.trace_id, 32) == HEADER_TRACE
+    assert span.parent is not None and hex_id(span.parent.span_id, 16) == HEADER_SPAN
+
+
 async def test_ambient_span_is_parent_without_meta(otel: Otel) -> None:
     server = otel.server()
     add_tool(server)
@@ -498,6 +544,33 @@ async def test_internal_error_carries_its_error_id(otel: Otel, logs: LogCapture)
     assert span.attributes["error.type"] == str(INTERNAL_ERROR)
     assert span.status.status_code is StatusCode.ERROR
     assert any(error_id in record.getMessage() for record in logs.records)
+
+
+async def test_inner_server_lends_the_outer_span_no_error_id(otel: Otel) -> None:
+    # A tool forwarding to an in-process server that records nothing: the
+    # inner tool's failure and error_id stay off the outer call's span.
+    outer = otel.server()
+    inner = MCPServer(port=0, rate_limit_per_minute=None)
+    inner._telemetry_state = Telemetry(inner, metrics=False, otel=None)
+
+    @inner.tool
+    async def boom() -> str:
+        """Fails."""
+        raise RuntimeError("inner failure")
+
+    @outer.tool
+    async def relay() -> str:
+        """Forwards a call to the inner server."""
+        answer = await inner.dispatch(call("boom", msg_id=99), make_context(session_id="inner"))
+        assert answer is not None and answer["result"]["isError"] is True
+        return "relayed"
+
+    answer = await outer.dispatch(call("relay"), make_context())
+    assert answer is not None and answer["result"]["isError"] is False
+    span = only(otel, "tools/call relay")
+    assert span.attributes["easy_mcp.status"] == "ok"
+    assert "easy_mcp.error_id" not in span.attributes
+    assert span.status.status_code is StatusCode.UNSET
 
 
 async def test_calls_ended_by_request_middleware_carry_a_status(otel: Otel) -> None:
@@ -1013,7 +1086,12 @@ async def test_without_opentelemetry_installed(monkeypatch: pytest.MonkeyPatch) 
     assert server._telemetry.otel is None
     assert "easy_mcp_tool_calls_total" in server.render_metrics()
     plain = MCPServer(port=0, rate_limit_per_minute=None)
+    add_tool(plain)
     assert plain._telemetry.active is False  # nothing to record: dispatch skips the hook
+    answer = await plain.dispatch(call(), make_context())
+    assert answer is not None and answer["result"]["content"][0]["text"] == "3"
+    invalid = await plain.dispatch(call("add", {"a": "x"}, 2), make_context())
+    assert invalid is not None and invalid["error"]["code"] == INVALID_PARAMS
 
 
 async def test_otel_metrics_mirror_builtin_names(otel: Otel) -> None:

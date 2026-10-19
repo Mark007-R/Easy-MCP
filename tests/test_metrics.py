@@ -50,6 +50,7 @@ from easy_mcp.exceptions import (
     ProtocolError,
 )
 from easy_mcp.middleware import RequestInfo, RequestNext, RequestOutcome, TransportInfo
+from easy_mcp.telemetry import Telemetry
 from easy_mcp.telemetry.prometheus import (
     CONTENT_TYPE,
     DURATION_BUCKETS,
@@ -463,6 +464,45 @@ async def test_calls_ended_by_request_middleware_are_counted(logs: LogCapture) -
     assert len(logs.events("tool_cancelled")) == 1
 
 
+async def test_inner_server_reports_nothing_on_the_outer_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A gateway's tool forwards to in-process servers: one recording nothing
+    # (no metrics, no OpenTelemetry), one whose telemetry fails to plan the
+    # message.  Neither may report its own tool's failure on the gateway's call.
+    outer = make_server()
+    quiet = MCPServer(port=0, rate_limit_per_minute=None)
+    quiet._telemetry_state = Telemetry(quiet, metrics=False, otel=None)
+    assert quiet._telemetry.active is False
+    broken = MCPServer(port=0, rate_limit_per_minute=None, metrics=True)
+
+    def unplannable(*args: Any) -> Any:
+        raise RuntimeError("telemetry bug")
+
+    monkeypatch.setattr(broken._telemetry, "_plan", unplannable)
+    inner_servers = {"quiet": quiet, "broken": broken}
+    for inner in inner_servers.values():
+
+        @inner.tool
+        async def boom() -> str:
+            """Fails."""
+            raise RuntimeError("inner failure")
+
+    @outer.tool
+    async def relay(which: str) -> str:
+        """Forwards a call to an inner server."""
+        message = rpc("tools/call", {"name": "boom"}, 99)
+        answer = await inner_servers[which].dispatch(message, make_context(session_id="inner"))
+        assert answer is not None and answer["result"]["isError"] is True
+        return "relayed"
+
+    for msg_id, which in enumerate(inner_servers):
+        message = rpc("tools/call", {"name": "relay", "arguments": {"which": which}}, msg_id)
+        answer = await outer.dispatch(message, make_context())
+        assert answer is not None and answer["result"]["isError"] is False
+    assert tool_calls(outer) == Counter({("relay", "ok"): 2})
+
+
 async def test_call_cancelled_while_its_unit_is_reserved_is_counted() -> None:
     hub = FakeHub()
     server = make_server(store=hub.store("worker-a"))
@@ -795,19 +835,34 @@ async def test_metrics_endpoint_answers_an_invalid_key_with_a_challenge(
 ) -> None:
     # Every 401 carries a challenge (RFC 9110 15.5.2), and /metrics is no
     # JSON-RPC endpoint: the same answer on the combined app and SSE alone,
-    # whichever header held the key.
-    server = make_server(auth=APIKeyAuth({SCRAPE_KEY: [METRICS_SCOPE]}))
-    for app in (server.build_app(), SSETransport(server).build_app()):
-        async with asgi(app) as http:
-            for headers in (bearer(WRONG_KEY), {"X-API-Key": WRONG_KEY}):
-                refused = await http.get("/metrics", headers=headers)
-                assert refused.status_code == 401
-                assert refused.headers["www-authenticate"] == "Bearer"
-                assert refused.json() == {"error": "invalid API key"}
-            assert (await http.get("/metrics", headers=bearer(SCRAPE_KEY))).status_code == 200
+    # whichever header held the key, and with OAuth too, whose challenge says
+    # where to sign in (there a bearer value no key matches is a token).
+    keys = APIKeyAuth({SCRAPE_KEY: [METRICS_SCOPE]})
+    keyed = make_server(auth=keys)
+    oauth = OAuthResourceServer(OAUTH_RESOURCE, ["https://auth.example.com"])
+    with_oauth = make_server(auth=keys, oauth=oauth)
+    for server in (keyed, with_oauth):
+        attempts = [{"X-API-Key": WRONG_KEY}]
+        if server.oauth is None:
+            attempts.append(bearer(WRONG_KEY))
+        for app in (server.build_app(), SSETransport(server).build_app()):
+            async with asgi(app) as http:
+                for headers in attempts:
+                    refused = await http.get("/metrics", headers=headers)
+                    assert refused.status_code == 401
+                    challenge = refused.headers["www-authenticate"]
+                    if server.oauth is None:
+                        assert challenge == "Bearer"
+                    else:
+                        assert challenge.startswith("Bearer resource_metadata=")
+                    assert refused.json() == {"error": "invalid API key"}
+                scraped = await http.get("/metrics", headers=bearer(SCRAPE_KEY))
+                assert scraped.status_code == 200
     reasons = [event["reason"] for event in logs.events("metrics_denied")]
-    assert reasons == ["unauthenticated"] * 4
-    assert metrics_of(server)['easy_mcp_rejected_total{easy_mcp_reason="unauthenticated"}'] == 4
+    assert reasons == ["unauthenticated"] * 6
+    rejected = 'easy_mcp_rejected_total{easy_mcp_reason="unauthenticated"}'
+    assert metrics_of(keyed)[rejected] == 4
+    assert metrics_of(with_oauth)[rejected] == 2
 
 
 def test_metrics_endpoint_with_oauth_needs_the_scope(

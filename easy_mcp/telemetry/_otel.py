@@ -208,15 +208,18 @@ class OtelBridge:
     def extract_headers(self, headers: Mapping[str, str]) -> Any | None:
         """The context an HTTP request's headers propagate.
 
-        Only the global propagator's own fields are read.  A header sent more
-        than once arrives joined with ``", "``, which the W3C parser refuses,
-        so a repeated ``traceparent`` is ignored.
+        Only the global propagator's own fields are read, whatever their case
+        (*headers* has lower-case names, and a field such as X-Ray's
+        ``X-Amzn-Trace-Id`` need not).  A header sent more than once arrives
+        joined with ``", "``, which the W3C parser refuses, so a repeated
+        ``traceparent`` is ignored.
         """
         fields = self._propagate.get_global_textmap().fields
         carrier = {
             name: value
             for name in fields
-            if isinstance(value := headers.get(name), str) and len(value) <= MAX_VALUE_LENGTH
+            if isinstance(value := headers.get(name.lower()), str)
+            and len(value) <= MAX_VALUE_LENGTH
         }
         if not carrier:
             return None

@@ -1302,9 +1302,10 @@ MONGODB_URI=mongodb://reader:pass@host/shop easy-mcp-mongodb --port 8014
 ```
 
 All of them take `--transport {http,sse,stdio}`, `--host`, `--port`, `--rate-limit`,
-`--debug` and `--metrics` (serve `GET /metrics`; with `EASY_MCP_API_KEYS` set,
-the scraper needs a key holding `metrics:read`), load API keys from
-`EASY_MCP_API_KEYS` when it is set, and
+`--debug` and `--metrics` (serve `GET /metrics`; with `EASY_MCP_API_KEYS` or
+`EASY_MCP_OAUTH_RESOURCE` set, the scraper needs a key or token holding
+`metrics:read`; without either, only requests from this machine are answered),
+load API keys from `EASY_MCP_API_KEYS` when it is set, and
 accept OAuth tokens when `EASY_MCP_OAUTH_RESOURCE` is set (see
 [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
 `python -m easy_mcp.connectors.<name>` works as well, and
@@ -1502,7 +1503,10 @@ mypy easy_mcp
 ```
 
 CI runs the same three commands on Python 3.11 through 3.14, with a Redis
-service for the shared-store live tests. Those run only when
+service for the shared-store live tests, and runs `mypy` and the tests once
+more on 3.11 with OpenTelemetry and `prometheus-client` uninstalled again, as
+on a default install (the tracing tests then skip). The shared-store live tests
+run only when
 `EASY_MCP_LIVE_REDIS_URL` names a scratch database, e.g.
 `docker run -d -p 6379:6379 redis:7-alpine` and
 `EASY_MCP_LIVE_REDIS_URL=redis://127.0.0.1:6379/15 pytest tests/test_live_redis.py`.
