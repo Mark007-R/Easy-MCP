@@ -1616,9 +1616,9 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
 
 ## Upgrading from 0.3.1
 
-A server that worked on 0.3.1 keeps working without code changes. These are
-the differences its clients, proxies and log pipelines can see; the
-[CHANGELOG](CHANGELOG.md) has the details.
+A server that worked on 0.3.1 needs no code change, unless a row below asks
+for one. These are the differences its clients, proxies and log pipelines
+can see; the [CHANGELOG](CHANGELOG.md) has the details.
 
 | What changed | What to do |
 |---|---|
@@ -1628,7 +1628,7 @@ the differences its clients, proxies and log pipelines can see; the
 | A call that middleware refuses, or that is cancelled before its tool starts, no longer spends a unit of `max_calls_per_session` (a busy one already did not); a call holds its unit from the built-in checks on, so concurrent calls beyond the cap get `-32006` while one waits in tool middleware | Nothing, unless you relied on refusals using up the cap. |
 | In a handshake-era session, each request runs with the identity of its own credential; the session stays bound to the principal that opened it | Nothing for API keys. With OAuth a refreshed or broader token takes effect at once. |
 | A stateless `tools/list` is `cacheScope: "private"` with request middleware registered or `oauth=` set, as with `auth=` before | Nothing; caches keep it per caller. |
-| No stateless (`2026-07-28`) response carries `-32002`: the `Origin` `403` sends `-32600`, any other becomes `-32001`; codes `-32023` to `-32099` become `-32603` with an `error_id`. Handshake-era clients still get `-32002`, now deprecated | A stateless client matching `-32002` should match `-32001` and the HTTP status. |
+| No stateless (`2026-07-28`) response carries `-32002`: the `Origin` `403` sends `-32600`, any other becomes `-32001`; codes `-32023` to `-32099` become `-32603` with an `error_id`. Handshake-era clients still get `-32002`, now deprecated | A stateless client that matched `-32002` should look at the HTTP status (`403`) instead. |
 | `ClientContext` compares and hashes by identity, and can be weakly referenced | A custom transport that compared contexts with `==` must compare the fields it means. |
 | With a shared store, `/healthz` answers `503` (`"store": "unreachable"`) when Redis cannot be reached | Use it as the load balancer's health check: the worker would refuse those requests anyway. |
 | `subscriptions/listen` without the stateless `_meta` is `-32602` over stdio and legacy SSE (was `-32601`); over Streamable HTTP a listen with `params` is a stateless request, so missing mirrored headers get `400` with `-32020` | Nothing for MCP clients; send listens as stateless requests. |
