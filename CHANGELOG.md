@@ -4,7 +4,14 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
-## [Unreleased]
+## [0.3.2] - 2026-10-19
+
+0.3.2 completes the v0.3 milestone: MCP resources, prompts and completion,
+list-change notifications and `subscriptions/listen`, middleware, OAuth 2.1
+bearer tokens, a shared session store for several workers, and
+OpenTelemetry tracing with Prometheus metrics. Several visible behaviours
+change for existing servers, each listed under Changed; the README's
+"Upgrading from 0.3.1" says what to do about them.
 
 ### Added
 
@@ -443,9 +450,10 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   with `notifications/cancelled`; before, only `tools/call` could. A cancelled
   request gets no response, as before for `tools/call`, and one other than
   `tools/call` is audited as `request_cancelled`.
-- With request middleware registered, a stateless `tools/list` carries
-  `cacheScope: "private"`, because its answer may now depend on the caller.
-  `server/discover` stays `public`.
+- With request middleware registered, or with `oauth=` set, a stateless
+  `tools/list` carries `cacheScope: "private"`, because its answer may now
+  depend on the caller (with `auth=`, as before). `server/discover` stays
+  `public`.
 - A `tools/call` holds one unit of `max_calls_per_session` from the moment it
   passes the built-in checks. The unit is returned if the tool never starts:
   a middleware refusal or failure, a busy answer, or a cancel before the tool
@@ -529,13 +537,18 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   without any request.
 - Registering or removing a tool while serving with a shared store logs a
   warning: only that worker sees the change.
-- `initialize` and `server/discover` advertise `tools.listChanged: true`.
-  Capabilities only ever grow: a kind, once advertised, stays advertised for
-  the life of the process, and one added after serving began is logged,
-  since clients may cache `server/discover` for an hour.
-- `GET /mcp` without a session id, or with a `2026-07-28`
-  `MCP-Protocol-Version`, still answers `405`; its `Allow` header now lists
-  `GET`. `HEAD /mcp` still answers `405`, with or without a session id.
+- `initialize` and `server/discover` advertise `tools.listChanged: true`,
+  and a tool registered or removed while clients are connected now sends
+  them `notifications/tools/list_changed` (on stdout over stdio, on the
+  `/sse` stream, on a session's `GET /mcp` stream), messages that 0.3.1
+  never sent. Capabilities only ever grow: a kind, once advertised, stays
+  advertised for the life of the process, and one added after serving began
+  is logged, since clients may cache `server/discover` for an hour.
+- `GET /mcp` with a session's `MCP-Session-Id` and credential opens the
+  session's notification stream (`text/event-stream`) instead of answering
+  `405`. Without a session id, or with a `2026-07-28`
+  `MCP-Protocol-Version`, it still answers `405`; its `Allow` header now
+  lists `GET`. `HEAD /mcp` still answers `405`, with or without a session id.
 - Clients that open a `GET /mcp` or `subscriptions/listen` stream hold a
   long-lived connection. `server.run()` closes these streams as shutdown
   begins, as it does legacy SSE streams. Serving `build_app()` with your own
@@ -566,8 +579,17 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   logs the same warning.
 - With `opentelemetry-api` installed (as it is next to the official MCP
   Python SDK, for one), an application that configures an OpenTelemetry SDK
-  now sees MCP spans, and spans its tools create nest under them. Nothing
+  now sees MCP spans, spans its tools create nest under them, and JSON log
+  lines written during a request carry `trace_id` and `span_id`. Nothing
   changes on the wire: responses carry no trace ids.
+- Audit events of 0.3.1 gain fields: `session_open`, `session_close` and
+  `session_credential_mismatch` carry `session_ref` (and `worker` with a
+  shared store), legacy SSE session events carry `transport: "sse"` and
+  their `session_close` a `reason`, and a Streamable HTTP `session_open`
+  carries `protocol_version`. `tool_denied` names the `middleware` that
+  refused, or the `scope` a step-up asked for. A `cancel_callback_failed`
+  of a resource, prompt or completion names its `kind` and `name` (a tool's
+  still names the `tool`). The README lists every event and its fields.
 - Cancel callbacks run in the cancelled call's OpenTelemetry context, so
   spans they start (a database driver's cancel request, say) join the call's
   trace. They still find the token through `current_cancel_token()`, and
@@ -579,6 +601,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 
 - The raw `session_id` in audit events. It stays in 0.3.x and is removed in
   0.4; key log processing on the new `session_ref`.
+- The `FORBIDDEN` code (`-32002`) that handshake-era clients still get for a
+  refused browser `Origin`, for a session used with another credential and
+  for `AuthorizationError`. The stateless revision forbids it, and it is
+  retired in 0.4; `-32002` then means only "resource not found" in the
+  handshake era.
 
 ### Fixed
 
@@ -926,7 +953,8 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   correlation, structured JSON logs with an audit trail, and the HTTP + SSE
   transport.
 
-[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.4...v0.2.5
