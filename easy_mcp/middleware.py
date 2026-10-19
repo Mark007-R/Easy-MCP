@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar
 from .exceptions import INTERNAL_ERROR, ProtocolError, ToolError
 from .logging import audit
 from .protocol import era_error_code, is_reserved_error_code
+from .telemetry._core import note_error_id
 
 if TYPE_CHECKING:
     from .cancellation import CancelToken
@@ -205,6 +206,7 @@ class RequestInfo:
 
     __slots__ = (
         "_client_id",
+        "_denial",
         "_identity",
         "_is_notification",
         "_meta",
@@ -227,6 +229,9 @@ class RequestInfo:
     )
 
     _client_id: str
+    # Why tool-level processing refused a call of a registered tool before
+    # its middleware (telemetry tells the reasons apart by this).
+    _denial: str | None
     _identity: ClientIdentity | None
     _is_notification: bool
     _meta: Mapping[str, Any] | None
@@ -294,6 +299,7 @@ class RequestInfo:
         # middleware's audit knows even when no outcome reached it.
         self._tool_started = False
         self._subscription = None
+        self._denial = None
         self._watch = None
         self._watch_baseline = 0
         return self
@@ -652,9 +658,14 @@ class ToolOutcome:
 class RequestOutcome:
     """What the client will receive for one request.  Read-only."""
 
-    __slots__ = ("_data", "_error_code", "_message", "_result", "_tool")
+    __slots__ = ("_data", "_denial", "_error_code", "_message", "_result", "_tool")
 
     _data: Any
+    # For a tools/call of a registered tool refused before its middleware,
+    # why: "not_visible", "scope", "session_limit", "invalid_arguments" or
+    # "refused".  Telemetry reads it; the client's answer cannot tell a
+    # hidden tool from invalid arguments (both are -32602), nor should it.
+    _denial: str | None
     _error_code: int | None
     _message: str | None
     _result: Any
@@ -672,6 +683,7 @@ class RequestOutcome:
         message: str | None = None,
         data: Any = None,
         tool: ToolOutcome | None = None,
+        denial: str | None = None,
     ) -> RequestOutcome:
         self = object.__new__(cls)
         self._result = result
@@ -679,6 +691,7 @@ class RequestOutcome:
         self._message = message
         self._data = data
         self._tool = tool
+        self._denial = denial
         return self
 
     @classmethod
@@ -1140,6 +1153,7 @@ class _Level(Generic[_OutcomeT]):
         """Log and audit a failed middleware; returns ``(error_id, client message)``."""
         name = describe(middleware)
         error_id = uuid.uuid4().hex[:12]
+        note_error_id(error_id)
         try:
             if exc is None:
                 self._logger.error(

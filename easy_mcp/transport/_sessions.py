@@ -437,7 +437,8 @@ class SessionManager:
         return presented == record.identity_fp and principal_ref(identity) == record.principal
 
     def credential_mismatch(self, local: LocalSession) -> None:
-        """Audit a request that named *local* with another credential."""
+        """Audit (and count) a request that named *local* with another credential."""
+        self._server._telemetry.rejected("credential_mismatch")
         audit(
             "session_credential_mismatch",
             session_id=local.session_id,
@@ -702,7 +703,7 @@ class SessionManager:
             if not ended:
                 self._end_here(local, reason)
             if removed and reason is not None:
-                self._closed(local.session_id, local.ref, local.record, reason)
+                self._closed(local, local.ref, reason)
             if not ended and self.store.shared:
                 await self._announce_end(local)
             return
@@ -727,7 +728,7 @@ class SessionManager:
             self._server._logger.error("could not remove a session from the store", exc_info=True)
             removed = True  # its close is audited all the same
         if removed and reason is not None:
-            self._closed(local.session_id, local.ref, local.record, reason)
+            self._closed(local, local.ref, reason)
         if self.store.shared:
             await self._announce_end(local)
 
@@ -750,7 +751,7 @@ class SessionManager:
             if self._unremoved.pop(ref, None) is None:
                 continue  # found expired meanwhile, and audited then (_expire)
             if removed and reason is not None:
-                self._closed(local.session_id, ref, local.record, reason)
+                self._closed(local, ref, reason)
             if self.store.shared:
                 await self._announce_end(local)
         return True
@@ -785,17 +786,17 @@ class SessionManager:
         if local.stream is not None:
             local.stream.put_nowait(CLOSE_STREAM)
 
-    def _closed(
-        self, session_id: str | None, ref: str, record: SessionRecord | None, reason: str
-    ) -> None:
+    def _closed(self, local: LocalSession, ref: str, reason: str) -> None:
+        record = local.record
         self._server._session_event(
             False,
             kind=self._kind,
             transport=self._transport,
-            session_id=session_id,
+            session_id=local.session_id,
             ref=ref,
-            client_id=record.client_id if record is not None else None,
-            t0=record.t0 if record is not None else None,
+            client_id=record.client_id,
+            protocol_version=local.context.protocol_version,
+            t0=record.t0,
             reason=reason,
         )
 
@@ -821,6 +822,7 @@ class SessionManager:
                 reason = "store_lost" if gone.lost else "idle_timeout"
             transport = self._transport
             session_id, client_id, t0 = gone.session_id, gone.client_id, gone.t0
+            version: str | None = None
             for manager in managers:
                 unremoved = manager._unremoved.pop(gone.ref, None)
                 local = manager._local.get(gone.ref)
@@ -836,6 +838,7 @@ class SessionManager:
                     local.record.client_id,
                     local.record.t0,
                 )
+                version = local.context.protocol_version
                 break
             if reason is not None:
                 self._server._session_event(
@@ -845,8 +848,10 @@ class SessionManager:
                     session_id=session_id,
                     ref=gone.ref,
                     client_id=client_id,
+                    protocol_version=version,
                     t0=t0,
                     reason=reason,
+                    idle_ms=gone.idle_ms,
                 )
 
     async def shutdown(self) -> None:

@@ -112,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="send tracebacks to clients (development only)",
     )
+    run.add_argument(
+        "--metrics",
+        action="store_true",
+        help="serve GET /metrics (http/sse); needs a key with the metrics:read scope when "
+        "the server has auth",
+    )
     return parser
 
 
@@ -131,6 +137,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         server.port = args.port
     if args.debug:
         server.debug = True
+    if args.metrics:
+        server.metrics = True
     server.run(args.transport)
 
 

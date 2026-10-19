@@ -7,8 +7,10 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import pytest
 import uvicorn
 
@@ -208,6 +210,78 @@ def logs() -> Iterator[LogCapture]:
     finally:
         logger.removeHandler(capture)
         logger.setLevel(level)
+
+
+# --------------------------------------------------------------- telemetry
+
+
+def parse_exposition(text: str) -> dict[str, float]:
+    """Prometheus text as ``{series: value}``, the series as written (name and labels)."""
+    samples: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        series, _, value = line.rpartition(" ")
+        samples[series] = float(value)
+    return samples
+
+
+def scrape(base: str, key: str | None = None) -> dict[str, float]:
+    """``GET /metrics`` of a live server, parsed; *key* is sent as a bearer credential."""
+    headers = {"Authorization": f"Bearer {key}"} if key is not None else {}
+    response = httpx.get(f"{base}/metrics", headers=headers, timeout=10)
+    assert response.status_code == 200, response.text
+    return parse_exposition(response.text)
+
+
+@dataclass
+class Otel:
+    """Servers traced into memory, through providers of their own (never the global ones)."""
+
+    exporter: Any
+    reader: Any
+    tracer_provider: Any
+    meter_provider: Any
+
+    def server(self, **options: Any) -> MCPServer:
+        """An ``MCPServer`` whose telemetry uses these providers; rate limiting off by default."""
+        from easy_mcp.telemetry import Telemetry
+        from easy_mcp.telemetry._otel import OtelBridge
+
+        options.setdefault("rate_limit_per_minute", None)
+        server = MCPServer(port=0, **options)
+        bridge = OtelBridge(
+            tracer_provider=self.tracer_provider, meter_provider=self.meter_provider
+        )
+        server._telemetry_state = Telemetry(server, metrics=server.metrics, otel=bridge)
+        return server
+
+    def spans(self) -> list[Any]:
+        """The spans ended so far, oldest first."""
+        return list(self.exporter.get_finished_spans())
+
+    def tracer(self) -> Any:
+        return self.tracer_provider.get_tracer("tests")
+
+
+@pytest.fixture
+def otel() -> Iterator[Otel]:
+    """In-memory span exporter and metric reader; skips without ``opentelemetry-sdk``."""
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+    yield Otel(exporter, reader, tracer_provider, meter_provider)
+    tracer_provider.shutdown()
+    meter_provider.shutdown()
 
 
 # ------------------------------------------------------------------- OAuth

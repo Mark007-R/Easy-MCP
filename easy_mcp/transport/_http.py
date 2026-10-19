@@ -7,17 +7,18 @@
   route runs.
 * :class:`BaseHTTPTransport` resolves credentials from headers (API keys,
   and OAuth access tokens with their ``WWW-Authenticate`` challenges), serves
-  the health endpoint and the OAuth Protected Resource Metadata, and owns the
-  uvicorn lifecycle.
+  the health endpoint, the OAuth Protected Resource Metadata and (with
+  ``metrics=True``) ``/metrics``, and owns the uvicorn lifecycle.
 """
 
 from __future__ import annotations
 
 import abc
 import asyncio
+import ipaddress
 import json
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -46,12 +47,19 @@ from ..middleware import TransportInfo
 from ..protocol import MODERN_PROTOCOL_VERSIONS
 from ..security.auth import ClientIdentity, fingerprint, is_scope_token
 from ..security.oauth import UNAVAILABLE_RETRY_SECONDS
+from ..telemetry import METRICS_SCOPE
+from ..telemetry.prometheus import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from .base import Transport
 
 if TYPE_CHECKING:
     from ..server import MCPServer
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Headers a proxy adds for the client it forwards (ASGI header names).
+FORWARDING_HEADERS = frozenset(
+    {b"forwarded", b"x-forwarded-for", b"x-forwarded-host", b"x-real-ip"}
+)
 
 
 def normalize_origins(origins: Iterable[str]) -> frozenset[str]:
@@ -166,6 +174,18 @@ def bearer_challenge(
     return value
 
 
+def _metrics_invalid_key() -> Response:
+    """``GET /metrics``' answer to an API key that matches none, on every transport.
+
+    No JSON-RPC body (it is no MCP endpoint), and a challenge, as every
+    ``401`` needs (RFC 9110 15.5.2).  With ``oauth``, the challenge is
+    replaced by the one saying where to sign in.
+    """
+    return JSONResponse(
+        {"error": "invalid API key"}, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+    )
+
+
 def _header(scope: Scope, name: bytes) -> str | None:
     for key, value in scope.get("headers", ()):
         if key == name:
@@ -173,22 +193,92 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
+def _is_loopback_address(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
+
+
+def is_local_request(scope: Scope) -> bool:
+    """Whether an HTTP request came from this machine and was addressed to a loopback host.
+
+    Both, because each alone can be got round: a remote client can send any
+    ``Host`` header, and a DNS-rebinding page makes a browser on this machine
+    send a request (with no ``Origin`` header, for a same-origin ``GET``) to
+    a loopback peer, under the attacker's own host name, which the browser
+    will not let it change.  The peer must be a loopback address
+    (``::ffff:127.0.0.1`` included) and the only ``Host`` header must name
+    ``localhost``, ``127.0.0.1`` or ``[::1]``, with any port.
+
+    A request carrying a proxy's forwarding header (``Forwarded``,
+    ``X-Forwarded-For``, ``X-Forwarded-Host``, ``X-Real-IP``) is never
+    local: it came through a proxy, and uvicorn's proxy-header trust
+    (``FORWARDED_ALLOW_IPS``) may have made the peer address one the client
+    chose.  Those headers stay in the scope when uvicorn rewrites ``client``.
+    """
+    headers = scope.get("headers", ())
+    if any(key in FORWARDING_HEADERS for key, _ in headers):
+        return False
+    client = scope.get("client")
+    peer = client[0] if client else None
+    if not isinstance(peer, str) or not _is_loopback_address(peer):
+        return False
+    hosts = [value for key, value in headers if key == b"host"]
+    if len(hosts) != 1:
+        return False
+    return _host_name(hosts[0].decode("latin-1")) in LOOPBACK_HOSTS
+
+
+def _host_name(value: str) -> str | None:
+    """The host a ``Host`` header (``uri-host [":" port]``) names, lowercased.
+
+    ``None`` for a malformed one.
+    """
+    value = value.strip()
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return None
+        name, rest = value[1:end], value[end + 1 :]
+    else:
+        name, colon, after = value.partition(":")
+        rest = colon + after
+    if rest:
+        port = rest[1:]
+        if not rest.startswith(":") or not (port == "" or (port.isascii() and port.isdigit())):
+            return None
+    return name.lower()
+
+
 class OriginGuard:
     """ASGI middleware: answer 403 when the ``Origin`` header is not allowed.
 
     Requests without an ``Origin`` header come from non-browser clients and
-    pass through; browsers always send one on POST and DELETE.
+    pass through; browsers always send one on POST and DELETE.  *on_reject*
+    is told ``"origin"`` for each request refused (the metrics count it).
     """
 
-    def __init__(self, app: ASGIApp, allowed_origins: frozenset[str] | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        allowed_origins: frozenset[str] | None = None,
+        on_reject: Callable[[str], None] | None = None,
+    ) -> None:
         self.app = app
         self.allowed_origins = allowed_origins
+        self.on_reject = on_reject
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             origin = _header(scope, b"origin")
             if origin is not None and not origin_allowed(origin, self.allowed_origins):
                 audit("origin_rejected", origin=origin[:200], path=scope.get("path", ""))
+                if self.on_reject is not None:
+                    self.on_reject("origin")
                 # The stateless revision forbids -32002 in any response, so a
                 # request that names it gets the generic -32600; older clients
                 # keep the code they have always seen.
@@ -269,7 +359,13 @@ class BaseHTTPTransport(Transport):
             self._uvicorn.should_exit = True
 
     def _middleware(self) -> list[Middleware]:
-        return [Middleware(OriginGuard, allowed_origins=self._server.allowed_origins)]
+        return [
+            Middleware(
+                OriginGuard,
+                allowed_origins=self._server.allowed_origins,
+                on_reject=self._server._telemetry.rejected,
+            )
+        ]
 
     # The transport's name in audit events.
     _audit_transport = "http"
@@ -279,7 +375,14 @@ class BaseHTTPTransport(Transport):
 
     def _reserved_paths(self) -> frozenset[str]:
         """Paths an MCP endpoint must not take: the transport serves something else there."""
+        if self._server.metrics:
+            return frozenset({"/healthz", "/metrics"})
         return frozenset({"/healthz"})
+
+    def _store_unavailable(self, msg_id: Any = None) -> JSONResponse:
+        """:func:`store_unavailable`, counted as a request refused before dispatch."""
+        self._server._telemetry.rejected("store_unavailable")
+        return store_unavailable(msg_id)
 
     def _endpoint_paths(self) -> tuple[str, ...]:
         """The paths clients address, for the check of the OAuth ``resource``."""
@@ -290,7 +393,12 @@ class BaseHTTPTransport(Transport):
         return rpc_error(401, AUTHENTICATION_REQUIRED, "Invalid API key")
 
     async def _resolve_identity(
-        self, request: Request, *, modern: bool, tool: str | None = None
+        self,
+        request: Request,
+        *,
+        modern: bool,
+        tool: str | None = None,
+        invalid_key: Callable[[], Response] | None = None,
     ) -> ClientIdentity | None | Response:
         """The request's identity, or the response that rejects its credential.
 
@@ -300,7 +408,9 @@ class BaseHTTPTransport(Transport):
         credential is challenged.  *modern* says which revision's challenge
         to send; *tool* is the tool a ``tools/call`` names, whose scope a
         token refused for ``required_scopes`` is asked for in the same
-        challenge.
+        challenge.  *invalid_key* builds the answer to an API key that
+        matches none (:meth:`_invalid_key_response` by default); with
+        ``oauth``, its ``WWW-Authenticate`` says where to sign in.
         """
         server = self._server
         if server.oauth is None:
@@ -313,11 +423,17 @@ class BaseHTTPTransport(Transport):
             try:
                 return server.authenticate_key(key)
             except AuthenticationError:
-                return self._invalid_key_response()
-        return await self._resolve_oauth(request, modern=modern, tool=tool)
+                server._telemetry.rejected("unauthenticated")
+                return (invalid_key or self._invalid_key_response)()
+        return await self._resolve_oauth(request, modern=modern, tool=tool, invalid_key=invalid_key)
 
     async def _resolve_oauth(
-        self, request: Request, *, modern: bool, tool: str | None = None
+        self,
+        request: Request,
+        *,
+        modern: bool,
+        tool: str | None = None,
+        invalid_key: Callable[[], Response] | None = None,
     ) -> ClientIdentity | None | Response:
         server = self._server
         oauth = server.oauth
@@ -356,6 +472,7 @@ class BaseHTTPTransport(Transport):
                 # refuse without verifying, which bounds signature checks,
                 # key fetches and introspection calls.
                 audit("auth_rate_limited", client_id=client_id, transport=self._audit_transport)
+                server._telemetry.rejected("auth_rate_limited")
                 return rpc_error(
                     429,
                     RATE_LIMITED,
@@ -370,6 +487,7 @@ class BaseHTTPTransport(Transport):
             )
         except TokenRequiredError:
             # No credential: RFC 6750 sends no error code, only where to sign in.
+            server._telemetry.rejected("unauthenticated")
             challenge = bearer_challenge(metadata_url, scope=server._initial_scopes())
             return rpc_error(
                 401,
@@ -379,6 +497,7 @@ class BaseHTTPTransport(Transport):
             )
         except InvalidTokenError as exc:
             failed = True  # the reservation is this failure's charge
+            server._telemetry.rejected("unauthenticated")
             fields = {"issuer": exc.issuer} if exc.issuer in oauth.authorization_servers else {}
             audit(
                 "auth_failed",
@@ -432,7 +551,8 @@ class BaseHTTPTransport(Transport):
         except AuthenticationError:
             # An X-API-Key that matches no key: the 0.3.1 answer, plus where
             # to sign in instead.
-            response = self._invalid_key_response()
+            server._telemetry.rejected("unauthenticated")
+            response = (invalid_key or self._invalid_key_response)()
             response.headers["WWW-Authenticate"] = bearer_challenge(
                 metadata_url, scope=server._initial_scopes()
             )
@@ -503,6 +623,91 @@ class BaseHTTPTransport(Transport):
             media_type="application/json",
             # Short: with step_up=False, tools registered at runtime change it.
             headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    def _metrics_routes(self) -> list[Route]:
+        """``GET /metrics`` when the server keeps metrics (Starlette answers ``HEAD`` too)."""
+        if self._server._telemetry.registry is None:
+            return []
+        return [Route("/metrics", self._handle_metrics, methods=["GET"])]
+
+    async def _handle_metrics(self, request: Request) -> Response:
+        """Serve the server's metrics in the Prometheus text format.
+
+        In order: the credential, as on the MCP endpoint (``401``, with a
+        ``Bearer`` challenge and, for an API key that matches none, the body
+        ``{"error": "invalid API key"}`` on every transport, with ``oauth``
+        too); one unit of the caller's rate-limit budget (``429``); then, with
+        auth configured, a credential holding ``metrics:read`` or ``*`` (``401``
+        without one, ``403`` without the scope, with an ``insufficient_scope``
+        challenge for an OAuth token), and without auth, a request
+        from this machine addressed to a loopback host, through no proxy
+        (``403`` otherwise).  The ``Origin`` check has run before all of
+        them.  Refusals are audited as ``metrics_denied``.
+        """
+        server = self._server
+        peer = request.client.host if request.client else "unknown"
+        resolved = await self._resolve_identity(
+            request, modern=False, invalid_key=_metrics_invalid_key
+        )
+        if isinstance(resolved, Response):
+            denied = {401: "unauthenticated", 403: "insufficient_scope"}.get(resolved.status_code)
+            if denied is not None:
+                audit("metrics_denied", reason=denied, client_id=f"ip:{peer}")
+            return resolved
+        identity = resolved
+        client_id = identity.fingerprint if identity is not None else f"ip:{peer}"
+        try:
+            # A scrape is a request like any other.
+            await server.acheck_rate_limit(client_id)
+        except RateLimitError as exc:
+            audit("rate_limited", client_id=client_id, method="GET /metrics")
+            server._telemetry.rejected("rate_limited")
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=429,
+                headers={"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))},
+            )
+        except StoreUnavailableError:
+            return self._store_unavailable()
+        if server.auth_configured:
+            if identity is None:
+                audit("metrics_denied", reason="unauthenticated", client_id=client_id)
+                server._telemetry.rejected("unauthenticated")
+                return JSONResponse(
+                    {"error": "authentication required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            # A token's scopes never hold "*" (it is no wildcard there).
+            if "*" not in identity.scopes and METRICS_SCOPE not in identity.scopes:
+                audit("metrics_denied", reason="insufficient_scope", client_id=client_id)
+                challenge: dict[str, str] | None = None
+                if server.oauth is not None and identity.issuer is not None:
+                    # A token is told which scope to ask for (RFC 6750 3.1).
+                    challenge = {
+                        "WWW-Authenticate": self._scope_challenge(
+                            [METRICS_SCOPE], identity.scopes, modern=False
+                        )
+                    }
+                return JSONResponse(
+                    {"error": f"the credential lacks the {METRICS_SCOPE!r} scope"},
+                    status_code=403,
+                    headers=challenge,
+                )
+        elif not is_local_request(request.scope):
+            audit("metrics_denied", reason="not_local", client_id=client_id)
+            return JSONResponse(
+                {
+                    "error": "metrics are served only to this machine without auth; configure "
+                    f"a key with the {METRICS_SCOPE!r} scope"
+                },
+                status_code=403,
+            )
+        return Response(
+            server.render_metrics(),
+            media_type=METRICS_CONTENT_TYPE,
+            headers={"Cache-Control": "no-store"},
         )
 
     @staticmethod

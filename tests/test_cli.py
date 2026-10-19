@@ -13,6 +13,7 @@ import pytest
 
 from easy_mcp import MCPServer
 from easy_mcp.cli import TargetError, load_server, main, parse_target
+from easy_mcp.transport._http import BaseHTTPTransport
 
 _counter = itertools.count()
 
@@ -173,6 +174,34 @@ def test_run_overrides_only_what_was_asked_for(
     assert server.port == 9000
     assert server.debug is True
     assert server.host == "10.0.0.1"  # not asked for, so not changed
+
+
+def test_cli_metrics_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: list[Any]
+) -> None:
+    name = write_module(tmp_path, monkeypatch, SERVER_MODULE)
+    main(["run", name])
+    assert captured[-1][0].metrics is False  # the module's own setting stands
+    main(["run", name, "--metrics"])
+    assert captured[-1][0].metrics is True
+
+
+def test_cli_metrics_flag_after_the_module_built_its_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A module that builds its app at import (the multi-worker pattern) has
+    # its server's telemetry built already; --metrics must still take effect.
+    served: list[tuple[MCPServer, Any]] = []
+
+    def serve(self: BaseHTTPTransport) -> None:
+        served.append((self._server, self.build_app()))
+
+    monkeypatch.setattr(BaseHTTPTransport, "run", serve)
+    name = write_module(tmp_path, monkeypatch, SERVER_MODULE + "\napp = server.build_app()\n")
+    main(["run", name, "--metrics"])
+    ((server, app),) = served
+    assert "/metrics" in [getattr(route, "path", None) for route in app.routes]
+    assert "easy_mcp_tool_calls_total" in server.render_metrics()
 
 
 def test_run_reports_a_bad_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

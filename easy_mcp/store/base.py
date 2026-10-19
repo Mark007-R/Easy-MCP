@@ -148,6 +148,9 @@ class ExpiredSession:
     that stays in this process.  ``lost`` marks a session a shared store
     found gone without a trace rather than expired: lost in a failover or a
     restart, so nobody audited its close (:meth:`Store.refresh_sessions`).
+    ``idle_ms`` is how long it had been idle when it was found expired, when
+    the store knows: its duration then ends at its last activity, not when
+    the expiry happened to be noticed.
     """
 
     ref: str
@@ -155,6 +158,7 @@ class ExpiredSession:
     session_id: str | None = None
     t0: int | None = None
     lost: bool = False
+    idle_ms: int | None = None
 
 
 class AsyncRateLimiter(Protocol):

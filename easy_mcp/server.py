@@ -134,7 +134,14 @@ from .subscriptions import (
     parse_filter,
     valid_subscription_id,
 )
-from .transport._http import THREAD_SHUTDOWN_GRACE, BaseHTTPTransport, normalize_origins
+from .telemetry._core import Telemetry, note_error_id, unobserved
+from .telemetry._otel import load_bridge
+from .transport._http import (
+    LOOPBACK_HOSTS,
+    THREAD_SHUTDOWN_GRACE,
+    BaseHTTPTransport,
+    normalize_origins,
+)
 from .transport._sessions import SessionManager
 from .transport.base import ClientContext, Transport
 from .transport.sse import SSETransport
@@ -345,6 +352,21 @@ def _completer_call(
     return run, False
 
 
+def _denial(exc: ProtocolError) -> str:
+    """Why a call of a registered tool was refused before its middleware.
+
+    ``RequestOutcome._denial``, told apart by the exception's type and code,
+    never its message.
+    """
+    if isinstance(exc, AuthenticationError | AuthorizationError):
+        return "scope"  # InsufficientScopeError (step-up) included
+    if isinstance(exc, SessionLimitError):
+        return "session_limit"
+    if exc.code == INVALID_PARAMS:
+        return "invalid_arguments"  # a ValidationError, or arguments that are no object
+    return "refused"  # the session gone, the store out of reach
+
+
 def _tool_failure(text: str) -> dict[str, Any]:
     """An MCP CallToolResult marking a tool-level (not protocol-level) error."""
     return {"content": [{"type": "text", "text": text}], "isError": True}
@@ -467,6 +489,22 @@ class MCPServer:
             this process.  Pass a :class:`~easy_mcp.RedisStore` to share it
             between worker processes, so that any worker can serve any
             request.  The stdio transport always keeps its state in process.
+        metrics: Keep metrics (call counts and outcomes, durations, sessions,
+            rejections) and serve them in the Prometheus text format at
+            ``GET /metrics`` on the HTTP transports.  With auth configured,
+            the endpoint needs a credential holding the ``metrics:read``
+            scope (:data:`~easy_mcp.METRICS_SCOPE`) or ``*``; without auth,
+            it answers only requests from this machine addressed to a
+            loopback host.  Over stdio there is no endpoint:
+            :meth:`render_metrics` returns the text, and with OpenTelemetry
+            installed the same metrics reach your metrics exporter.  Fixed
+            once the server has built its app or dispatched a message;
+            :meth:`run` still picks up a change made before it serves.
+            Tracing needs no switch:
+            with ``opentelemetry-api`` installed every request is a span,
+            which costs nothing until your application configures an
+            OpenTelemetry SDK (``OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp``
+            turns it off).
         json_logs: Emit structured JSON logs (recommended) or plain text.
     """
 
@@ -488,6 +526,7 @@ class MCPServer:
         allowed_origins: Iterable[str] | None = None,
         instructions: str | None = None,
         store: Store | None = None,
+        metrics: bool = False,
         json_logs: bool = True,
     ) -> None:
         if default_timeout is not None and default_timeout <= 0:
@@ -505,6 +544,9 @@ class MCPServer:
         self.name = name
         self.version = version
         self.debug = debug
+        self.metrics = metrics
+        # Spans and metrics, built when first needed and fixed from then on.
+        self._telemetry_state: Telemetry | None = None
         self.auth = auth
         self.oauth = oauth
         # Token principals already audited as principal_seen, oldest first.
@@ -1256,6 +1298,34 @@ class MCPServer:
         self._store_ping = (time.monotonic(), reachable)
         return reachable
 
+    # ------------------------------------------------------------- telemetry
+
+    @property
+    def _telemetry(self) -> Telemetry:
+        """The server's spans and metrics, built on first use and fixed from then on.
+
+        Built when the server first dispatches, builds its app, runs or
+        renders its metrics: setting ``metrics`` later has no effect, except
+        that :meth:`run` still turns metrics on while nothing has been served
+        (``easy-mcp run --metrics`` on a module that built its app).
+        """
+        telemetry = self._telemetry_state
+        if telemetry is None:
+            telemetry = Telemetry(self, metrics=self.metrics, otel=load_bridge())
+            self._telemetry_state = telemetry
+        return telemetry
+
+    def render_metrics(self) -> str:
+        """The current metrics in the Prometheus text format (version 0.0.4).
+
+        What ``GET /metrics`` serves; over stdio, which has no endpoint, the
+        way to read them.
+
+        Raises:
+            RuntimeError: The server was built without ``metrics=True``.
+        """
+        return self._telemetry.render()
+
     def _session_event(
         self,
         opened: bool,
@@ -1268,6 +1338,7 @@ class MCPServer:
         protocol_version: str | None = None,
         t0: int | None = None,
         reason: str | None = None,
+        idle_ms: int | None = None,
     ) -> None:
         """Every session opening or closing goes through here: HTTP, SSE and stdio.
 
@@ -1275,8 +1346,29 @@ class MCPServer:
         session's ``session_ref``; the raw *session_id* is audited too, when
         this process knows it (it is dropped from audit events in 0.4).
         *t0* is when the session opened (epoch milliseconds) and *kind* is
-        ``"http"``, ``"sse"`` or ``"stdio"``.
+        ``"http"``, ``"sse"`` or ``"stdio"``.  Telemetry counts the session
+        open or closed here, and records a closed one's duration when *t0* is
+        known: up to its last activity for a session found idle, which had
+        been idle for *idle_ms*.  A shared store's session found idle has no
+        *t0* (its record lapsed with its TTL, and no worker holds it between
+        requests), so it is counted closed but not measured.  A session that
+        ended with an error (*reason* ``store_lost`` or ``lease_lost``) is
+        measured with that reason as its ``error.type``.
         """
+        if opened:
+            self._telemetry.session_opened(transport)
+        else:
+            duration: float | None = None
+            if t0 is not None:
+                ended = time.time() * 1000 - (idle_ms or 0)
+                duration = max(0.0, ended - t0) / 1000
+            self._telemetry.session_closed(
+                transport,
+                duration_s=duration,
+                protocol_version=protocol_version,
+                http=kind != "stdio",
+                reason=reason,
+            )
         fields: dict[str, Any] = {}
         if session_id is not None:
             fields["session_id"] = session_id
@@ -1341,14 +1433,19 @@ class MCPServer:
 
         # Rate limiting applies to every method, so discovery endpoints cannot
         # be used to bypass the budget.
+        telemetry = self._telemetry
         try:
             await self._charge(context)
         except StoreUnavailableError as exc:
             # The budget cannot be checked, so the message is not served
             # (the store logs the outage).
+            telemetry.rejected("store_unavailable")
             return None if is_notification else _protocol_error_response(msg_id, exc)
         except ProtocolError as exc:
             audit("rate_limited", client_id=context.client_id, method=method)
+            # Not dispatched, so no span and no duration: an attacker over
+            # the limit cannot flood the traces.
+            telemetry.rejected("rate_limited")
             return None if is_notification else _protocol_error_response(msg_id, exc)
         except Exception:
             # A store that failed in a way it does not report as an outage:
@@ -1367,6 +1464,30 @@ class MCPServer:
             # would skip the header checks that apply to requests.
             return None
 
+        # Telemetry is the outermost layer of what follows: built in, around
+        # the user's middleware, so it measures and classifies every answer.
+        serve = functools.partial(
+            self._dispatch_message, method, params, msg_id, is_notification, context, transport
+        )
+        if not telemetry.active:
+            # Nothing is recorded here, and nothing this message reports may
+            # land on an enclosing one (another server's tool dispatching
+            # to this server in-process).
+            return await unobserved(serve)
+        return await telemetry.observe(
+            method, params, msg_id, is_notification, context, transport, serve
+        )
+
+    async def _dispatch_message(
+        self,
+        method: str,
+        params: dict[str, Any],
+        msg_id: Any,
+        is_notification: bool,
+        context: ClientContext,
+        transport: TransportInfo | None,
+    ) -> dict[str, Any] | None:
+        """Serve one message that passed the envelope checks and the rate limit."""
         # A request carrying the modern per-request _meta is served statelessly
         # (2026-07-28); anything else keeps the initialize-era behaviour.
         modern = not is_notification and is_modern_request(method, params)
@@ -1411,6 +1532,7 @@ class MCPServer:
             self._logger.error("internal error error_id=%s", error_id, exc_info=True)
             if is_notification:
                 return None
+            note_error_id(error_id)
             response = _error_response(
                 msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
@@ -1531,6 +1653,7 @@ class MCPServer:
                     error_id,
                     exc_info=True,
                 )
+                note_error_id(error_id)
                 return _error_response(
                     msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
                 )
@@ -1539,6 +1662,10 @@ class MCPServer:
                     ended = "disconnected" if ours else "client_cancelled"
                 elif request.method == "tools/call":
                     audit("tool_cancelled", client_id=context.client_id, request_id=msg_id)
+                    # Wherever the call was: request middleware and the
+                    # store's call count come before anything the
+                    # tool-level processing reports.
+                    self._telemetry.tool_cancelled()
                 else:
                     audit(
                         "request_cancelled",
@@ -1553,13 +1680,16 @@ class MCPServer:
         except Exception:
             error_id = uuid.uuid4().hex[:12]
             self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            note_error_id(error_id)
             return _error_response(
                 msg_id, INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
         finally:
-            if listen and request._subscription is not None:
+            sink = request._subscription if listen else None
+            if sink is not None:
                 # Gone already when the server or the client ended it.
-                self._notifier.drop(request._subscription, ended)
+                self._notifier.drop(sink, ended)
+                self._telemetry.subscription_closed(request.transport.name, sink.end_reason)
             if registered and context.in_flight.get(msg_id) is task:
                 del context.in_flight[msg_id]
 
@@ -1571,6 +1701,10 @@ class MCPServer:
         final one included, went through ``context.push``.
         """
         outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
+        if request.method == "tools/call":
+            # A call that request middleware refused, or failed on, before
+            # call_next() has no status yet: it is counted by its answer.
+            self._telemetry.note_request_outcome(outcome)
         if request.method == "initialize" and outcome.error_code is None:
             # Only a handshake the client is answered with negotiates a
             # version; later requests on this connection or session are
@@ -1669,7 +1803,11 @@ class MCPServer:
         result: Any
         try:
             if method == "tools/call":
-                return RequestOutcome._of_tool(await self._execute_tool(request, context))
+                outcome = RequestOutcome._of_tool(await self._execute_tool(request, context))
+                # What tool-level processing answered, before request
+                # middleware may replace it: the call's final status.
+                self._telemetry.note_outcome(outcome)
+                return outcome
             if method == LISTEN_METHOD:
                 # Returns when the stream ends; what the client gets went
                 # through context.push.
@@ -1700,11 +1838,18 @@ class MCPServer:
         except ProtocolError as exc:
             # The code the client will get, so outer middleware sees it too.
             code = era_error_code(exc.code, stateless=request.stateless)
-            return RequestOutcome._create(error_code=code, message=str(exc), data=exc.data)
+            refused = RequestOutcome._create(
+                error_code=code, message=str(exc), data=exc.data, denial=request._denial
+            )
+            if refused._denial is not None:
+                # A call of a registered tool refused before its middleware.
+                self._telemetry.note_outcome(refused)
+            return refused
         except Exception:
             # Sanitize: clients get an opaque error_id; the log gets the trace.
             error_id = uuid.uuid4().hex[:12]
             self._logger.error("internal error error_id=%s", error_id, exc_info=True)
+            note_error_id(error_id)
             return RequestOutcome._create(
                 error_code=INTERNAL_ERROR, message=f"Internal server error (error_id={error_id})"
             )
@@ -1733,6 +1878,7 @@ class MCPServer:
                 error_id,
                 error.get("message"),
             )
+            note_error_id(error_id)
             return _error_response(
                 response.get("id"), INTERNAL_ERROR, f"Internal server error (error_id={error_id})"
             )
@@ -1983,6 +2129,7 @@ class MCPServer:
         logged by its type only, never by its value.
         """
         error_id = uuid.uuid4().hex[:12]
+        note_error_id(error_id)
         try:
             if unsupported:
                 self._logger.error(
@@ -2568,6 +2715,8 @@ class MCPServer:
             uris=frozenset(honored or ()),
         )
         request._subscription = sink
+        # Counted down where the request ends, whoever ends the stream.
+        self._telemetry.subscription_opened(request.transport.name)
         # In the same step as the registration, and flushes run only from
         # loop callbacks: the acknowledgment is the stream's first frame.
         try:
@@ -2821,6 +2970,11 @@ class MCPServer:
         # Report protected tools as unknown to unauthorized callers, so their
         # existence is not enumerable.
         if definition is None or not self._visible(context.identity, definition):
+            if definition is not None:
+                # The client cannot tell a hidden tool from a missing one;
+                # the operator's telemetry can, so probing for protected
+                # tools shows there ("unauthorized").
+                request._denial = "not_visible"
             raise ProtocolError(f"Unknown tool: {name}", code=INVALID_PARAMS)
 
         handle = context.store_handle
@@ -2864,6 +3018,7 @@ class MCPServer:
             plain = validate_arguments(arguments, definition.arguments_schema)
             built = build_param_models(definition.param_models, _copy(plain))
         except ProtocolError as exc:
+            request._denial = _denial(exc)
             if reserved and handle is not None:
                 await self._release_call(handle, name)
             # A step-up denial names the scope the client was asked for.
@@ -2890,6 +3045,8 @@ class MCPServer:
         token._on_error = self._callback_failed(name, context)
         timeout = definition.timeout if definition.timeout is not None else self.default_timeout
         call = ToolCall._create(request, definition, plain, token, timeout)
+        telemetry = self._telemetry
+        telemetry.tool_started(name)
         try:
             # Set here rather than around the tool alone, so tool middleware
             # sees the token, the call and the caller too, and context
@@ -2906,8 +3063,10 @@ class MCPServer:
             # Wherever the call was, in a middleware or in the tool.  Only the
             # first trigger counts, so a tool stopped already keeps its reason.
             self._stop_tool(token, CANCELLED, name, context)
+            telemetry.tool_cancelled()
             raise
         finally:
+            telemetry.tool_ended(name)
             # Work a middleware left behind must not start the tool from now
             # on, when its count may be refunded.
             call._closed = True
@@ -3028,6 +3187,7 @@ class MCPServer:
                 error_id,
                 "; ".join(exc.errors),
             )
+            note_error_id(error_id)
             duration_ms = _duration_ms()
             audit(
                 "tool_call",
@@ -3153,6 +3313,7 @@ class MCPServer:
     ) -> ToolOutcome:
         """The outcome for a tool that raised; logs and audits it."""
         error_id = uuid.uuid4().hex[:12]
+        note_error_id(error_id)
         try:
             self._logger.error("tool %r failed error_id=%s", name, error_id, exc_info=exc)
             audit(
@@ -3230,10 +3391,13 @@ class MCPServer:
             raise ServerBusyError(
                 f"Server busy: all {self.max_sync_workers} tool workers are in use; retry shortly"
             )
+        telemetry = self._telemetry
+        telemetry.worker_acquired()
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         # Carries the cancel token (and any other context) into the thread,
-        # as asyncio.to_thread does.
+        # as asyncio.to_thread does: the request's span too, so spans the
+        # function starts are its children.
         run_in_context = contextvars.copy_context().run
         kind, label, field = target.kind, target.label, target.field
 
@@ -3247,6 +3411,7 @@ class MCPServer:
                 # the client's next call could find it still taken.
                 if slots is not None:
                     slots.release()
+                telemetry.worker_released()
             status = "ok" if outcome[0] else "error"
             token_ref = weakref.ref(token)
 
@@ -3262,6 +3427,8 @@ class MCPServer:
                     reason=fired.reason if fired is not None else None,
                     status=status,
                 )
+                if kind == "tool":
+                    telemetry.late_finish(label, status)
 
             # Runs at once if the token has fired, or when it fires: the
             # deadline, or a cancel, can land after the answer is ready but
@@ -3283,6 +3450,7 @@ class MCPServer:
         except BaseException:
             if slots is not None:
                 slots.release()
+            telemetry.worker_released()
             raise
         return future
 
@@ -3306,13 +3474,17 @@ class MCPServer:
         if not callbacks:
             return
         failed = token._on_error or self._callback_failed(name, context, kind)
+        telemetry = self._telemetry
+        # The call's trace context: a cancel callback's own spans (a driver's
+        # KILL QUERY, say) join the call's trace.
+        traced = telemetry.capture_context()
 
         def run() -> None:
             # The token stays alive while its callbacks run (the call may be
             # long gone): they can read its reason, or find it through
             # current_cancel_token().
             with cancel_scope(token):
-                _run_callbacks(callbacks, failed)
+                telemetry.run_in(traced, functools.partial(_run_callbacks, callbacks, failed))
 
         try:
             self._spawn(f"easy-mcp-cancel:{name}", run)
@@ -3459,8 +3631,16 @@ class MCPServer:
                 over stdin/stdout.  A :class:`Transport` instance can be
                 passed for custom configuration.
         """
+        built = self._telemetry_state
+        if self.metrics and built is not None and built.registry is None and not self._started:
+            # metrics turned on after the telemetry was built, but before
+            # anything was served: a module that built its app at import,
+            # run with ``easy-mcp run --metrics``.  Built anew, keeping its
+            # OpenTelemetry bridge (and so its instruments).
+            self._telemetry_state = Telemetry(self, metrics=True, otel=built.otel)
         self._transport = self._resolve_transport(transport)
         self._warn_if_misconfigured()
+        telemetry = self._telemetry
         self._logger.info(
             "starting %s v%s via %s",
             self.name,
@@ -3482,6 +3662,8 @@ class MCPServer:
                     "oauth": self.oauth is not None,
                     "rate_limit": self._limiter is not None,
                     "store": self._store.describe(),
+                    "metrics": telemetry.registry is not None,
+                    "tracing": telemetry.otel is not None,
                     "debug": self.debug,
                 }
             },
@@ -3537,6 +3719,15 @@ class MCPServer:
                     "binding %s without authentication exposes all public tools "
                     "to the network; configure APIKeyAuth",
                     self.host,
+                )
+            if (
+                self.metrics
+                and self.host not in LOOPBACK_HOSTS
+                and not isinstance(self._transport, StdioTransport)
+            ):
+                self._logger.info(
+                    "/metrics answers only loopback callers without auth; configure "
+                    "APIKeyAuth with a 'metrics:read' key to scrape it remotely"
                 )
         if self.oauth is not None:
             self._warn_about_oauth(self.oauth)

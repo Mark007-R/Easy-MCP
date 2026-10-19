@@ -213,6 +213,7 @@ class _Sink:
         "channel",
         "client_id",
         "closed",
+        "end_reason",
         "ended",
         "identity",
         "key",
@@ -262,6 +263,8 @@ class _Sink:
         # its completion result, or its client cancelled it.
         self.settled = False
         self.closed = False
+        # Why a listen stream ended, as subscription_close audits it.
+        self.end_reason: str | None = None
         # The resource URIs a listen stream was acknowledged for; a session's
         # are kept by the notifier, since they outlive its sinks.
         self.uris = uris
@@ -850,6 +853,7 @@ class ChangeNotifier:
             return False
         waiting = sink._close()
         if sink.listen:
+            sink.end_reason = reason
             audit(
                 "subscription_close",
                 client_id=sink.client_id,
@@ -881,6 +885,7 @@ class ChangeNotifier:
                 sink.push(cancelled_message(sink.subscription_id, reason))
         except Exception:
             logger.debug("could not send the end of subscription %r", sink.subscription_id)
+        sink.end_reason = reason
         audit(
             "subscription_close",
             client_id=sink.client_id,

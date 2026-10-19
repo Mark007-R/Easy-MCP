@@ -552,3 +552,33 @@ def test_github_allow_write_over_stdio_needs_api_keys(monkeypatch: pytest.Monkey
     )
     assert keyed.instructions is not None
     assert "Write tools need an API key holding" in keyed.instructions
+
+
+def test_connector_metrics_flag() -> None:
+    from easy_mcp.connectors import _cli
+
+    parser = _cli.build_parser("test")
+    assert _cli.server_kwargs(parser.parse_args(["--metrics"]))["metrics"] is True
+    assert _cli.server_kwargs(parser.parse_args([]))["metrics"] is False
+    server = postgres.build_server(
+        connector=lambda: None, **_cli.server_kwargs(parser.parse_args(["--metrics"]))
+    )
+    assert "easy_mcp_tool_calls_total" in server.render_metrics()
+
+
+def test_connector_metrics_help_names_oauth_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    from easy_mcp.connectors import _cli
+
+    # OAuth from the environment, without API keys, puts /metrics behind a
+    # credential as keys do, so the help names both.
+    for name, value in OAUTH_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("EASY_MCP_API_KEYS", raising=False)
+    parser = _cli.build_parser("test")
+    server = postgres.build_server(
+        connector=lambda: None, **_cli.server_kwargs(parser.parse_args(["--metrics"]))
+    )
+    assert server.auth is None and server.auth_configured
+    help_text = " ".join(parser.format_help().split())
+    assert "with EASY_MCP_API_KEYS or EASY_MCP_OAUTH_RESOURCE set" in help_text
+    assert "metrics:read" in help_text
