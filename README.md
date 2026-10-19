@@ -44,15 +44,21 @@ pip install easy-mcp-kit
 The package installs as `easy-mcp-kit`; the import name is `easy_mcp`.
 
 Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
-`pip install "easy-mcp-kit[oauth]"` adds PyJWT, to verify OAuth access tokens
-locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
-Several worker processes sharing sessions and limits need Redis:
-`pip install "easy-mcp-kit[redis]"` (see
-[Running several workers](#running-several-workers)).
-`pip install "easy-mcp-kit[otel]"` adds the OpenTelemetry API, for traces
-(see [Traces and metrics](#traces-and-metrics)). Optional extras:
-`[pydantic]`, `[postgres]`, `[mysql]`, `[mongodb]`, `[oauth]`, `[redis]`,
-`[otel]`.
+Everything else is an optional extra, for the one feature that needs it;
+combine them as `pip install "easy-mcp-kit[redis,otel]"`:
+
+| Extra | Installs | For |
+|---|---|---|
+| `[oauth]` | PyJWT 2.15+, with its crypto extra | verifying JWT access tokens locally ([OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)); token introspection needs no extra |
+| `[redis]` | redis-py 5.0.1+ | `RedisStore`: sessions and limits shared between workers ([Running several workers](#running-several-workers)) |
+| `[otel]` | `opentelemetry-api` 1.30+ | OpenTelemetry spans and metrics ([Traces and metrics](#traces-and-metrics)); `metrics=True` and `/metrics` need no extra |
+| `[pydantic]` | Pydantic 2 | models as tool parameters and results ([Pydantic models](#pydantic-models-optional)) |
+| `[postgres]` | psycopg 3.1+ (binary) | the Postgres connector |
+| `[mysql]` | PyMySQL 1.1+ | the MySQL / MariaDB connector |
+| `[mongodb]` | pymongo 4.6+ | the MongoDB connector |
+
+The GitHub and SQLite connectors need no extra. Coming from 0.3.1? Read
+[Upgrading from 0.3.1](#upgrading-from-031) first.
 
 ## Why easy_mcp?
 
