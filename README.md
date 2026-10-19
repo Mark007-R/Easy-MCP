@@ -1037,74 +1037,69 @@ SHA-256 fingerprints ever appear):
  "client_id": "3f9c2a71b04d", "duration_ms": 0.42, "status": "ok"}}
 ```
 
-Cancellation leaves a trail as well: `tool_cancelled` when a client cancels,
-`cancel_callback_failed` when a tool's cancel callback raised (the detail is
-in the log under its `error_id`), and `tool_finished_after_cancel` when a sync
-tool finished after its call was cancelled or timed out. That last one is
-worth watching for tools that write.
+Every audit event goes to the `easy_mcp.audit` logger, with its name as
+`message` and its fields under `event` (`type` repeats the name). A
+`client_id` is the fingerprint of an API key or of a token's principal (32
+hex digits, so no client can pick one that shares another user's),
+`ip:<address>` for an anonymous HTTP client, or `stdio`. No event ever holds
+a key, a token, a secret, arguments, results, contents, prompt argument
+values, `_meta` or headers, and URIs are cut to 512 characters. The last
+column says what changed since 0.3.1.
 
-Middleware adds its own: `request_denied` and `tool_denied` (which names the
-`middleware` that refused) when a middleware refuses before the tool runs,
-`tool_result_withheld` when it replaces the answer of a tool that did run
-(`status: "cancelled"` when the middleware stopped the tool before it
-answered, with a timeout of its own, say), `middleware_failed` (with its
-`error_id` and `stage`) when one fails or breaks its contract, and
-`request_cancelled` when a request other than `tools/call` is cancelled. None
-of them carries arguments, results, `_meta` or headers.
+| Event | Logged when | Fields | 0.3.2 |
+|---|---|---|---|
+| **Calls** | | | |
+| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout` or `busy`; `error_id` with `error` and `output_schema_error` | |
+| `tool_denied` | a call is refused before its tool runs: bad arguments, `max_calls_per_session`, a step-up, or tool middleware | `tool`, `client_id`, `reason` (the exception's class: `ValidationError`, `SessionLimitError`, `InsufficientScopeError`, ...), `middleware` when one refused, `scope` for a step-up | `middleware`, `scope` added |
+| `tool_cancelled` | a `tools/call` is cancelled: by its client, a closed stateless connection, the session's end or shutdown | `client_id`, `request_id` | |
+| `request_cancelled` | any other request is cancelled in the same ways (reads, prompts and completions included; a listen stream's end is a `subscription_close`) | `method`, `client_id`, `request_id` | new |
+| `tool_finished_after_cancel` | a sync tool returns after its call was cancelled or timed out: worth watching for tools that write | `tool`, `client_id`, `reason` (`cancelled` or `timeout`), `status` (`ok` or `error`) | |
+| `resource_finished_after_cancel`, `prompt_finished_after_cancel`, `completion_finished_after_cancel` | the same, for a sync resource, prompt or completer | `uri`, `prompt`, or for a completion the `prompt` or template `uri` with `.` and the argument's name; then as above | new |
+| `cancel_callback_failed` | a cancel callback raised (the traceback is logged under its `error_id`) | `tool`, or `kind` and `name` for a resource, prompt or completion; `client_id`, `error_id` | `kind`, `name` added |
+| `rate_limited` | a message, an SSE session opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse` and `GET /metrics` for those two) | |
+| **Middleware** | | | |
+| `request_denied` | request middleware refuses before the work runs | `method`, `client_id`, `reason` (the exception's class), `middleware`, `tool` on `tools/call` | new |
+| `tool_result_withheld` | middleware replaces the answer of a tool that did run | `tool`, `client_id`, `middleware`, `status` (the tool's, or `cancelled` when the middleware stopped it before it answered, with a timeout of its own, say), `reason` | new |
+| `middleware_failed` | a middleware raises unexpectedly or breaks its contract | `middleware`, `method`, `tool` when there is one, `client_id`, `error_id`, `stage` (`before` or `after`) | new |
+| **Resources and prompts** | | | |
+| `resource_read` | a `resources/read` is answered | `uri`, `template` when one matched, `client_id`, `duration_ms`, `status`: `ok`, `not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`; `error_id` when one was logged; `hidden: true` when the URI matched an item the caller may not see | new |
+| `prompt_get` | a `prompts/get` of a prompt the caller may see is answered | `prompt`, `client_id`, `duration_ms`, `status` (as for reads; `denied` for bad arguments) | new |
+| `resource_subscribe`, `resource_unsubscribe` | a handshake-era session watches a resource or stops | `uri`, `client_id`, `session_id`, `session_ref` | new |
+| **Streams** | | | |
+| `subscription_open` | a `subscriptions/listen` stream is acknowledged | `client_id`, `subscription_id` (the listen request's id), `kinds`, `resources` (how many it watches, when it names any) | new |
+| `subscription_close` | a listen stream ends | `client_id`, `subscription_id`, `reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`, `token_expired`, `undeliverable` or `closed` | new |
+| `subscription_refused` | a listen is over its cap (`-32007`) | `client_id`, `reason` (`client_limit` or `server_limit`) | new |
+| `stream_open`, `stream_close` | a session's `GET /mcp` stream opens or closes | `session_id`, `session_ref`, `client_id`, `transport`; on close a `reason`: `client_closed`, `replaced`, `session_closed`, `shutdown` or `token_expired` | new |
+| **Sessions** | | | |
+| `session_open` | a handshake-era session opens: on Streamable HTTP when its `initialize` is answered, on legacy SSE and stdio when the stream or the process starts (so before `initialize`) | `session_id`, `session_ref`, `client_id`, `transport`; `protocol_version` on Streamable HTTP; `worker` with a shared store | `session_ref`, `protocol_version`, `worker` added; `transport` on legacy SSE |
+| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | legacy SSE `reason` and `store_lost` added |
+| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | `session_ref` added |
+| **Transports** | | | |
+| `origin_rejected` | a browser `Origin` is refused (`403`) | `origin` (cut to 200 characters), `path` | |
+| `header_mismatch` | a stateless request's MCP headers disagree with its body (`400`) | `client_id`, `transport` | |
+| `request_abandoned` | a stateless Streamable HTTP client closes the connection before its answer, which cancels the call | `client_id`, `request_id`, `transport` | |
+| `payload_too_large` | an oversized line arrives on stdio | `client_id`, `transport` | |
+| `stdio_auth_failed` | stdio refuses to start: an invalid `EASY_MCP_STDIO_API_KEY`, or one set for an `oauth=` server without API keys | none | |
+| `metrics_denied` | `/metrics` is refused | `reason` (`unauthenticated`, `insufficient_scope` or `not_local`), `client_id` | new |
+| **OAuth** | | | |
+| `auth_failed` | a token is refused (`401`), or lacks the required scopes at the transport's check (`403`) | `reason` (`expired`, `bad_signature`, `wrong_audience`, ... or `insufficient_scope`), `transport`, `client_id` (`ip:<address>`), `token_fp` (a fingerprint of the token), `issuer` when it is a configured one, `scope` for `insufficient_scope` | new |
+| `auth_rate_limited` | an address is over its failed-token budget (`429`) | `client_id`, `transport` | new |
+| `auth_unavailable` | the authorization server cannot be reached | `issuer`, `stage` (`metadata`, `keys` or `introspection`) | new |
+| `principal_seen` | this process first sees a signed-in user; every other event names the user by fingerprint only | `client_id` (the principal's fingerprint), `issuer`, `subject`, `oauth_client_id` | new |
+| **Shared store** | | | |
+| `bus_message_rejected` | a message between workers fails its authentication or names another identity | `op`, `session_ref`, `src` (the sending worker), `reason` (`mac` or `identity`) | new |
+| `sse_relay_failed` | an answer cannot reach the worker holding a legacy SSE stream | `session_ref`, `reason` (`too_large`, `unserializable` or `owner_unreachable`), `error_id` for the first two, which still reach the stream as a `-32603` error with it | new |
 
-Resources and prompts add `resource_read` (the URI, cut to 512 characters,
-the `template` it matched, the client, duration and `status`: `ok`,
-`not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`, with an
-`error_id` when one was logged, and `hidden: true` when the URI matched an
-item the caller may not see) and `prompt_get` (the prompt, the client,
-duration and `status`, `denied` for bad arguments). Neither carries
-contents or argument values. `resource_subscribe` and `resource_unsubscribe`
-name the URI, the client and the session. `request_cancelled` covers reads,
-prompts and completions, and `resource_finished_after_cancel`,
-`prompt_finished_after_cancel` and `completion_finished_after_cancel` mirror
-`tool_finished_after_cancel`. Completions are not audited one by one (they
-arrive per keystroke); their failures are logged with an `error_id`, and list
-requests are not audited, as `tools/list` is not.
-
-Change notifications add `subscription_open` (the client, the listen
-request's id, the list kinds it gets and how many `resources` it watches),
-`subscription_close` (with its
-`reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`,
-`token_expired`, `undeliverable` or `closed`), `subscription_refused`
-(`client_limit` or `server_limit`), and `stream_open` / `stream_close` for a
-session's `GET /mcp` stream (closed as `client_closed`, `replaced`,
-`session_closed`, `shutdown` or `token_expired`). The notifications
-themselves are logged at debug level only.
-
-OAuth adds `auth_failed` (why a token was refused, the client address and a
-fingerprint of the token), `auth_rate_limited`, `auth_unavailable` (the
-authorization server could not be reached) and `principal_seen`, logged once
-per signed-in user and process with the token's issuer, subject and client;
-every other event names that user by fingerprint only (32 hex digits, so no
-client can pick a client id that shares another user's). `tool_denied`
-carries the `scope` a step-up asked for. No event ever holds a token or a
-secret.
-
-Session events (`session_open`, `session_close`,
-`session_credential_mismatch`) carry `session_ref`, a digest of the session
-id that also names the session in the store. On Streamable HTTP,
-`session_open` also carries the negotiated `protocol_version`; legacy SSE and
-stdio sessions are audited as open before their `initialize` arrives, so
-theirs carries none. The raw `session_id` is still there, but is dropped from
-audit events in 0.4: key log processing on `session_ref`. With a shared
-store, session events carry the `worker` that logged them (a session's
-close is logged once, by the worker that removes it from the store or, if
-the store lost it, by the worker serving it: `reason: "lease_lost"` on
-legacy SSE, `"store_lost"` on Streamable HTTP),
-`bus_message_rejected` records a message between workers that failed its
-authentication (`reason: "mac"`) or names another identity
-(`reason: "identity"`), and `sse_relay_failed` an answer that could not reach
-the worker holding a legacy SSE stream (`reason: "too_large"`,
-`"unserializable"` or `"owner_unreachable"`); the first two still reach the
-stream, as a `-32603` error with an `error_id`.
-
-`/metrics` adds `metrics_denied` (with its `reason`: `unauthenticated`,
-`insufficient_scope` or `not_local`).
+`session_ref` is a digest of the session id, and also names the session in
+the store. The raw `session_id` is deprecated in audit events and dropped in
+0.4: key log processing on `session_ref`. Completions (they arrive per
+keystroke) and list requests are not audited; a completer's failure is
+logged with its `error_id`. A call of a protected tool the caller cannot see
+is answered as an unknown tool and audited nowhere; with metrics it counts as
+`easy_mcp_status="unauthorized"`. Notifications sent to clients are logged
+at debug level only. `server.run()` also logs a `startup` event on the
+`easy_mcp` logger: the transport, what is registered, and whether auth,
+OAuth, rate limiting, the store, metrics, tracing and debug are on.
 
 ### Traces and metrics
 
