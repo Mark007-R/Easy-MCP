@@ -57,8 +57,10 @@ oauth = ["pyjwt[crypto]>=2.15.0"]
 otel = ["opentelemetry-api>=1.30"]
 # RedisStore: sessions and limits shared between workers.  5.0.1 is the first
 # release with aclose() and after the fixes for connections left unread by a
-# cancelled command, which disconnects routinely cause here.
-redis = ["redis>=5.0.1"]
+# cancelled command, which disconnects routinely cause here; 5.0.2 is the first
+# whose BlockingConnectionPool does not deadlock when a connect fails, which
+# hung startup on a Redis out of reach.
+redis = ["redis>=5.0.2"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -66,7 +68,7 @@ dev = [
     "pydantic>=2.0",
     "pymongo>=4.6",  # bson, for the MongoDB connector's Extended JSON tests
     "pyjwt[crypto]>=2.15.0",  # the OAuth tests sign their own tokens
-    "redis>=5.0.1",  # RedisStore's unit tests; its live tests need a server too
+    "redis>=5.0.2",  # RedisStore's unit tests; its live tests need a server too
     "opentelemetry-sdk>=1.30",  # the tracing tests export to memory
     "prometheus-client>=0.20",  # its parser checks the /metrics exposition
     "ruff>=0.5",
@@ -86,6 +88,7 @@ Homepage = "https://github.com/Mark007-R/Easy-MCP"
 Repository = "https://github.com/Mark007-R/Easy-MCP"
 Issues = "https://github.com/Mark007-R/Easy-MCP/issues"
 Security = "https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md"
+Changelog = "https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
 path = "easy_mcp/_version.py"

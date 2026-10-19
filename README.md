@@ -9,7 +9,7 @@
 
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
 
-Watch the [demo video](docs/Demo.mp4) and browse the [server](docs/server.py.png) / [client](docs/client.py.png) code snapshots in [`docs/`](docs/).
+Watch the [demo video](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/Demo.mp4) and browse the [server](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/server.py.png) / [client](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/client.py.png) code snapshots in [`docs/`](https://github.com/Mark007-R/Easy-MCP/tree/main/docs).
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Tools, resources and prompts are all plain functions. Schema generation,
@@ -44,15 +44,21 @@ pip install easy-mcp-kit
 The package installs as `easy-mcp-kit`; the import name is `easy_mcp`.
 
 Requires Python 3.11+. Only two runtime dependencies: `starlette` and `uvicorn`.
-`pip install "easy-mcp-kit[oauth]"` adds PyJWT, to verify OAuth access tokens
-locally (see [OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)).
-Several worker processes sharing sessions and limits need Redis:
-`pip install "easy-mcp-kit[redis]"` (see
-[Running several workers](#running-several-workers)).
-`pip install "easy-mcp-kit[otel]"` adds the OpenTelemetry API, for traces
-(see [Traces and metrics](#traces-and-metrics)). Optional extras:
-`[pydantic]`, `[postgres]`, `[mysql]`, `[mongodb]`, `[oauth]`, `[redis]`,
-`[otel]`.
+Everything else is an optional extra, for the one feature that needs it;
+combine them as `pip install "easy-mcp-kit[redis,otel]"`:
+
+| Extra | Installs | For |
+|---|---|---|
+| `[oauth]` | PyJWT 2.15+, with its crypto extra | verifying JWT access tokens locally ([OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)); token introspection needs no extra |
+| `[redis]` | redis-py 5.0.2+ | `RedisStore`: sessions and limits shared between workers ([Running several workers](#running-several-workers)) |
+| `[otel]` | `opentelemetry-api` 1.30+ | OpenTelemetry spans and metrics ([Traces and metrics](#traces-and-metrics)); `metrics=True` and `/metrics` need no extra |
+| `[pydantic]` | Pydantic 2 | models as tool parameters and results ([Pydantic models](#pydantic-models-optional)) |
+| `[postgres]` | psycopg 3.1+ (binary) | the Postgres connector |
+| `[mysql]` | PyMySQL 1.1+ | the MySQL / MariaDB connector |
+| `[mongodb]` | pymongo 4.6+ | the MongoDB connector |
+
+The GitHub and SQLite connectors need no extra. Coming from 0.3.1? Read
+[Upgrading from 0.3.1](#upgrading-from-031) first.
 
 ## Why easy_mcp?
 
@@ -473,11 +479,9 @@ middleware's error, over HTTP as the stream's last event. Once a stream has
 had its result, or its client cancelled it, an error raised after
 `call_next()` is not sent: a request gets one answer.
 
-A custom transport takes part by setting `ClientContext.push` (how the server
-sends on the client's channel) and `ClientContext.multiplexed`, and by calling
-`server.close_subscriptions(context)` when the channel ends, and again once
-the requests it was still running have finished (an `initialize` answered
-meanwhile starts the session's notifications anew).
+A custom transport takes part through `ClientContext.push`,
+`ClientContext.multiplexed` and `server.close_subscriptions()`; see
+[Custom transports](#custom-transports).
 
 ### Resource updates
 
@@ -623,10 +627,12 @@ The store needs Redis 7.0 or later: an older Redis reports a write refused
 inside a script (Redis full, read-only or failing to persist) as a generic
 error, which is answered as an internal error rather than `503`. Give Redis
 TLS (`rediss://`), a user limited to the `easy-mcp:` keys and channels (the
-ACL is in [SECURITY.md](SECURITY.md); as written it needs Redis 7.2 or
-later), and the default `noeviction` memory policy. Servers that share one
-Redis need different `name=`s, since the name is the store's namespace, or
-an explicit `RedisStore(..., namespace=...)`.
+ACL is in
+[SECURITY.md](https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md);
+as written it needs Redis 7.2 or later), and the default `noeviction`
+memory policy. Servers that share one Redis need different `name=`s, since
+the name is the store's namespace, or an explicit
+`RedisStore(..., namespace=...)`.
 `RedisStore.from_client(client)` takes a `redis.asyncio` client you
 configured yourself (a custom TLS context, a Sentinel master); Redis Cluster
 is not supported. Client options may follow
@@ -724,7 +730,11 @@ What clients see:
   asks the user for it; the broader token works at once, in the same session.
   Over legacy SSE the call is answered on the stream instead, with a `-32001`
   JSON-RPC error whose `data.error` is `"insufficient_scope"`, and the SSE
-  `403` (sent before the body is read) names only `required_scopes`.
+  `403` (sent before the body is read) never names a tool's scope: it asks
+  for `required_scopes` and, as every handshake-era `403` does, also lists
+  the scopes the token already holds that this server checks, so a client
+  asking again keeps them (its JSON-RPC `data.scope` lists only the missing
+  `required_scopes`).
   Pass `step_up=False` to keep protected tools invisible to
   tokens that cannot call them, as with API keys. A token's `*` scope is never
   a wildcard. Resources, templates and prompts follow the same rule: a
@@ -782,7 +792,7 @@ Good to know:
   `server.oauth.metadata_path` at the root of the host.
 - Browser-based clients on other origins need CORS headers, which easy_mcp
   does not send yet; clients behind a proxy (such as the MCP Inspector's) are
-  not affected.
+  not affected. [Not in 0.3.2](#not-in-032) has a workaround.
 
 ### Rate limiting, payload caps, timeouts, session limits
 
@@ -1037,74 +1047,73 @@ SHA-256 fingerprints ever appear):
  "client_id": "3f9c2a71b04d", "duration_ms": 0.42, "status": "ok"}}
 ```
 
-Cancellation leaves a trail as well: `tool_cancelled` when a client cancels,
-`cancel_callback_failed` when a tool's cancel callback raised (the detail is
-in the log under its `error_id`), and `tool_finished_after_cancel` when a sync
-tool finished after its call was cancelled or timed out. That last one is
-worth watching for tools that write.
+Every audit event goes to the `easy_mcp.audit` logger, with its name as
+`message` and its fields under `event` (`type` repeats the name). A
+`client_id` is the fingerprint of an API key (12 hex digits) or of a token's
+principal (32 hex digits, so no client can pick one that shares another
+user's), `ip:<address>` for an anonymous HTTP client, or `stdio`. No event
+ever holds a key, a token, a secret, arguments, results, contents, prompt
+argument values, `_meta` or header values other than a refused `Origin`
+(`origin_rejected`, cut to 200 characters), and URIs are cut to 512
+characters (to 256, ending in `...`, in the `*_finished_after_cancel` events
+and in `cancel_callback_failed`'s `name`, so a URI longer than that is not
+spelled the same there as in its `resource_read`). The last column says what
+changed since 0.3.1.
 
-Middleware adds its own: `request_denied` and `tool_denied` (which names the
-`middleware` that refused) when a middleware refuses before the tool runs,
-`tool_result_withheld` when it replaces the answer of a tool that did run
-(`status: "cancelled"` when the middleware stopped the tool before it
-answered, with a timeout of its own, say), `middleware_failed` (with its
-`error_id` and `stage`) when one fails or breaks its contract, and
-`request_cancelled` when a request other than `tools/call` is cancelled. None
-of them carries arguments, results, `_meta` or headers.
+| Event | Logged when | Fields | 0.3.2 |
+|---|---|---|---|
+| **Calls** | | | |
+| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout` or `busy`; `error_id` with `error` and `output_schema_error` | |
+| `tool_denied` | a call is refused before its tool runs: bad arguments, `max_calls_per_session`, a step-up, or tool middleware | `tool`, `client_id`, `reason` (the exception's class: `ValidationError`, `SessionLimitError`, `InsufficientScopeError`, ...), `middleware` when one refused, `scope` for a step-up | `middleware`, `scope` added |
+| `tool_cancelled` | a `tools/call` is cancelled: by its client, a closed stateless connection, the session's end or shutdown | `client_id`, `request_id` | |
+| `request_cancelled` | any other request is cancelled in the same ways (reads, prompts and completions included; a listen stream's end is a `subscription_close`) | `method`, `client_id`, `request_id` | new |
+| `tool_finished_after_cancel` | a sync tool returns after its call was cancelled or timed out: worth watching for tools that write | `tool`, `client_id`, `reason` (`cancelled` or `timeout`), `status` (`ok` or `error`) | |
+| `resource_finished_after_cancel`, `prompt_finished_after_cancel`, `completion_finished_after_cancel` | the same, for a sync resource, prompt or completer | `uri`, `prompt`, or for a completion the `prompt` or template `uri` with `.` and the argument's name; then as above | new |
+| `cancel_callback_failed` | a cancel callback raised (the traceback is logged under its `error_id`) | `tool`, or `kind` and `name` for a resource, prompt or completion; `client_id`, `error_id` | `kind`, `name` added |
+| `rate_limited` | a message, an SSE session opening, a `GET /mcp` stream opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse`, `GET /mcp` and `GET /metrics` for those three; the first two name the transport's configured path) | `GET /mcp` and `GET /metrics` added |
+| **Middleware** | | | |
+| `request_denied` | request middleware refuses before the work runs | `method`, `client_id`, `reason` (the exception's class), `middleware`, `tool` on `tools/call` | new |
+| `tool_result_withheld` | middleware replaces the answer of a tool that did run | `tool`, `client_id`, `middleware`, `status` (the tool's, or `cancelled` when the middleware stopped it before it answered, with a timeout of its own, say), `reason` | new |
+| `middleware_failed` | a middleware raises unexpectedly or breaks its contract | `middleware`, `method`, `tool` when there is one, `client_id`, `error_id`, `stage` (`before` or `after`) | new |
+| **Resources and prompts** | | | |
+| `resource_read` | a `resources/read` is answered | `uri`, `template` when one matched, `client_id`, `duration_ms`, `status`: `ok`, `not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`; `error_id` when one was logged; `hidden: true` when the URI matched an item the caller may not see | new |
+| `prompt_get` | a `prompts/get` of a prompt the caller may see is answered | `prompt`, `client_id`, `duration_ms`, `status` (as for reads; `denied` for bad arguments) | new |
+| `resource_subscribe`, `resource_unsubscribe` | a handshake-era session watches a resource or stops | `uri`, `client_id`, `session_id`, `session_ref` | new |
+| **Streams** | | | |
+| `subscription_open` | a `subscriptions/listen` stream is acknowledged | `client_id`, `subscription_id` (the listen request's id), `kinds`, `resources` (how many it watches, when it names any) | new |
+| `subscription_close` | a listen stream ends | `client_id`, `subscription_id`, `reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`, `token_expired`, `undeliverable` or `closed` | new |
+| `subscription_refused` | a listen is over its cap (`-32007`) | `client_id`, `reason` (`client_limit` or `server_limit`) | new |
+| `stream_open`, `stream_close` | a session's `GET /mcp` stream opens or closes | `session_id`, `session_ref`, `client_id`, `transport`; on close a `reason`: `client_closed`, `replaced`, `session_closed`, `shutdown` or `token_expired` | new |
+| **Sessions** | | | |
+| `session_open` | a handshake-era session opens: on Streamable HTTP when its `initialize` is answered, on legacy SSE and stdio when the stream or the process starts (so before `initialize`) | `session_id`, `session_ref`, `client_id`, `transport`; `protocol_version` on Streamable HTTP; `worker` with a shared store | `session_ref`, `protocol_version`, `worker` added; `transport` on legacy SSE |
+| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | `session_ref`, `worker` and `store_lost` added; `transport` and `reason` on legacy SSE |
+| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | `session_ref` added; `transport` on legacy SSE |
+| **Transports** | | | |
+| `origin_rejected` | a browser `Origin` is refused (`403`) | `origin` (cut to 200 characters), `path` | |
+| `header_mismatch` | a stateless request's MCP headers disagree with its body (`400`) | `client_id`, `transport` | |
+| `request_abandoned` | a stateless Streamable HTTP client closes the connection before its answer, which cancels the call | `client_id`, `request_id`, `transport` | |
+| `payload_too_large` | an oversized line arrives on stdio | `client_id`, `transport` | |
+| `stdio_auth_failed` | stdio refuses to start: an invalid `EASY_MCP_STDIO_API_KEY`, or one set for an `oauth=` server without API keys | none | |
+| `metrics_denied` | `/metrics` is refused | `reason` (`unauthenticated`, `insufficient_scope` or `not_local`), `client_id` | new |
+| **OAuth** | | | |
+| `auth_failed` | a token is refused (`401`), or lacks the required scopes at the transport's check (`403`) | `reason` (`expired`, `bad_signature`, `wrong_audience`, ... or `insufficient_scope`), `transport`, `client_id` (`ip:<address>`), `token_fp` (a fingerprint of the token), `issuer` when it is a configured one, `scope` for `insufficient_scope` | new |
+| `auth_rate_limited` | an address is over its failed-token budget (`429`) | `client_id`, `transport` | new |
+| `auth_unavailable` | the authorization server cannot be reached | `issuer`, `stage` (`metadata`, `keys` or `introspection`) | new |
+| `principal_seen` | this process first sees a signed-in user; every other event names the user by fingerprint only | `client_id` (the principal's fingerprint), `issuer`, `subject`, `oauth_client_id` | new |
+| **Shared store** | | | |
+| `bus_message_rejected` | a message between workers fails its authentication or names another identity | `op`, `session_ref`, `src` (the sending worker), `reason` (`mac` or `identity`) | new |
+| `sse_relay_failed` | an answer cannot reach the worker holding a legacy SSE stream | `session_ref`, `reason` (`too_large`, `unserializable` or `owner_unreachable`), `error_id` for the first two, which still reach the stream as a `-32603` error with it | new |
 
-Resources and prompts add `resource_read` (the URI, cut to 512 characters,
-the `template` it matched, the client, duration and `status`: `ok`,
-`not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`, with an
-`error_id` when one was logged, and `hidden: true` when the URI matched an
-item the caller may not see) and `prompt_get` (the prompt, the client,
-duration and `status`, `denied` for bad arguments). Neither carries
-contents or argument values. `resource_subscribe` and `resource_unsubscribe`
-name the URI, the client and the session. `request_cancelled` covers reads,
-prompts and completions, and `resource_finished_after_cancel`,
-`prompt_finished_after_cancel` and `completion_finished_after_cancel` mirror
-`tool_finished_after_cancel`. Completions are not audited one by one (they
-arrive per keystroke); their failures are logged with an `error_id`, and list
-requests are not audited, as `tools/list` is not.
-
-Change notifications add `subscription_open` (the client, the listen
-request's id, the list kinds it gets and how many `resources` it watches),
-`subscription_close` (with its
-`reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`,
-`token_expired`, `undeliverable` or `closed`), `subscription_refused`
-(`client_limit` or `server_limit`), and `stream_open` / `stream_close` for a
-session's `GET /mcp` stream (closed as `client_closed`, `replaced`,
-`session_closed`, `shutdown` or `token_expired`). The notifications
-themselves are logged at debug level only.
-
-OAuth adds `auth_failed` (why a token was refused, the client address and a
-fingerprint of the token), `auth_rate_limited`, `auth_unavailable` (the
-authorization server could not be reached) and `principal_seen`, logged once
-per signed-in user and process with the token's issuer, subject and client;
-every other event names that user by fingerprint only (32 hex digits, so no
-client can pick a client id that shares another user's). `tool_denied`
-carries the `scope` a step-up asked for. No event ever holds a token or a
-secret.
-
-Session events (`session_open`, `session_close`,
-`session_credential_mismatch`) carry `session_ref`, a digest of the session
-id that also names the session in the store. On Streamable HTTP,
-`session_open` also carries the negotiated `protocol_version`; legacy SSE and
-stdio sessions are audited as open before their `initialize` arrives, so
-theirs carries none. The raw `session_id` is still there, but is dropped from
-audit events in 0.4: key log processing on `session_ref`. With a shared
-store, session events carry the `worker` that logged them (a session's
-close is logged once, by the worker that removes it from the store or, if
-the store lost it, by the worker serving it: `reason: "lease_lost"` on
-legacy SSE, `"store_lost"` on Streamable HTTP),
-`bus_message_rejected` records a message between workers that failed its
-authentication (`reason: "mac"`) or names another identity
-(`reason: "identity"`), and `sse_relay_failed` an answer that could not reach
-the worker holding a legacy SSE stream (`reason: "too_large"`,
-`"unserializable"` or `"owner_unreachable"`); the first two still reach the
-stream, as a `-32603` error with an `error_id`.
-
-`/metrics` adds `metrics_denied` (with its `reason`: `unauthenticated`,
-`insufficient_scope` or `not_local`).
+`session_ref` is a digest of the session id, and also names the session in
+the store. The raw `session_id` is deprecated in audit events and dropped in
+0.4: key log processing on `session_ref`. Completions (they arrive per
+keystroke) and list requests are not audited; a completer's failure is
+logged with its `error_id`. A call of a protected tool the caller cannot see
+is answered as an unknown tool and audited nowhere; with metrics it counts as
+`easy_mcp_status="unauthorized"`. Notifications sent to clients are logged
+at debug level only. `server.run()` also logs a `startup` event on the
+`easy_mcp` logger: the transport, what is registered, and whether auth,
+OAuth, rate limiting, the store, metrics, tracing and debug are on.
 
 ### Traces and metrics
 
@@ -1137,9 +1146,11 @@ request would wait for the collector.
 A client that sends trace context in `params._meta` (`traceparent`,
 `tracestate`, `baggage`, which MCP reserves for this) gets the server span as
 a child of its own; the official MCP Python SDK client does this on its own.
-Over HTTP a `traceparent` header is used when `_meta` has none, and becomes a
-span link when it does; a span already current when the message arrives (an
-ASGI tracing middleware around the app) is the parent before the header.
+Over HTTP the trace-context headers (the fields of the configured
+propagators: `traceparent`, `tracestate` and `baggage` by default) are used
+when `_meta` has none, and the span they name becomes a span link when it
+does; a span already current when the message arrives (an ASGI tracing
+middleware around the app) is the parent before the headers.
 Code inside a tool runs in the span, sync tools' threads and cancel callbacks
 included, so spans it starts join the trace:
 
@@ -1235,6 +1246,32 @@ process opens no port), and `server.render_metrics()` returns the text.
 Each process keeps its own metrics; see
 [Production deployment](#production-deployment). `--metrics` turns this on
 for `easy-mcp run` and the connectors.
+
+## What works where
+
+Every transport serves both protocol eras: stdio and legacy SSE carry
+handshake-era sessions and stateless (`2026-07-28`) requests alike, and
+Streamable HTTP has a column for each. "Several workers" means processes
+sharing a `RedisStore` (see [Running several workers](#running-several-workers)).
+
+| | stdio | Legacy SSE (`/sse`) | Streamable HTTP sessions | Stateless HTTP (`2026-07-28`) | Several workers |
+|---|---|---|---|---|---|
+| Tools | yes | yes | yes | yes | yes, when every worker registers the same |
+| Resources and templates | yes | yes | yes | yes | yes, as tools |
+| Prompts | yes | yes | yes | yes | yes, as tools |
+| Completion | yes | yes | yes | yes | yes, as tools |
+| List changes | on stdout after `initialize`; `subscriptions/listen` for stateless clients | on the `/sse` stream | on the session's `GET /mcp` stream, also for changes made while none was open | `subscriptions/listen` | per worker: each tells the streams it holds about its own lists; what a session was last told is in the store |
+| Resource updates | `resources/subscribe`, or a listen's `resourceSubscriptions` | `resources/subscribe`, on the `/sse` stream | `resources/subscribe`, on `GET /mcp`; held until a stream opens | a listen's `resourceSubscriptions` | `notify_resource_updated` reaches its own worker's streams; subscriptions are in the store; an update with no stream open is lost |
+| OAuth 2.1 bearer tokens | no: local servers take credentials from the environment | yes; a missing tool scope is a `-32001` error on the stream, not a `403` | yes, with step-up `403` | yes, with step-up `403` | yes; key caches and the failed-token throttle per worker |
+| API keys | one, `EASY_MCP_STDIO_API_KEY` | yes | yes | yes | yes, the same keys in every worker |
+| Shared store | ignored: state stays in the process | sessions; answers relayed to the worker holding the stream | sessions, served by any worker | rate limits and per-client call counts | needed (or sticky sessions and per-worker limits) |
+| Metrics | no `/metrics`: `render_metrics()` or an OpenTelemetry exporter | `/metrics` | `/metrics` | `/metrics` | per worker: scrape each |
+| Tracing | yes | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, each worker exports its own spans |
+| Middleware | yes | yes | yes | yes | per worker: its state is not shared |
+
+`/metrics` and `/healthz` are served next to `/mcp` and `/sse` by the same
+app. Tracing needs `opentelemetry-api` and an SDK your application
+configures; metrics need only `metrics=True`.
 
 ## Connecting a client
 
@@ -1382,6 +1419,42 @@ Python's range included; malformed Extended JSON is reported as such.
 A `mongodb+srv://` URI is resolved on first use, not at startup. Connect as a
 user with only the `read` role.
 
+## Environment variables
+
+These are all the variables easy_mcp reads. Outside the `from_env()`
+constructors and the connectors, only the stdio key and the OpenTelemetry
+switches are read without being asked for.
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| **Server** | | |
+| `EASY_MCP_API_KEYS` | `APIKeyAuth.from_env()`, the connectors | API keys and their scopes, `key1:*;key2:reports\|stats` (`;` between keys, `\|` between scopes, `*` or none for all scopes) |
+| `EASY_MCP_STDIO_API_KEY` | `StdioTransport` (`server.run("stdio")`) | the stdio client's key; an invalid one stops startup |
+| `EASY_MCP_REDIS_URL` | `RedisStore.from_env()` | the shared store, a `redis://` or `rediss://` URL with its ACL user; client options may follow in the query string |
+| `EASY_MCP_OAUTH_RESOURCE` | `OAuthResourceServer.from_env()`, the connectors (OAuth is on when it is set) | required: the public URL of this endpoint |
+| `EASY_MCP_OAUTH_AUTHORIZATION_SERVERS` | the same | required: the accepted issuers, separated by spaces or commas |
+| `EASY_MCP_OAUTH_AUDIENCE` | the same | optional: the accepted `aud` values, when not the resource |
+| `EASY_MCP_OAUTH_REQUIRED_SCOPES` | the same | optional: scopes every token must carry |
+| `EASY_MCP_OAUTH_JWKS_URI` | the same | optional: where the signing keys are, instead of the authorization server's metadata |
+| `EASY_MCP_OAUTH_INTROSPECTION_CLIENT_ID`, `EASY_MCP_OAUTH_INTROSPECTION_CLIENT_SECRET` | the same | both or neither: verify tokens by introspection (RFC 7662) with these credentials |
+| `EASY_MCP_OAUTH_INTROSPECTION_ENDPOINT` | the same | optional: the introspection URL, instead of the metadata's |
+| `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS` | easy_mcp, once per server, when it first serves | a comma-separated list; `easy_mcp` in it turns easy_mcp's OpenTelemetry spans and metrics off (`metrics=True` and `/metrics` keep working) |
+| `OTEL_PROPAGATORS` | the OpenTelemetry API | the formats trace context is read in from `_meta` and headers; `tracecontext` alone drops client baggage |
+| **Connectors** | | |
+| `GITHUB_TOKEN` | `easy-mcp-github` | optional: the GitHub token; public data without it |
+| `GITHUB_API_URL` | `easy-mcp-github` | where the token is sent, by default `https://api.github.com` |
+| `DATABASE_URL` | `easy-mcp-postgres` | the connection string |
+| `MYSQL_URL` | `easy-mcp-mysql` | the connection URL |
+| `MONGODB_URI` | `easy-mcp-mongodb` | the connection string (the database comes from `--database` or the URI) |
+| `SQLITE_PATH` | `easy-mcp-sqlite` | the database file, when `--database` is not given |
+| **Tests** (read by the test suite only) | | |
+| `EASY_MCP_LIVE_SDK_CLIENT` | every interop test against the official MCP Python SDK client | `1` runs them (with `mcp` 2.3 or later installed) |
+| `EASY_MCP_LIVE_REDIS_URL` | the shared-store and middleware live tests | an admin URL of a scratch Redis database: the tests create an ACL user, briefly lower `maxmemory`, and delete their keys |
+| `EASY_MCP_LIVE_OAUTH_ISSUER`, `EASY_MCP_LIVE_OAUTH_RESOURCE`, `EASY_MCP_LIVE_OAUTH_TOKEN` | `tests/test_live_oauth.py` | a real authorization server: its issuer, the resource a fresh access token was issued for, and the token |
+| `EASY_MCP_LIVE_OAUTH_AUDIENCE`, `EASY_MCP_LIVE_OAUTH_INTROSPECTION_CLIENT_ID`, `EASY_MCP_LIVE_OAUTH_INTROSPECTION_CLIENT_SECRET` | the same | optional: the audience it maps the resource to; introspection credentials |
+| `EASY_MCP_LIVE_MYSQL_URL`, `EASY_MCP_LIVE_POSTGRES_URL`, `EASY_MCP_LIVE_MONGODB_URI` | `tests/test_live_cancellation.py` | a database the connector reaches as its least-privileged account, to check that a cancel stops the query there |
+| `EASY_MCP_LIVE_MONGODB_SETUP_URI` | the same | optional: an account that may write, to seed the MongoDB test's collection |
+
 ## Architecture
 
 ```
@@ -1437,9 +1510,7 @@ The dispatcher (`MCPServer.dispatch`) is transport-independent: it takes one
 decoded JSON-RPC message plus a `ClientContext` and returns the response.
 Transports only resolve credentials, cap payload sizes, and move bytes —
 so Streamable HTTP, SSE, and stdio all get the same checks, and a future
-WebSocket transport cannot silently bypass one. A custom transport should pass
-`transport=TransportInfo(name=..., headers=...)` to `dispatch`, so middleware
-knows how a message arrived.
+WebSocket transport cannot silently bypass one.
 
 **Determinism:** tool, resource and prompt listings are sorted, JSON output
 uses sorted keys, and identical inputs produce byte-identical responses — useful for reproducible
@@ -1452,12 +1523,77 @@ hand-written walker (no dependency, ~microseconds for typical payloads). The
 per-message overhead is dominated by JSON encode/decode; for large results
 prefer returning compact structures over huge strings.
 
+### Custom transports
+
+A transport moves messages; the server does everything else. A custom one (a
+WebSocket, a message queue) subclasses `Transport` and keeps this contract:
+
+- **A `ClientContext` per connection or session.** `client_id` is the
+  rate-limit key: the caller's `identity.fingerprint` when it authenticated,
+  an address such as `"ip:203.0.113.7"` otherwise. `session_id` names the
+  session the channel carries, uniquely. `tool_calls` and `in_flight` belong
+  to the server: a `notifications/cancelled` you dispatch cancels what
+  `in_flight` holds. `protocol_version` is set by the server when it answers
+  `initialize` (`None` before, and for stateless requests, which carry their
+  own); read it, never set it.
+- **Credentials.** `await server.authenticate_request(bearer=..., api_key=...,
+  client="ip:...")` resolves an API key or an OAuth token to a
+  `ClientIdentity` (`None` for anonymous access). It raises
+  `TokenRequiredError` or `InvalidTokenError` (answer `401`),
+  `InsufficientScopeError` (`403`) or `AuthServerUnavailableError` (`503`),
+  and a plain `AuthenticationError` for a value that matches no API key and
+  cannot be a token (answer `401`; catch the token errors first, since they
+  subclass it). `server.authenticate_key(key)` checks an API key alone.
+- **Per-request identity.** When every request of a session carries its own
+  credential, resolve it on every request, refuse one whose
+  `identity.fingerprint` is not the session's (for a token that is its
+  principal's, so a refreshed token keeps the session), and dispatch the
+  request with `dataclasses.replace(context, identity=identity)` when the
+  identity differs from the context's. The copy shares the session's call
+  counts, calls in flight and channel, so caps, cancels and notifications
+  stay the session's, while scopes come from the request's own credential.
+- **Dispatch.** `await server.dispatch(message, context, transport=info)`
+  for each decoded message, each in a task of its own, and write back what
+  it returns (`None`: nothing to send). Cancelling that task is how a closed
+  connection cancels a call. `TransportInfo(name, client_address=...,
+  client_port=..., http_version=..., headers=...)` tells middleware how the
+  message arrived and drops credential headers itself. Telemetry adds network
+  attributes, and reads trace-context headers (the global propagator's
+  fields: `traceparent`, `tracestate` and `baggage` by default), only for the
+  built-in names (`"stdio"`, `"streamable-http"`, `"sse"`); without
+  `transport=`, middleware sees `"custom"`.
+- **Server-initiated messages.** Set `push` to a function that queues one
+  message on the channel. The server calls it on the event loop only; it
+  must not block, and it raises once the channel can take no more. The
+  contexts of one channel share one `push`. Set `multiplexed=True` when all
+  of the channel's subscriptions share it, as on stdio and `/sse`: a
+  subscription the server ends is then also announced with
+  `notifications/cancelled`. Without `push`, `subscriptions/listen` answers
+  `-32601` and the channel hears no list changes or resource updates. With
+  `push` and no `store_handle`, a successful `initialize` starts the
+  session's notifications as `dispatch` returns its result, so write that
+  result before awaiting anything else. A listen's `dispatch` returns only
+  when its stream ends: its acknowledgment and notifications go through
+  `push`, and whatever `dispatch` returns at the end is sent like any answer.
+- **Ending.** Call `server.close_subscriptions(context, reason=...)` when the
+  channel ends, and again once the requests it was still running have
+  finished (an `initialize` answered meanwhile starts the session's
+  notifications anew); it is idempotent. Serve inside
+  `async with server.lifespan(): ...`, which connects the store, fetches
+  OAuth keys and, at the end, gives tool threads 5 s.
+- **`store_handle`.** Leave it `None`: call counts, cancels and the rate
+  limit then stay in the process (`dispatch` charges `check_rate_limit()`),
+  as on stdio. The built-in HTTP transports set it from the store's session
+  records, which is what lets workers share them; `Store` and `StoreHandle`
+  are provisional until 1.0.
+
 ## Production deployment
 
 - Run behind TLS (reverse proxy such as Caddy/nginx) — API keys travel in headers.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
-- Browser-based clients on other origins must be listed in `allowed_origins`.
+- Browser-based clients on other origins must be listed in `allowed_origins`,
+  and need CORS headers (see [Not in 0.3.2](#not-in-032)).
 - With OAuth, set `resource` to the exact URL clients use, and behind a proxy
   forward `/.well-known/oauth-protected-resource/...` to the server too.
 - Notification streams (`GET /mcp`, `subscriptions/listen`, `/sse`) stay
@@ -1491,7 +1627,94 @@ prefer returning compact structures over huge strings.
   for anyone who reaches it; uvicorn's proxy-header trust (`--proxy-headers`
   with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all)
   makes the peer address client-controlled.
-- Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
+- Read [SECURITY.md](https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md)
+  before exposing a server beyond localhost.
+
+## Upgrading from 0.3.1
+
+A server that worked on 0.3.1 needs no code change, unless a row below asks
+for one. These are the differences its clients, proxies and log pipelines
+can see; the
+[CHANGELOG](https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md)
+has the details.
+
+| What changed | What to do |
+|---|---|
+| `initialize` and `server/discover` advertise `tools.listChanged: true`, and a tool registered or removed while clients are connected sends them `notifications/tools/list_changed` (stdout, the `/sse` stream, the session's `GET /mcp` stream) | Nothing for MCP clients. A hand-written stdio client must accept notifications between answers. |
+| `GET /mcp` with a session's `MCP-Session-Id` opens a long-lived `text/event-stream` instead of answering `405` | Keep proxy buffering off and idle timeouts above 15 s for it, as for `/sse`; under your own uvicorn pass `--timeout-graceful-shutdown`. |
+| Every request except `initialize` can be cancelled with `notifications/cancelled`, not only `tools/call`; a cancelled one gets no answer | Nothing; a client that cancels gets what it asked for. |
+| A call that middleware refuses, or that is cancelled before its tool starts, no longer spends a unit of `max_calls_per_session` (a busy one already did not); a call holds its unit from the built-in checks on, so concurrent calls beyond the cap get `-32006` while one waits in tool middleware | Nothing, unless you relied on refusals using up the cap. |
+| In a handshake-era session, each request runs with the identity of its own credential; the session stays bound to the principal that opened it | Nothing for API keys. With OAuth a refreshed or broader token takes effect at once. |
+| A stateless `tools/list` is `cacheScope: "private"` with request middleware registered or `oauth=` set, as with `auth=` before | Nothing; caches keep it per caller. |
+| No stateless (`2026-07-28`) response carries `-32002`: the `Origin` `403` sends `-32600`, any other becomes `-32001`; codes `-32023` to `-32099` become `-32603` with an `error_id`. Handshake-era clients still get `-32002`, now deprecated | A stateless client that matched `-32002` should look at the HTTP status (`403`) instead. |
+| `ClientContext` compares and hashes by identity, and can be weakly referenced | A custom transport that compared contexts with `==` must compare the fields it means. |
+| With a shared store, `/healthz` answers `503` (`"store": "unreachable"`) when Redis cannot be reached | Use it as the load balancer's health check: the worker would refuse those requests anyway. |
+| `subscriptions/listen` without the stateless `_meta` is `-32602` over stdio and legacy SSE (was `-32601`); over Streamable HTTP a listen with `params` is a stateless request, so missing mirrored headers get `400` with `-32020` | Nothing for MCP clients; send listens as stateless requests. |
+| A request with an `id` naming a `notifications/*` method is answered `-32601` (it got no answer at all); a stateless error `-32020` to `-32022` raised by middleware gets HTTP `400` | Nothing. |
+| `server.run()` gives running Streamable HTTP requests 5 s at shutdown, then cancels them with `503`, `-32008` (`data.reason: "shutdown"`) and `Retry-After: 1`; it used to wait without a bound | Retry on `503`. |
+| The HTTP transports charge the rate limit through `acheck_rate_limit()` | A subclass that overrides `check_rate_limit()` for HTTP must override `acheck_rate_limit()`. |
+| `max_sessions` counts the sessions of every endpoint of one kind serving a server together (Streamable HTTP and legacy SSE still apart), and Streamable HTTP endpoints share stateless call counts; each transport used to keep its own | Nothing, unless you serve one server at several endpoints of one kind and sized `max_sessions` per endpoint. |
+| `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`, and `/metrics` with `metrics=True` | Move the endpoint. |
+| Existing audit events gain fields (`session_ref`, `worker`, `protocol_version`, `middleware`, `scope`, a legacy SSE `transport` and `reason`), and the raw `session_id` is deprecated | Key log processing on `session_ref`; see the [event catalogue](#structured-logging-and-audit-trail). |
+| With `opentelemetry-api` installed and an SDK configured, every message is a span and JSON log lines carry `trace_id` and `span_id` | `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns this off. |
+| `ToolRegistrationError` is a subclass of the new `RegistrationError` | Nothing: existing `except` clauses still catch it. |
+
+## Not in 0.3.2
+
+The MCP specification has more than easy_mcp offers yet. These are not in
+0.3.2:
+
+- **Progress notifications.** `notifications/progress` is never sent; a
+  `progressToken` in `_meta` is ignored.
+- **Multi-round-trip requests** (`InputRequiredResult`): no tool, resource or
+  prompt can ask the client for input during a call. A retry carrying
+  `inputResponses` or `requestState` is served like any request (its read is
+  `private` with `ttlMs: 0`).
+- **Elicitation and sampling.** The server never sends `elicitation/create` or
+  `sampling/createMessage`.
+- **SSE resumability.** No stream carries event ids, and `Last-Event-ID` is
+  ignored. A client whose stream drops opens a new one: a session's
+  `GET /mcp` stream announces the list changes made meanwhile, a new listen
+  stream does not, so list again after reopening one.
+- **Tasks** (`tasks/*`) are unknown methods (`-32601`).
+- **Icons.** Tools, resources, prompts and the server carry no `icons`.
+- **Protocol logging** (`logging/setLevel`, `notifications/message`); logs go
+  to stderr and traces to OpenTelemetry, as the stateless revision prefers.
+- **`tools/list` pagination.** The tool list is always one page.
+- **Redis Cluster.** Use one Redis, or Sentinel through
+  `RedisStore.from_client()`.
+- **A notification bus between workers.** List changes and resource updates
+  are per worker; see [Running several workers](#running-several-workers).
+- **Resources in the connectors.** The five ready-made connectors offer
+  tools only.
+- **CORS for browser clients.** easy_mcp sends no CORS headers, so a
+  browser-based client on another origin cannot read its answers,
+  `WWW-Authenticate` or `MCP-Session-Id` (clients that are not browsers, and
+  those behind a proxy such as the MCP Inspector's, are not affected).
+  Until it does, wrap the app in Starlette's `CORSMiddleware`, list the same
+  origins in `allowed_origins`, and serve it with uvicorn instead of
+  `server.run()`; `build_app()`'s lifespan still runs through the wrapper:
+
+  ```python
+  # app.py: uvicorn app:app
+  from starlette.middleware.cors import CORSMiddleware
+
+  from easy_mcp import MCPServer, OAuthResourceServer
+
+  ORIGINS = ["https://app.example.com"]
+  server = MCPServer(allowed_origins=ORIGINS, oauth=OAuthResourceServer.from_env())
+  app = CORSMiddleware(
+      server.build_app(),
+      allow_origins=ORIGINS,
+      allow_methods=["GET", "POST", "DELETE"],
+      allow_headers=["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version",
+                     "MCP-Session-Id", "Mcp-Method", "Mcp-Name"],
+      expose_headers=["MCP-Session-Id", "WWW-Authenticate", "Retry-After"],
+  )
+  ```
+
+  The middleware answers preflight requests itself, and easy_mcp's `Origin`
+  check still refuses every origin not listed.
 
 ## Development
 
@@ -1513,8 +1736,9 @@ run only when
 Interop tests against the official MCP Python SDK client run when
 `EASY_MCP_LIVE_SDK_CLIENT=1` is set and `mcp` 2.3 or later is installed (best
 in a virtualenv of its own: `pip install "mcp>=2.3" -e .`).
-Releases are listed in [CHANGELOG.md](CHANGELOG.md).
+Releases are listed in
+[CHANGELOG.md](https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Mark007-R/Easy-MCP/blob/main/LICENSE).

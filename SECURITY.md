@@ -72,7 +72,7 @@ Consequences:
 | Notifications after a cancel | A `notifications/cancelled` naming a listen stream (stdio, legacy SSE) ends it before anything else runs, so not even a change already pending is written for it; a closed HTTP listen stream cancels its request. Cancels reach only the subscriptions of the channel they arrive on, and duplicate subscription ids on one channel are refused (`-32600`) |
 | Policy hooks weakening built-in checks | Middleware runs after the transport checks, the rate limit and protocol validation; tool middleware also after visibility, scopes, session caps and argument validation. It can refuse but cannot grant, cannot change the arguments a tool receives or the identity of the caller, and a failing middleware fails closed (`-32603`; the tool does not run if it failed before `call_next()`) |
 | Metrics disclosure | `/metrics` is off unless `metrics=True`. With auth configured it needs an API key or token holding `metrics:read` (a key's `*` too; a token's `*` is no wildcard). Without auth only a loopback peer that addressed a loopback `Host`, with no proxy forwarding header (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`), gets it, so neither a remote host connecting directly (which can forge `Host`) nor a DNS-rebinding page in a local browser (which cannot) can read it. Behind a proxy that check is not enough: uvicorn's proxy-header trust (`--proxy-headers` with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all) makes the peer address client-controlled, so a server behind any proxy, local or remote, needs auth before it serves `/metrics`. The `Origin` allowlist applies, scrapes spend the rate limit, and refusals are audited (`metrics_denied`). Metrics carry no client ids, key fingerprints, session ids, addresses or request ids |
-| Telemetry injection and cardinality | Method names outside the MCP method set are recorded as `_OTHER`, tool and prompt names only for registered ones, request ids cut to 128 characters and resource URIs to 512 (spans only, never span names or metric labels); trace-context values are read only from `traceparent`, `tracestate` and `baggage`, capped at 8192 characters and parsed only by the W3C parser, which ignores malformed ones. Each metric keeps at most 2000 series, folding the rest into `_OTHER`. Rate-limited and transport-refused messages create no span. Spans hold no arguments, results, exception text, headers or raw session ids (a SHA-256 digest stands in), not even with `debug=True`; a failed call carries its `error_id` |
+| Telemetry injection and cardinality | Method names outside the MCP method set are recorded as `_OTHER`, tool and prompt names only for registered ones, request ids cut to 128 characters and resource URIs to 512 (spans only, never span names or metric labels); trace-context values are read only from `traceparent`, `tracestate` and `baggage` in `_meta`, and over HTTP from the header fields of the configured propagators (those three by default), capped at 8192 characters and parsed by those propagators (the W3C parsers by default); values that name no valid span are ignored. Each metric keeps at most 2000 series, folding the rest into `_OTHER`. Rate-limited and transport-refused messages create no span. Spans hold no arguments, results, exception text, headers or raw session ids (a SHA-256 digest stands in), not even with `debug=True`; a failed call carries its `error_id` |
 | Telemetry failures | Every telemetry step is guarded: a broken span processor, exporter or SDK never changes an answer (the first failure is logged as a warning, later ones at debug level), and easy_mcp itself never awaits an exporter; but span processors run inside `span.end()` on the event loop, so use `BatchSpanProcessor` (a `SimpleSpanProcessor` makes every request wait for the export) |
 
 ## Transport trust boundaries
@@ -186,6 +186,66 @@ request and tool call. The same trust model applies to them as to tools:
   returns or the server shuts down.
 - **Never block the event loop.** A blocking middleware stalls every client;
   use `await asyncio.to_thread(...)` for blocking work.
+
+## The surfaces 0.3.2 adds, together
+
+0.3.2 adds long-lived streams, one new unauthenticated endpoint (the OAuth
+Protected Resource Metadata; the existing `/healthz` gains fields),
+`/metrics`, a shared store with messages between workers, and two telemetry
+channels that leave the host. The table above has a row for each
+protection; this section reviews the surfaces side by side, and then where
+they meet.
+
+| Surface | Who can reach it | What it exposes or accepts | What bounds it | Left to you |
+|---|---|---|---|---|
+| `GET /mcp` streams | the holder of a session id together with the credential that opened the session | list-change notifications without names, judged by what the session's latest credential may see; `notifications/resources/updated` with the URI | one per session (a new one replaces the old), sessions capped by `max_sessions`, one rate-limit unit per open, a coalescing outbox, keep-alives every 15 s, the expiry of the OAuth token it opened with | proxy buffering off, idle timeouts above 15 s, `--timeout-graceful-shutdown` under your own uvicorn |
+| `subscriptions/listen` streams | any stateless client that passes authentication (anonymous ones unless `oauth=` is set; with `auth=` alone they hear only what public callers may see) | the same notifications, tagged with the listen's id, for resources the caller may read | 8 per client and `max_sessions` per process, 1000 URIs, one rate-limit unit per open; its identity is the listen request's for the stream's life, which ends when that request's OAuth token expires | as for `GET /mcp` |
+| `/metrics` | with auth, a key or token holding `metrics:read` (or a key holding `*`); without auth, only a loopback peer that addressed a loopback host with no proxy forwarding header | request and tool counts and durations by method, registered tool and prompt name, outcome and protocol version; no client ids, fingerprints, session ids, addresses or request ids | off unless `metrics=True`; the `Origin` check; the rate limit; 2000 series per metric; refusals audited (`metrics_denied`) | auth behind any proxy, local or remote; a scrape key of its own, which is also a key on `/mcp` |
+| `/.well-known/oauth-protected-resource/...` and `/healthz` | anyone: no credential, no rate limit | the metadata: `resource`, the authorization servers and `scopes_supported` (`required_scopes`, or with `step_up=False` every scope a tool, resource or prompt names); `/healthz`: the server's name and version, its tool count, and with OAuth or a shared store their status | small, constant answers (the metadata may be cached for 5 minutes); the `Origin` check | scope and server names that say nothing secret; filter `/healthz` at the proxy if its version and tool count should stay private |
+| The shared store and the bus between workers | whoever reaches Redis with its credentials | session records (client ids, credential fingerprints, list digests, subscribed resource URIs in clear), counts and rate limits, relayed legacy SSE answers in transit | no API keys, tokens or session ids are stored; messages between workers are authenticated with a key derived from the session id, bound to the session's credential and dropped after 60 s; the store fails closed | TLS, the least-privilege ACL user, `noeviction` with `maxmemory`, a namespace per server: Redis is inside the trust boundary |
+| Resource URIs in audit logs and spans | your log store, your tracing backend, and whoever can read them | each URI a client reads or watches, cut to 512 characters, template values included (`users://{user_id}/...` logs the id) | never in span names or metric labels; contents never logged | no secrets in URIs; logs and traces treated as holding the identifiers your URIs carry; a span processor that drops `mcp.resource.uri` if the tracing backend is less trusted than the log store |
+| Client trace context | any client | `traceparent`, `tracestate` and `baggage` in `_meta`, and over HTTP as headers (the fields of the configured propagators) | 8192 characters each, the configured propagators' parsers (W3C by default), malformed values ignored and never echoed; log lines carry only this process's own span ids | `ParentBased(remote_parent_sampled=...)` to cap sampling, `OTEL_PROPAGATORS=tracecontext` to drop client baggage |
+| Middleware | your code, on every request that passes the built-in checks | validated arguments, `_meta`, the caller's identity (never the token), headers without credentials | it cannot skip a check, grant access or rewrite a result; it fails closed; telemetry encloses it, so its refusals are still measured | bounded awaits; a review of what it logs or exports; no decisions on headers a client can set or on `clientInfo` |
+
+Where they meet:
+
+- **A resource URI leaves the host more than once.** The audit log and the
+  request's span both carry it, an exporter sends the span to your tracing
+  backend, and with a shared store a subscribed URI also sits in Redis. A
+  template that puts an identifier into URIs puts it in all three places.
+- **Client baggage can reach other services.** Baggage a client sends is
+  current inside the tool, so an instrumented HTTP client there forwards it
+  to whatever the tool calls: a client can put up to 8192 characters into
+  another service's request headers. `OTEL_PROPAGATORS=tracecontext` stops
+  it.
+- **A client chooses the trace its spans join**, and under a parent-based
+  sampler whether they are sampled. Spans carry `easy_mcp.client_id`, so the
+  choice stays attributable.
+- **Streams follow credentials differently.** A session's `GET /mcp` stream
+  judges what to announce by the credential of the session's latest request
+  (served by the worker holding the stream, with a shared store), so a
+  broader token widens what it hears and a narrower one narrows it. A listen
+  stream keeps the identity it opened with. Both end when the OAuth token
+  they opened with expires; the legacy `/sse` stream does not, since every
+  message posted to its session (`POST /messages`) is verified again.
+- **Everything that streams, counts or traces is per process.** A scrape
+  sees one worker; a listen hears the changes made in its own worker; a
+  probe for hidden tools shows in telemetry (`easy_mcp_status="unauthorized"`
+  and the span's tool name) but not in the audit log.
+- **A scrape key is an API key.** It also authenticates on `/mcp` and can call
+  public tools and `requires_auth` tools without scopes. `/metrics` also
+  shows the scraper which registered tools and prompts were called,
+  protected ones included.
+- **The metadata and step-up trade disclosure.** With `step_up=False` the
+  public metadata lists every item scope, so its scope names hint at what
+  protected items exist; with step-up (the default) it lists only
+  `required_scopes`, but every signed-in caller sees every item, and a
+  `403` names the scope it needs.
+- **Middleware writes into the request's span.** Attributes it adds leave
+  through the exporter with the span, so review them as you review its logs.
+- **A client that stops reading any stream holds up shutdown** once its
+  buffers are full (see Known limitations); list changes can fill them
+  without the client sending anything.
 
 ## Ready-made connectors
 
@@ -355,14 +415,21 @@ the client is untrusted, the credential in the environment is trusted.
   call. Such a token still comes from a trusted issuer for this audience, and
   would learn the same after one step-up; `step_up=False` keeps tools hidden.
   Legacy SSE checks the credential before it reads the body, so its `403`
-  names only `required_scopes`.
+  never names a tool's scope and reveals nothing about whether a tool exists.
+  Like every handshake-era `403`, its challenge also lists the scopes the
+  token already holds that this server checks (so a client asking again
+  keeps them): a token that lacks `required_scopes` learns which of its own
+  scopes the server uses, which `scopes_supported` does not show while
+  step-up is on.
 - **OAuth caches and the failed-token throttle are per process.** Each worker
   fetches its own keys and counts failures on its own; behind a proxy, all
   clients share the proxy's address for that throttle, as for anonymous rate
   limiting.
 - **No CORS headers yet.** A browser-based client on another origin cannot
   read `WWW-Authenticate` or the metadata cross-origin; clients behind a proxy
-  are not affected.
+  are not affected. The README's "Not in 0.3.2" shows a workaround with
+  Starlette's `CORSMiddleware`; list exactly the origins you trust, in it and
+  in `allowed_origins`.
 - **Middleware is not covered by tool timeouts.** A tool's `timeout` bounds the
   tool function only; a middleware must bound its own awaits.
 - **Some messages never reach middleware.** Requests the transport rejects,
@@ -383,11 +450,12 @@ the client is untrusted, the credential in the environment is trusted.
   `traceparent` in `_meta` (or, over HTTP, as a header) chooses the trace its
   server spans join, and under the SDK's default parent-based sampler,
   whether they are sampled; spans carry `easy_mcp.client_id`, so who did it
-  stays visible. Client baggage reaches tool code and anything it calls with
-  an instrumented client. Use `ParentBased(remote_parent_sampled=...)` to cap
-  sampling and `OTEL_PROPAGATORS=tracecontext` to drop client baggage. A
-  malformed value is ignored, never echoed, and never an error. Log lines
-  carry the `trace_id` and `span_id` only of a span this process made: with
+  stays visible. Client baggage, from `_meta` or (over HTTP) a `baggage`
+  header, reaches tool code and anything it calls with an instrumented
+  client. Use `ParentBased(remote_parent_sampled=...)` to cap sampling and
+  `OTEL_PROPAGATORS=tracecontext` to drop client baggage. A malformed value
+  is ignored, never echoed, and never an error. Log lines carry the
+  `trace_id` and `span_id` only of a span this process made: with
   no SDK configured they carry none, so a client's own ids never appear in
   the audit log as the server's.
 - **A hidden tool's call leaves no audit event.** A call of a protected tool
