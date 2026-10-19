@@ -1229,6 +1229,32 @@ Each process keeps its own metrics; see
 [Production deployment](#production-deployment). `--metrics` turns this on
 for `easy-mcp run` and the connectors.
 
+## What works where
+
+Every transport serves both protocol eras: stdio and legacy SSE carry
+handshake-era sessions and stateless (`2026-07-28`) requests alike, and
+Streamable HTTP has a column for each. "Several workers" means processes
+sharing a `RedisStore` (see [Running several workers](#running-several-workers)).
+
+| | stdio | Legacy SSE (`/sse`) | Streamable HTTP sessions | Stateless HTTP (`2026-07-28`) | Several workers |
+|---|---|---|---|---|---|
+| Tools | yes | yes | yes | yes | yes, when every worker registers the same |
+| Resources and templates | yes | yes | yes | yes | yes, as tools |
+| Prompts | yes | yes | yes | yes | yes, as tools |
+| Completion | yes | yes | yes | yes | yes, as tools |
+| List changes | on stdout after `initialize`; `subscriptions/listen` for stateless clients | on the `/sse` stream | on the session's `GET /mcp` stream, also for changes made while none was open | `subscriptions/listen` | per worker: each tells the streams it holds about its own lists; what a session was last told is in the store |
+| Resource updates | `resources/subscribe`, or a listen's `resourceSubscriptions` | `resources/subscribe`, on the `/sse` stream | `resources/subscribe`, on `GET /mcp`; held until a stream opens | a listen's `resourceSubscriptions` | `notify_resource_updated` reaches its own worker's streams; subscriptions are in the store; an update with no stream open is lost |
+| OAuth 2.1 bearer tokens | no: local servers take credentials from the environment | yes; a missing tool scope is a `-32001` error on the stream, not a `403` | yes, with step-up `403` | yes, with step-up `403` | yes; key caches and the failed-token throttle per worker |
+| API keys | one, `EASY_MCP_STDIO_API_KEY` | yes | yes | yes | yes, the same keys in every worker |
+| Shared store | ignored: state stays in the process | sessions; answers relayed to the worker holding the stream | sessions, served by any worker | rate limits and per-client call counts | needed (or sticky sessions and per-worker limits) |
+| Metrics | no `/metrics`: `render_metrics()` or an OpenTelemetry exporter | `/metrics` | `/metrics` | `/metrics` | per worker: scrape each |
+| Tracing | yes | yes, and the `traceparent` header | yes, and the `traceparent` header | yes, and the `traceparent` header | yes, each worker exports its own spans |
+| Middleware | yes | yes | yes | yes | per worker: its state is not shared |
+
+`/metrics` and `/healthz` are served next to `/mcp` and `/sse` by the same
+app. Tracing needs `opentelemetry-api` and an SDK your application
+configures; metrics need only `metrics=True`.
+
 ## Connecting a client
 
 ```bash
