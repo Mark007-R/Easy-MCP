@@ -780,7 +780,7 @@ Good to know:
   `server.oauth.metadata_path` at the root of the host.
 - Browser-based clients on other origins need CORS headers, which easy_mcp
   does not send yet; clients behind a proxy (such as the MCP Inspector's) are
-  not affected.
+  not affected. [Not in 0.3.2](#not-in-032) has a workaround.
 
 ### Rate limiting, payload caps, timeouts, session limits
 
@@ -1571,7 +1571,8 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
 - Run behind TLS (reverse proxy such as Caddy/nginx) — API keys travel in headers.
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
-- Browser-based clients on other origins must be listed in `allowed_origins`.
+- Browser-based clients on other origins must be listed in `allowed_origins`,
+  and need CORS headers (see [Not in 0.3.2](#not-in-032)).
 - With OAuth, set `resource` to the exact URL clients use, and behind a proxy
   forward `/.well-known/oauth-protected-resource/...` to the server too.
 - Notification streams (`GET /mcp`, `subscriptions/listen`, `/sse`) stay
@@ -1606,6 +1607,88 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all)
   makes the peer address client-controlled.
 - Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
+
+## Upgrading from 0.3.1
+
+A server that worked on 0.3.1 keeps working without code changes. These are
+the differences its clients, proxies and log pipelines can see; the
+[CHANGELOG](CHANGELOG.md) has the details.
+
+| What changed | What to do |
+|---|---|
+| `initialize` and `server/discover` advertise `tools.listChanged: true`, and a tool registered or removed while clients are connected sends them `notifications/tools/list_changed` (stdout, the `/sse` stream, the session's `GET /mcp` stream) | Nothing for MCP clients. A hand-written stdio client must accept notifications between answers. |
+| `GET /mcp` with a session's `MCP-Session-Id` opens a long-lived `text/event-stream` instead of answering `405` | Keep proxy buffering off and idle timeouts above 15 s for it, as for `/sse`; under your own uvicorn pass `--timeout-graceful-shutdown`. |
+| Every request except `initialize` can be cancelled with `notifications/cancelled`, not only `tools/call`; a cancelled one gets no answer | Nothing; a client that cancels gets what it asked for. |
+| A call that middleware refuses, or that is cancelled before its tool starts, no longer spends a unit of `max_calls_per_session` (a busy one already did not); a call holds its unit from the built-in checks on, so concurrent calls beyond the cap get `-32006` while one waits in tool middleware | Nothing, unless you relied on refusals using up the cap. |
+| In a handshake-era session, each request runs with the identity of its own credential; the session stays bound to the principal that opened it | Nothing for API keys. With OAuth a refreshed or broader token takes effect at once. |
+| A stateless `tools/list` is `cacheScope: "private"` with request middleware registered or `oauth=` set, as with `auth=` before | Nothing; caches keep it per caller. |
+| No stateless (`2026-07-28`) response carries `-32002`: the `Origin` `403` sends `-32600`, any other becomes `-32001`; codes `-32023` to `-32099` become `-32603` with an `error_id`. Handshake-era clients still get `-32002`, now deprecated | A stateless client matching `-32002` should match `-32001` and the HTTP status. |
+| `ClientContext` compares and hashes by identity, and can be weakly referenced | A custom transport that compared contexts with `==` must compare the fields it means. |
+| With a shared store, `/healthz` answers `503` (`"store": "unreachable"`) when Redis cannot be reached | Use it as the load balancer's health check: the worker would refuse those requests anyway. |
+| `subscriptions/listen` without the stateless `_meta` is `-32602` over stdio and legacy SSE (was `-32601`); over Streamable HTTP a listen with `params` is a stateless request, so missing mirrored headers get `400` with `-32020` | Nothing for MCP clients; send listens as stateless requests. |
+| A request with an `id` naming a `notifications/*` method is answered `-32601` (it got no answer at all); a stateless error `-32020` to `-32022` raised by middleware gets HTTP `400` | Nothing. |
+| `server.run()` gives running Streamable HTTP requests 5 s at shutdown, then cancels them with `503`, `-32008` (`data.reason: "shutdown"`) and `Retry-After: 1`; it used to wait without a bound | Retry on `503`. |
+| The HTTP transports charge the rate limit through `acheck_rate_limit()` | A subclass that overrides `check_rate_limit()` for HTTP must override `acheck_rate_limit()`. |
+| `max_sessions` counts the sessions of every endpoint of one kind serving a server together (Streamable HTTP and legacy SSE still apart), and Streamable HTTP endpoints share stateless call counts; each transport used to keep its own | Nothing, unless you serve one server at several endpoints of one kind and sized `max_sessions` per endpoint. |
+| `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`, and `/metrics` with `metrics=True` | Move the endpoint. |
+| Existing audit events gain fields (`session_ref`, `worker`, `protocol_version`, `middleware`, `scope`, a legacy SSE `reason`), and the raw `session_id` is deprecated | Key log processing on `session_ref`; see the [event catalogue](#structured-logging-and-audit-trail). |
+| With `opentelemetry-api` installed and an SDK configured, every message is a span and JSON log lines carry `trace_id` and `span_id` | `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns this off. |
+| `ToolRegistrationError` is a subclass of the new `RegistrationError` | Nothing: existing `except` clauses still catch it. |
+
+## Not in 0.3.2
+
+The MCP specification has more than easy_mcp offers yet. These are not in
+0.3.2:
+
+- **Progress notifications.** `notifications/progress` is never sent; a
+  `progressToken` in `_meta` is ignored.
+- **Multi-round-trip requests** (`InputRequiredResult`): no tool, resource or
+  prompt can ask the client for input during a call. A retry carrying
+  `inputResponses` or `requestState` is served like any request (its read is
+  `private` with `ttlMs: 0`).
+- **Elicitation and sampling.** The server never sends `elicitation/create` or
+  `sampling/createMessage`.
+- **SSE resumability.** No stream carries event ids, and `Last-Event-ID` is
+  ignored. A client whose stream drops opens a new one: a session's
+  `GET /mcp` stream announces the list changes made meanwhile, a new listen
+  stream does not, so list again after reopening one.
+- **Tasks** (`tasks/*`) are unknown methods (`-32601`).
+- **Icons.** Tools, resources, prompts and the server carry no `icons`.
+- **Protocol logging** (`logging/setLevel`, `notifications/message`); logs go
+  to stderr and traces to OpenTelemetry, as the stateless revision prefers.
+- **`tools/list` pagination.** The tool list is always one page.
+- **Redis Cluster.** Use one Redis, or Sentinel through
+  `RedisStore.from_client()`.
+- **A notification bus between workers.** List changes and resource updates
+  are per worker; see [Running several workers](#running-several-workers).
+- **Resources in the connectors.** The five ready-made connectors offer
+  tools only.
+- **CORS for browser clients.** easy_mcp sends no CORS headers, so a
+  browser-based client on another origin cannot read its answers,
+  `WWW-Authenticate` or `MCP-Session-Id` (clients that are not browsers, and
+  those behind a proxy such as the MCP Inspector's, are not affected).
+  Until it does, wrap the app in Starlette's `CORSMiddleware`, list the same
+  origins in `allowed_origins`, and serve it with uvicorn instead of
+  `server.run()`; `build_app()`'s lifespan still runs through the wrapper:
+
+  ```python
+  # app.py: uvicorn app:app
+  from starlette.middleware.cors import CORSMiddleware
+
+  ORIGINS = ["https://app.example.com"]
+  server = MCPServer(allowed_origins=ORIGINS, oauth=OAuthResourceServer.from_env())
+  app = CORSMiddleware(
+      server.build_app(),
+      allow_origins=ORIGINS,
+      allow_methods=["GET", "POST", "DELETE"],
+      allow_headers=["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version",
+                     "MCP-Session-Id", "Mcp-Method", "Mcp-Name"],
+      expose_headers=["MCP-Session-Id", "WWW-Authenticate", "Retry-After"],
+  )
+  ```
+
+  The middleware answers preflight requests itself, and easy_mcp's `Origin`
+  check still refuses every origin not listed.
 
 ## Development
 
