@@ -1377,6 +1377,42 @@ Python's range included; malformed Extended JSON is reported as such.
 A `mongodb+srv://` URI is resolved on first use, not at startup. Connect as a
 user with only the `read` role.
 
+## Environment variables
+
+These are all the variables easy_mcp reads. Outside the `from_env()`
+constructors and the connectors, only the stdio key and the OpenTelemetry
+switches are read without being asked for.
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| **Server** | | |
+| `EASY_MCP_API_KEYS` | `APIKeyAuth.from_env()`, the connectors | API keys and their scopes, `key1:*;key2:reports\|stats` (`;` between keys, `\|` between scopes, `*` or none for all scopes) |
+| `EASY_MCP_STDIO_API_KEY` | `StdioTransport` (`server.run("stdio")`) | the stdio client's key; an invalid one stops startup |
+| `EASY_MCP_REDIS_URL` | `RedisStore.from_env()` | the shared store, a `redis://` or `rediss://` URL with its ACL user; client options may follow in the query string |
+| `EASY_MCP_OAUTH_RESOURCE` | `OAuthResourceServer.from_env()`, the connectors (OAuth is on when it is set) | required: the public URL of this endpoint |
+| `EASY_MCP_OAUTH_AUTHORIZATION_SERVERS` | the same | required: the accepted issuers, separated by spaces or commas |
+| `EASY_MCP_OAUTH_AUDIENCE` | the same | optional: the accepted `aud` values, when not the resource |
+| `EASY_MCP_OAUTH_REQUIRED_SCOPES` | the same | optional: scopes every token must carry |
+| `EASY_MCP_OAUTH_JWKS_URI` | the same | optional: where the signing keys are, instead of the authorization server's metadata |
+| `EASY_MCP_OAUTH_INTROSPECTION_CLIENT_ID`, `EASY_MCP_OAUTH_INTROSPECTION_CLIENT_SECRET` | the same | both or neither: verify tokens by introspection (RFC 7662) with these credentials |
+| `EASY_MCP_OAUTH_INTROSPECTION_ENDPOINT` | the same | optional: the introspection URL, instead of the metadata's |
+| `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS` | easy_mcp, once per server, when it first serves | a comma-separated list; `easy_mcp` in it turns easy_mcp's OpenTelemetry spans and metrics off (`metrics=True` and `/metrics` keep working) |
+| `OTEL_PROPAGATORS` | the OpenTelemetry API | the formats trace context is read in from `_meta` and headers; `tracecontext` alone drops client baggage |
+| **Connectors** | | |
+| `GITHUB_TOKEN` | `easy-mcp-github` | optional: the GitHub token; public data without it |
+| `GITHUB_API_URL` | `easy-mcp-github` | where the token is sent, by default `https://api.github.com` |
+| `DATABASE_URL` | `easy-mcp-postgres` | the connection string |
+| `MYSQL_URL` | `easy-mcp-mysql` | the connection URL |
+| `MONGODB_URI` | `easy-mcp-mongodb` | the connection string (the database comes from `--database` or the URI) |
+| `SQLITE_PATH` | `easy-mcp-sqlite` | the database file, when `--database` is not given |
+| **Tests** (read by the test suite only) | | |
+| `EASY_MCP_LIVE_SDK_CLIENT` | every interop test against the official MCP Python SDK client | `1` runs them (with `mcp` 2.3 or later installed) |
+| `EASY_MCP_LIVE_REDIS_URL` | the shared-store and middleware live tests | an admin URL of a scratch Redis database: the tests create an ACL user, briefly lower `maxmemory`, and delete their keys |
+| `EASY_MCP_LIVE_OAUTH_ISSUER`, `EASY_MCP_LIVE_OAUTH_RESOURCE`, `EASY_MCP_LIVE_OAUTH_TOKEN` | `tests/test_live_oauth.py` | a real authorization server: its issuer, the resource a fresh access token was issued for, and the token |
+| `EASY_MCP_LIVE_OAUTH_AUDIENCE`, `EASY_MCP_LIVE_OAUTH_INTROSPECTION_CLIENT_ID`, `EASY_MCP_LIVE_OAUTH_INTROSPECTION_CLIENT_SECRET` | the same | optional: the audience it maps the resource to; introspection credentials |
+| `EASY_MCP_LIVE_MYSQL_URL`, `EASY_MCP_LIVE_POSTGRES_URL`, `EASY_MCP_LIVE_MONGODB_URI` | `tests/test_live_cancellation.py` | a database the connector reaches as its least-privileged account, to check that a cancel stops the query there |
+| `EASY_MCP_LIVE_MONGODB_SETUP_URI` | the same | optional: an account that may write, to seed the MongoDB test's collection |
+
 ## Architecture
 
 ```
