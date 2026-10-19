@@ -182,7 +182,7 @@ change for existing servers, each listed under Changed; the README's
   cancel token and a connector's `KILL QUERY` included), a legacy SSE message
   posted to another worker is answered on the stream, and sessions survive a
   worker restart. Install it with `pip install "easy-mcp-kit[redis]"`
-  (redis-py 5.0.1 or later). It needs Redis 7.0 or later, and the
+  (redis-py 5.0.2 or later). It needs Redis 7.0 or later, and the
   least-privilege ACL in SECURITY.md, as written, Redis 7.2 or later. The URL
   comes from `EASY_MCP_REDIS_URL`, and the server's `name` is the namespace
   unless `namespace=` says otherwise.
@@ -398,8 +398,9 @@ change for existing servers, each listed under Changed; the README's
   (`traceparent`, `tracestate`, `baggage`, reserved for this in
   `2026-07-28` and honoured for earlier versions too) makes the span a child
   of the client's; failing that, a span already current when the message
-  arrives, then (over HTTP) a `traceparent` header, which becomes a span
-  link when `_meta` wins. Malformed values are ignored. Tool code runs in
+  arrives, then (over HTTP) the trace-context headers (`traceparent`,
+  `tracestate` and `baggage` with the default propagators), which become a
+  span link when `_meta` wins. Malformed values are ignored. Tool code runs in
   the span, sync tools' threads and cancel callbacks included. A cancelled
   request is no error and has no duration sample; JSON-RPC codes the
   conventions call the caller's (`-32700`, `-32600`, `-32601`, `-32602`,
@@ -583,13 +584,14 @@ change for existing servers, each listed under Changed; the README's
   lines written during a request carry `trace_id` and `span_id`. Nothing
   changes on the wire: responses carry no trace ids.
 - Audit events of 0.3.1 gain fields: `session_open`, `session_close` and
-  `session_credential_mismatch` carry `session_ref` (and `worker` with a
-  shared store), legacy SSE session events carry `transport: "sse"` and
-  their `session_close` a `reason`, and a Streamable HTTP `session_open`
-  carries `protocol_version`. `tool_denied` names the `middleware` that
-  refused, or the `scope` a step-up asked for. A `cancel_callback_failed`
-  of a resource, prompt or completion names its `kind` and `name` (a tool's
-  still names the `tool`). The README lists every event and its fields.
+  `session_credential_mismatch` carry `session_ref`, `session_open` and
+  `session_close` also `worker` with a shared store, legacy SSE session
+  events carry `transport: "sse"` and their `session_close` a `reason`, and
+  a Streamable HTTP `session_open` carries `protocol_version`.
+  `tool_denied` names the `middleware` that refused, or the `scope` a
+  step-up asked for. A `cancel_callback_failed` of a resource, prompt or
+  completion names its `kind` and `name` (a tool's still names the `tool`).
+  The README lists every event and its fields.
 - Cancel callbacks run in the cancelled call's OpenTelemetry context, so
   spans they start (a database driver's cancel request, say) join the call's
   trace. They still find the token through `current_cancel_token()`, and

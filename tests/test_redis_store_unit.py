@@ -225,6 +225,30 @@ async def test_error_replies_redis_py_raises_map_to_store_unavailable() -> None:
         await store.aclose()
 
 
+async def test_replies_older_redis_py_leaves_unmapped_are_outages_too() -> None:
+    # Before 6.0, redis-py raises a plain ResponseError, code still in the
+    # message, for MASTERDOWN (a replica cut off from its master, as in a
+    # Sentinel failover), CLUSTERDOWN and TRYAGAIN.
+    client = FakeClient()
+    store = RedisStore.from_client(client, namespace="t")
+    record = SessionRecord(session_ref("s"), "http", "ip:x", None)
+    try:
+        for line in (
+            "MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.",
+            "CLUSTERDOWN The cluster is down",
+            "TRYAGAIN Multiple keys request during rehashing of slot",
+        ):
+            error = redis_errors.ResponseError(line)
+            client.replies = {name: error for name in _SCRIPTS}
+            client.replies["publish"] = error
+            with pytest.raises(StoreUnavailableError):
+                await store.create_session(record, cap=5, ttl=60)
+            with pytest.raises(StoreUnavailableError):
+                await store.publish("x")
+    finally:
+        await store.aclose()
+
+
 async def test_a_full_redis_is_answered_503_and_dispatch_never_raises() -> None:
     client = FakeClient()
     store = RedisStore.from_client(client, namespace="t")

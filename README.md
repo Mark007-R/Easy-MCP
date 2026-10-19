@@ -9,7 +9,7 @@
 
 **Build secure MCP (Model Context Protocol) servers from plain Python functions.**
 
-Watch the [demo video](docs/Demo.mp4) and browse the [server](docs/server.py.png) / [client](docs/client.py.png) code snapshots in [`docs/`](docs/).
+Watch the [demo video](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/Demo.mp4) and browse the [server](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/server.py.png) / [client](https://github.com/Mark007-R/Easy-MCP/blob/main/docs/client.py.png) code snapshots in [`docs/`](https://github.com/Mark007-R/Easy-MCP/tree/main/docs).
 
 `easy_mcp` is FastAPI-for-MCP: declare a function, add a decorator, run a server.
 Tools, resources and prompts are all plain functions. Schema generation,
@@ -50,7 +50,7 @@ combine them as `pip install "easy-mcp-kit[redis,otel]"`:
 | Extra | Installs | For |
 |---|---|---|
 | `[oauth]` | PyJWT 2.15+, with its crypto extra | verifying JWT access tokens locally ([OAuth 2.1 bearer tokens](#oauth-21-bearer-tokens)); token introspection needs no extra |
-| `[redis]` | redis-py 5.0.1+ | `RedisStore`: sessions and limits shared between workers ([Running several workers](#running-several-workers)) |
+| `[redis]` | redis-py 5.0.2+ | `RedisStore`: sessions and limits shared between workers ([Running several workers](#running-several-workers)) |
 | `[otel]` | `opentelemetry-api` 1.30+ | OpenTelemetry spans and metrics ([Traces and metrics](#traces-and-metrics)); `metrics=True` and `/metrics` need no extra |
 | `[pydantic]` | Pydantic 2 | models as tool parameters and results ([Pydantic models](#pydantic-models-optional)) |
 | `[postgres]` | psycopg 3.1+ (binary) | the Postgres connector |
@@ -627,10 +627,12 @@ The store needs Redis 7.0 or later: an older Redis reports a write refused
 inside a script (Redis full, read-only or failing to persist) as a generic
 error, which is answered as an internal error rather than `503`. Give Redis
 TLS (`rediss://`), a user limited to the `easy-mcp:` keys and channels (the
-ACL is in [SECURITY.md](SECURITY.md); as written it needs Redis 7.2 or
-later), and the default `noeviction` memory policy. Servers that share one
-Redis need different `name=`s, since the name is the store's namespace, or
-an explicit `RedisStore(..., namespace=...)`.
+ACL is in
+[SECURITY.md](https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md);
+as written it needs Redis 7.2 or later), and the default `noeviction`
+memory policy. Servers that share one Redis need different `name=`s, since
+the name is the store's namespace, or an explicit
+`RedisStore(..., namespace=...)`.
 `RedisStore.from_client(client)` takes a `redis.asyncio` client you
 configured yourself (a custom TLS context, a Sentinel master); Redis Cluster
 is not supported. Client options may follow
@@ -1043,12 +1045,13 @@ SHA-256 fingerprints ever appear):
 
 Every audit event goes to the `easy_mcp.audit` logger, with its name as
 `message` and its fields under `event` (`type` repeats the name). A
-`client_id` is the fingerprint of an API key or of a token's principal (32
-hex digits, so no client can pick one that shares another user's),
-`ip:<address>` for an anonymous HTTP client, or `stdio`. No event ever holds
-a key, a token, a secret, arguments, results, contents, prompt argument
-values, `_meta` or headers, and URIs are cut to 512 characters. The last
-column says what changed since 0.3.1.
+`client_id` is the fingerprint of an API key (12 hex digits) or of a token's
+principal (32 hex digits, so no client can pick one that shares another
+user's), `ip:<address>` for an anonymous HTTP client, or `stdio`. No event
+ever holds a key, a token, a secret, arguments, results, contents, prompt
+argument values, `_meta` or header values other than a refused `Origin`
+(`origin_rejected`, cut to 200 characters), and URIs are cut to 512
+characters. The last column says what changed since 0.3.1.
 
 | Event | Logged when | Fields | 0.3.2 |
 |---|---|---|---|
@@ -1060,7 +1063,7 @@ column says what changed since 0.3.1.
 | `tool_finished_after_cancel` | a sync tool returns after its call was cancelled or timed out: worth watching for tools that write | `tool`, `client_id`, `reason` (`cancelled` or `timeout`), `status` (`ok` or `error`) | |
 | `resource_finished_after_cancel`, `prompt_finished_after_cancel`, `completion_finished_after_cancel` | the same, for a sync resource, prompt or completer | `uri`, `prompt`, or for a completion the `prompt` or template `uri` with `.` and the argument's name; then as above | new |
 | `cancel_callback_failed` | a cancel callback raised (the traceback is logged under its `error_id`) | `tool`, or `kind` and `name` for a resource, prompt or completion; `client_id`, `error_id` | `kind`, `name` added |
-| `rate_limited` | a message, an SSE session opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse` and `GET /metrics` for those two) | |
+| `rate_limited` | a message, an SSE session opening, a `GET /mcp` stream opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse`, `GET /mcp` and `GET /metrics` for those three; the first two name the transport's configured path) | `GET /mcp` and `GET /metrics` added |
 | **Middleware** | | | |
 | `request_denied` | request middleware refuses before the work runs | `method`, `client_id`, `reason` (the exception's class), `middleware`, `tool` on `tools/call` | new |
 | `tool_result_withheld` | middleware replaces the answer of a tool that did run | `tool`, `client_id`, `middleware`, `status` (the tool's, or `cancelled` when the middleware stopped it before it answered, with a timeout of its own, say), `reason` | new |
@@ -1076,8 +1079,8 @@ column says what changed since 0.3.1.
 | `stream_open`, `stream_close` | a session's `GET /mcp` stream opens or closes | `session_id`, `session_ref`, `client_id`, `transport`; on close a `reason`: `client_closed`, `replaced`, `session_closed`, `shutdown` or `token_expired` | new |
 | **Sessions** | | | |
 | `session_open` | a handshake-era session opens: on Streamable HTTP when its `initialize` is answered, on legacy SSE and stdio when the stream or the process starts (so before `initialize`) | `session_id`, `session_ref`, `client_id`, `transport`; `protocol_version` on Streamable HTTP; `worker` with a shared store | `session_ref`, `protocol_version`, `worker` added; `transport` on legacy SSE |
-| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | legacy SSE `reason` and `store_lost` added |
-| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | `session_ref` added |
+| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | `session_ref`, `worker` and `store_lost` added; `transport` and `reason` on legacy SSE |
+| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | `session_ref` added; `transport` on legacy SSE |
 | **Transports** | | | |
 | `origin_rejected` | a browser `Origin` is refused (`403`) | `origin` (cut to 200 characters), `path` | |
 | `header_mismatch` | a stateless request's MCP headers disagree with its body (`400`) | `client_id`, `transport` | |
@@ -1136,9 +1139,11 @@ request would wait for the collector.
 A client that sends trace context in `params._meta` (`traceparent`,
 `tracestate`, `baggage`, which MCP reserves for this) gets the server span as
 a child of its own; the official MCP Python SDK client does this on its own.
-Over HTTP a `traceparent` header is used when `_meta` has none, and becomes a
-span link when it does; a span already current when the message arrives (an
-ASGI tracing middleware around the app) is the parent before the header.
+Over HTTP the trace-context headers (the fields of the configured
+propagators: `traceparent`, `tracestate` and `baggage` by default) are used
+when `_meta` has none, and the span they name becomes a span link when it
+does; a span already current when the message arrives (an ASGI tracing
+middleware around the app) is the parent before the headers.
 Code inside a tool runs in the span, sync tools' threads and cancel callbacks
 included, so spans it starts join the trace:
 
@@ -1254,7 +1259,7 @@ sharing a `RedisStore` (see [Running several workers](#running-several-workers))
 | API keys | one, `EASY_MCP_STDIO_API_KEY` | yes | yes | yes | yes, the same keys in every worker |
 | Shared store | ignored: state stays in the process | sessions; answers relayed to the worker holding the stream | sessions, served by any worker | rate limits and per-client call counts | needed (or sticky sessions and per-worker limits) |
 | Metrics | no `/metrics`: `render_metrics()` or an OpenTelemetry exporter | `/metrics` | `/metrics` | `/metrics` | per worker: scrape each |
-| Tracing | yes | yes, and the `traceparent` header | yes, and the `traceparent` header | yes, and the `traceparent` header | yes, each worker exports its own spans |
+| Tracing | yes | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, and the `traceparent`, `tracestate` and `baggage` headers | yes, each worker exports its own spans |
 | Middleware | yes | yes | yes | yes | per worker: its state is not shared |
 
 `/metrics` and `/healthz` are served next to `/mcp` and `/sse` by the same
@@ -1528,8 +1533,10 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   client="ip:...")` resolves an API key or an OAuth token to a
   `ClientIdentity` (`None` for anonymous access). It raises
   `TokenRequiredError` or `InvalidTokenError` (answer `401`),
-  `InsufficientScopeError` (`403`) or `AuthServerUnavailableError` (`503`).
-  `server.authenticate_key(key)` checks an API key alone.
+  `InsufficientScopeError` (`403`) or `AuthServerUnavailableError` (`503`),
+  and a plain `AuthenticationError` for a value that matches no API key and
+  cannot be a token (answer `401`; catch the token errors first, since they
+  subclass it). `server.authenticate_key(key)` checks an API key alone.
 - **Per-request identity.** When every request of a session carries its own
   credential, resolve it on every request, refuse one whose
   `identity.fingerprint` is not the session's (for a token that is its
@@ -1544,9 +1551,10 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   connection cancels a call. `TransportInfo(name, client_address=...,
   client_port=..., http_version=..., headers=...)` tells middleware how the
   message arrived and drops credential headers itself. Telemetry adds network
-  attributes, and reads a `traceparent` header, only for the built-in names
-  (`"stdio"`, `"streamable-http"`, `"sse"`); without `transport=`,
-  middleware sees `"custom"`.
+  attributes, and reads trace-context headers (the global propagator's
+  fields: `traceparent`, `tracestate` and `baggage` by default), only for the
+  built-in names (`"stdio"`, `"streamable-http"`, `"sse"`); without
+  `transport=`, middleware sees `"custom"`.
 - **Server-initiated messages.** Set `push` to a function that queues one
   message on the channel. The server calls it on the event loop only; it
   must not block, and it raises once the channel can take no more. The
@@ -1612,13 +1620,16 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   for anyone who reaches it; uvicorn's proxy-header trust (`--proxy-headers`
   with `--forwarded-allow-ips` or `FORWARDED_ALLOW_IPS`, `*` above all)
   makes the peer address client-controlled.
-- Read [SECURITY.md](SECURITY.md) before exposing a server beyond localhost.
+- Read [SECURITY.md](https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md)
+  before exposing a server beyond localhost.
 
 ## Upgrading from 0.3.1
 
 A server that worked on 0.3.1 needs no code change, unless a row below asks
 for one. These are the differences its clients, proxies and log pipelines
-can see; the [CHANGELOG](CHANGELOG.md) has the details.
+can see; the
+[CHANGELOG](https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md)
+has the details.
 
 | What changed | What to do |
 |---|---|
@@ -1637,7 +1648,7 @@ can see; the [CHANGELOG](CHANGELOG.md) has the details.
 | The HTTP transports charge the rate limit through `acheck_rate_limit()` | A subclass that overrides `check_rate_limit()` for HTTP must override `acheck_rate_limit()`. |
 | `max_sessions` counts the sessions of every endpoint of one kind serving a server together (Streamable HTTP and legacy SSE still apart), and Streamable HTTP endpoints share stateless call counts; each transport used to keep its own | Nothing, unless you serve one server at several endpoints of one kind and sized `max_sessions` per endpoint. |
 | `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`, and `/metrics` with `metrics=True` | Move the endpoint. |
-| Existing audit events gain fields (`session_ref`, `worker`, `protocol_version`, `middleware`, `scope`, a legacy SSE `reason`), and the raw `session_id` is deprecated | Key log processing on `session_ref`; see the [event catalogue](#structured-logging-and-audit-trail). |
+| Existing audit events gain fields (`session_ref`, `worker`, `protocol_version`, `middleware`, `scope`, a legacy SSE `transport` and `reason`), and the raw `session_id` is deprecated | Key log processing on `session_ref`; see the [event catalogue](#structured-logging-and-audit-trail). |
 | With `opentelemetry-api` installed and an SDK configured, every message is a span and JSON log lines carry `trace_id` and `span_id` | `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns this off. |
 | `ToolRegistrationError` is a subclass of the new `RegistrationError` | Nothing: existing `except` clauses still catch it. |
 
@@ -1681,6 +1692,8 @@ The MCP specification has more than easy_mcp offers yet. These are not in
   # app.py: uvicorn app:app
   from starlette.middleware.cors import CORSMiddleware
 
+  from easy_mcp import MCPServer, OAuthResourceServer
+
   ORIGINS = ["https://app.example.com"]
   server = MCPServer(allowed_origins=ORIGINS, oauth=OAuthResourceServer.from_env())
   app = CORSMiddleware(
@@ -1716,8 +1729,9 @@ run only when
 Interop tests against the official MCP Python SDK client run when
 `EASY_MCP_LIVE_SDK_CLIENT=1` is set and `mcp` 2.3 or later is installed (best
 in a virtualenv of its own: `pip install "mcp>=2.3" -e .`).
-Releases are listed in [CHANGELOG.md](CHANGELOG.md).
+Releases are listed in
+[CHANGELOG.md](https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Mark007-R/Easy-MCP/blob/main/LICENSE).

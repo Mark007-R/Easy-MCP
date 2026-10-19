@@ -189,20 +189,22 @@ request and tool call. The same trust model applies to them as to tools:
 
 ## The surfaces 0.3.2 adds, together
 
-0.3.2 adds long-lived streams, two unauthenticated endpoints, `/metrics`, a
-shared store with messages between workers, and two telemetry channels that
-leave the host. The table above has a row for each protection; this section
-reviews the surfaces side by side, and then where they meet.
+0.3.2 adds long-lived streams, one new unauthenticated endpoint (the OAuth
+Protected Resource Metadata; the existing `/healthz` gains fields),
+`/metrics`, a shared store with messages between workers, and two telemetry
+channels that leave the host. The table above has a row for each
+protection; this section reviews the surfaces side by side, and then where
+they meet.
 
 | Surface | Who can reach it | What it exposes or accepts | What bounds it | Left to you |
 |---|---|---|---|---|
 | `GET /mcp` streams | the holder of a session id together with the credential that opened the session | list-change notifications without names, judged by what the session's latest credential may see; `notifications/resources/updated` with the URI | one per session (a new one replaces the old), sessions capped by `max_sessions`, one rate-limit unit per open, a coalescing outbox, keep-alives every 15 s, the expiry of the OAuth token it opened with | proxy buffering off, idle timeouts above 15 s, `--timeout-graceful-shutdown` under your own uvicorn |
-| `subscriptions/listen` streams | any stateless client that passes authentication (anonymous ones when neither `auth=` nor `oauth=` is set) | the same notifications, tagged with the listen's id, for resources the caller may read | 8 per client and `max_sessions` per process, 1000 URIs, one rate-limit unit per open; its identity is the listen request's for the stream's life, which ends when that request's OAuth token expires | as for `GET /mcp` |
+| `subscriptions/listen` streams | any stateless client that passes authentication (anonymous ones unless `oauth=` is set; with `auth=` alone they hear only what public callers may see) | the same notifications, tagged with the listen's id, for resources the caller may read | 8 per client and `max_sessions` per process, 1000 URIs, one rate-limit unit per open; its identity is the listen request's for the stream's life, which ends when that request's OAuth token expires | as for `GET /mcp` |
 | `/metrics` | with auth, a key or token holding `metrics:read` (or a key holding `*`); without auth, only a loopback peer that addressed a loopback host with no proxy forwarding header | request and tool counts and durations by method, registered tool and prompt name, outcome and protocol version; no client ids, fingerprints, session ids, addresses or request ids | off unless `metrics=True`; the `Origin` check; the rate limit; 2000 series per metric; refusals audited (`metrics_denied`) | auth behind any proxy, local or remote; a scrape key of its own, which is also a key on `/mcp` |
 | `/.well-known/oauth-protected-resource/...` and `/healthz` | anyone: no credential, no rate limit | the metadata: `resource`, the authorization servers and `scopes_supported` (`required_scopes`, or with `step_up=False` every scope a tool, resource or prompt names); `/healthz`: the server's name and version, its tool count, and with OAuth or a shared store their status | small, constant answers (the metadata may be cached for 5 minutes); the `Origin` check | scope and server names that say nothing secret; filter `/healthz` at the proxy if its version and tool count should stay private |
 | The shared store and the bus between workers | whoever reaches Redis with its credentials | session records (client ids, credential fingerprints, list digests, subscribed resource URIs in clear), counts and rate limits, relayed legacy SSE answers in transit | no API keys, tokens or session ids are stored; messages between workers are authenticated with a key derived from the session id, bound to the session's credential and dropped after 60 s; the store fails closed | TLS, the least-privilege ACL user, `noeviction` with `maxmemory`, a namespace per server: Redis is inside the trust boundary |
 | Resource URIs in audit logs and spans | your log store, your tracing backend, and whoever can read them | each URI a client reads or watches, cut to 512 characters, template values included (`users://{user_id}/...` logs the id) | never in span names or metric labels; contents never logged | no secrets in URIs; logs and traces treated as holding the identifiers your URIs carry; a span processor that drops `mcp.resource.uri` if the tracing backend is less trusted than the log store |
-| Client trace context | any client | `traceparent`, `tracestate` and `baggage` in `_meta`, and over HTTP the `traceparent` header | 8192 characters each, the W3C parser, malformed values ignored and never echoed; log lines carry only this process's own span ids | `ParentBased(remote_parent_sampled=...)` to cap sampling, `OTEL_PROPAGATORS=tracecontext` to drop client baggage |
+| Client trace context | any client | `traceparent`, `tracestate` and `baggage` in `_meta`, and over HTTP as headers (the fields of the configured propagators) | 8192 characters each, the W3C parser, malformed values ignored and never echoed; log lines carry only this process's own span ids | `ParentBased(remote_parent_sampled=...)` to cap sampling, `OTEL_PROPAGATORS=tracecontext` to drop client baggage |
 | Middleware | your code, on every request that passes the built-in checks | validated arguments, `_meta`, the caller's identity (never the token), headers without credentials | it cannot skip a check, grant access or rewrite a result; it fails closed; telemetry encloses it, so its refusals are still measured | bounded awaits; a review of what it logs or exports; no decisions on headers a client can set or on `clientInfo` |
 
 Where they meet:
@@ -443,11 +445,12 @@ the client is untrusted, the credential in the environment is trusted.
   `traceparent` in `_meta` (or, over HTTP, as a header) chooses the trace its
   server spans join, and under the SDK's default parent-based sampler,
   whether they are sampled; spans carry `easy_mcp.client_id`, so who did it
-  stays visible. Client baggage reaches tool code and anything it calls with
-  an instrumented client. Use `ParentBased(remote_parent_sampled=...)` to cap
-  sampling and `OTEL_PROPAGATORS=tracecontext` to drop client baggage. A
-  malformed value is ignored, never echoed, and never an error. Log lines
-  carry the `trace_id` and `span_id` only of a span this process made: with
+  stays visible. Client baggage, from `_meta` or (over HTTP) a `baggage`
+  header, reaches tool code and anything it calls with an instrumented
+  client. Use `ParentBased(remote_parent_sampled=...)` to cap sampling and
+  `OTEL_PROPAGATORS=tracecontext` to drop client baggage. A malformed value
+  is ignored, never echoed, and never an error. Log lines carry the
+  `trace_id` and `span_id` only of a span this process made: with
   no SDK configured they carry none, so a client's own ids never appear in
   the audit log as the server's.
 - **A hidden tool's call leaves no audit event.** A call of a protected tool

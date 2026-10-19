@@ -606,12 +606,14 @@ def test_live_sessions_survive_a_worker_restart(fleet: Callable[..., Fleet]) -> 
 
 
 def test_live_idle_expiry_and_global_cap(fleet: Callable[..., Fleet]) -> None:
-    a, b = fleet(idle=1, max_sessions=2).workers
+    # The cap holds only while the first session is younger than the idle
+    # timeout, and three requests take well over a second on a busy machine.
+    a, b = fleet(idle=4, max_sessions=2).workers
     first, second = open_session(a), open_session(a)
     refused = post(b, rpc("initialize", INIT, "init"))
     assert refused.status_code == 503
     assert refused.json()["error"]["code"] == TOO_MANY_SESSIONS
-    time.sleep(1.5)
+    time.sleep(4.5)
     open_session(b)
     for session in (first, second):
         assert post(a, rpc("ping", msg_id=2), session=session).status_code == 404

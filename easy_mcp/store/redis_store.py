@@ -79,8 +79,9 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # Error replies that mean "the store cannot serve this now" rather than a bug.
 # redis-py raises its own class for most (see _call), with the code removed
-# from the message; these are the codes it leaves in place.
-_UNAVAILABLE_REPLIES = ("MISCONF", "BUSY", "NOREPLICAS")
+# from the message; these are the codes it leaves in place.  Before 6.0 it
+# also leaves MASTERDOWN, CLUSTERDOWN and TRYAGAIN in a plain ResponseError.
+_UNAVAILABLE_REPLIES = ("MISCONF", "BUSY", "NOREPLICAS", "MASTERDOWN", "CLUSTERDOWN", "TRYAGAIN")
 
 # Each kind's removed sessions are remembered in a sorted set ("gone"), scored
 # by when the memory lapses; the set itself lapses with its newest member.
@@ -668,8 +669,8 @@ class RedisStore(Store):
         except (
             exceptions.OutOfMemoryError,  # OOM: full, under noeviction
             exceptions.ReadOnlyError,  # READONLY: a replica, or a demoted primary
-            exceptions.ClusterDownError,  # MASTERDOWN, CLUSTERDOWN
-            exceptions.TryAgainError,  # TRYAGAIN
+            exceptions.ClusterDownError,  # MASTERDOWN, CLUSTERDOWN (redis-py 6.0+)
+            exceptions.TryAgainError,  # TRYAGAIN (redis-py 6.0+)
             exceptions.NoScriptError,  # NOSCRIPT: scripts flushed meanwhile
         ) as exc:
             self._unavailable(exc)
