@@ -651,6 +651,14 @@ async def test_a_cancel_thread_that_cannot_start_does_not_mask_the_cancel(
     await server.dispatch(notification("notifications/cancelled", {"requestId": 2}), context)
     assert await asyncio.wait_for(call, 5) is None  # still dropped, per MCP
     blocker.release.set()
+    # Let that call's thread finish and be audited here, or its
+    # tool_finished_after_cancel lands in the next test's log capture.
+    assert await wait_for(blocker.finished)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not any(
+        event["reason"] == "cancelled" for event in logs.events("tool_finished_after_cancel")
+    ):
+        await asyncio.sleep(0.02)
 
 
 async def test_a_tool_finishing_between_the_deadline_and_the_trigger_is_audited(
@@ -673,11 +681,18 @@ async def test_a_tool_finishing_between_the_deadline_and_the_trigger_is_audited(
     server._stop_tool = late  # type: ignore[method-assign]
     response = await server.dispatch(rpc("tools/call", {"name": "block"}), make_context())
     assert response is not None and response["error"]["code"] == TOOL_TIMEOUT
+
+    def timeouts() -> list[dict[str, Any]]:
+        # Only this test's call: a thread an earlier test left running may
+        # still be audited while this one runs.
+        events = logs.events("tool_finished_after_cancel")
+        return [event for event in events if event["reason"] == "timeout"]
+
     deadline = time.monotonic() + 3
-    while not logs.events("tool_finished_after_cancel") and time.monotonic() < deadline:
+    while not timeouts() and time.monotonic() < deadline:
         await asyncio.sleep(0.02)
-    (event,) = logs.events("tool_finished_after_cancel")
-    assert event["reason"] == "timeout" and event["status"] == "ok"
+    (event,) = timeouts()
+    assert event["status"] == "ok"
 
 
 class Rows(list):  # type: ignore[type-arg]
