@@ -1120,6 +1120,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
 
         def on_close() -> None:
             outbox.close()
+            # A question the call asked on this stream will get no answer now.
+            self._server._channel_closed(outbox.put)
             if cancel_on_close and not task.done():
                 task.cancel()  # the client closed the stream: that is its cancel
                 audit(

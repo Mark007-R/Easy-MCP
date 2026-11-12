@@ -13,6 +13,7 @@ import httpx
 import pytest
 from conftest import LogCapture, Pushed, make_context, modern, notification, rpc
 
+import easy_mcp
 import easy_mcp.elicitation
 import easy_mcp.server
 from easy_mcp import (
@@ -1000,3 +1001,143 @@ def test_an_elicitation_can_be_built_by_hand() -> None:
     content = accepted.content
     content["guests"] = 99
     assert accepted["guests"] == 2  # content is a copy
+
+
+# ----------------------------------------------- found by review, kept fixed
+
+
+async def test_a_state_that_is_not_ascii_is_refused_and_costs_no_call(logs: LogCapture) -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    runs: list[int] = []
+
+    @server.tool(max_calls_per_session=2)
+    def capped() -> str:
+        """A capped tool."""
+        runs.append(1)
+        return "ran"
+
+    context = make_context()
+    for state in ("abc.\ud800", "\ud800.abc", "é.é"):
+        refused = await server.dispatch(stateless("capped", requestState=state), context)
+        assert refused is not None
+        assert refused["error"] == {"code": INVALID_PARAMS, "message": "Invalid requestState"}
+    # None of them was a call: the cap is untouched.
+    assert text(await server.dispatch(stateless("capped"), context)) == "ran"
+    assert text(await server.dispatch(stateless("capped"), context)) == "ran"
+    assert runs == [1, 1]
+    assert not [record for record in logs.records if record.levelname == "ERROR"]
+
+
+async def test_a_question_asked_in_a_task_group_is_still_a_question() -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+
+    @server.tool
+    async def grouped() -> str:
+        """Ask from a child task."""
+
+        async def child() -> str:
+            return str(elicit("Where?", {"city": str}).get("city"))
+
+        async with asyncio.TaskGroup() as group:
+            task = group.create_task(child())
+        return task.result()
+
+    key, params = asked(await server.dispatch(stateless("grouped"), make_context()))
+    assert params["message"] == "Where?"
+    retry = stateless(
+        "grouped", inputResponses={key: {"action": "accept", "content": {"city": "Kyiv"}}}
+    )
+    assert text(await server.dispatch(retry, make_context())) == "Kyiv"
+    bad = stateless(
+        "grouped", inputResponses={key: {"action": "accept", "content": {"city": 7}}}
+    )
+    refused = await server.dispatch(bad, make_context())
+    assert refused is not None and refused["error"]["code"] == INVALID_PARAMS
+
+
+async def test_an_answer_no_utf8_can_hold_is_still_carried() -> None:
+    server, _ = booking_server()
+    key1, _ = asked(await server.dispatch(stateless("trip"), make_context()))
+    odd = {key1: {"action": "accept", "content": {"city": "\ud800"}}}
+    second = await server.dispatch(stateless("trip", inputResponses=odd), make_context())
+    key2, _ = asked(second)
+    assert second is not None
+    state = second["result"]["requestState"]
+    assert state.isascii()
+    answer2 = {key2: {"action": "accept", "content": {"by": "train"}}}
+    third = await server.dispatch(
+        stateless("trip", inputResponses=answer2, requestState=state), make_context()
+    )
+    assert text(third) == "\ud800 by train"
+
+
+async def test_a_finished_run_is_not_reported_when_the_call_is_cancelled_later(
+    logs: LogCapture,
+) -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    fired: list[str] = []
+
+    @server.tool
+    def careful() -> str:
+        """A sync tool that registers a cancel callback, then asks."""
+        token = easy_mcp.current_cancel_token()
+        assert token is not None
+        token.on_cancel(lambda: fired.append("stop the query"))
+        return str(elicit("Go?", {"go": bool}).get("go"))
+
+    pushed, context = await session(server)
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "careful"}, 9), context))
+    await question(pushed)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 9}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    await server.wait_for_tool_threads(2)
+    # The run that asked had ended before the cancel: nothing of it fires.
+    assert fired == []
+    assert logs.events("tool_finished_after_cancel") == []
+
+
+async def test_a_run_in_progress_is_still_cancelled_with_its_call() -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    stopped = threading.Event()
+    entered = threading.Event()
+
+    @server.tool
+    def slow() -> str:
+        """Ask once, then work until cancelled."""
+        if not elicit("Go?", {"go": bool}).accepted:
+            return "no"
+        token = easy_mcp.current_cancel_token()
+        assert token is not None
+        token.on_cancel(stopped.set)
+        entered.set()
+        token.wait(10)
+        return "stopped"
+
+    pushed, context = await session(server)
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", {"name": "slow"}, 9), context))
+    await server.dispatch(reply(await question(pushed), go=True), context)
+    assert await asyncio.to_thread(entered.wait, 5)
+    await server.dispatch(notification("notifications/cancelled", {"requestId": 9}), context)
+    assert await asyncio.wait_for(call, 5) is None
+    assert await asyncio.to_thread(stopped.wait, 5)
+
+
+async def test_a_question_on_a_stream_its_client_closed_ends_the_call() -> None:
+    server, runs = booking_server()
+    sent: list[dict[str, Any]] = []
+    context = make_context()
+    await server.dispatch(init(), context)
+    context.notify = sent.append
+    arguments = {"name": "book", "arguments": {"restaurant": "L"}}
+    call = asyncio.create_task(server.dispatch(rpc("tools/call", arguments), context))
+    deadline = time.monotonic() + 5
+    while not sent:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.005)
+    assert sent[0]["method"] == "elicitation/create"
+    # What a transport does when the response this call writes to has gone.
+    server._channel_closed(context.notify)
+    response = await asyncio.wait_for(call, 5)
+    assert response is not None and response["result"]["isError"] is True
+    assert "connection to the client has ended" in text(response)
+    assert server._asked == {} and runs == ["start"]

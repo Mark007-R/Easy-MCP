@@ -452,6 +452,8 @@ answer arrives, the function is called anew with the same arguments, and
 this time `elicit()` returns it. So ask first and act afterwards: anything
 before the last `elicit()` runs more than once. The tool's timeout covers
 each run, not the time the user takes.
+Progress keeps counting across runs: after a
+question, only values above those already reported are sent.
 
 That rule is what makes one tool work with every client:
 

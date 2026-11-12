@@ -54,6 +54,7 @@ from .elicitation import (
     _InputRequired,
     _InvalidAnswer,
     call_digest,
+    question_signal,
     supports_form,
 )
 from .exceptions import (
@@ -279,6 +280,11 @@ class _Target:
     kind: str  # "tool", "resource", "prompt" or "completion"
     label: str  # the tool or prompt name, the URI, or "<prompt or template>.<argument>"
     field: str  # the audit field the label goes in: "tool", "uri" or "prompt"
+
+
+def _fire(token: CancelToken, source: CancelToken) -> None:
+    """Cancel *token* for the reason *source* was."""
+    token.cancel(source.reason or CANCELLED)
 
 
 class _DeadlineExceeded(Exception):
@@ -610,8 +616,9 @@ class MCPServer:
         self._state = StateSigner(state_secret)
         self._state_warned = False
         # The questions sessions' clients have yet to answer, by the id of the
-        # request that asked: the future waiting, and the session asked.
-        self._asked: dict[str, tuple[asyncio.Future[dict[str, Any]], str]] = {}
+        # request that asked: the future waiting, the session asked, and the
+        # channel the question went out on.
+        self._asked: dict[str, tuple[asyncio.Future[dict[str, Any]], str, Push]] = {}
         self._registry = ToolRegistry()
         self._resources = ResourceRegistry()
         self._prompts = PromptRegistry()
@@ -3414,43 +3421,52 @@ class MCPServer:
         """
         definition = call.tool
         name = definition.name
+        # A session's call may run the function several times.  Each run gets
+        # a cancel token of its own, fired with the call's: what a finished
+        # run registered (its callbacks, the record of a late finish) must
+        # not fire when a later run, or the wait for an answer, is cancelled.
+        reruns = asking is not None and not asking.stateless and asking.unavailable is None
         rounds = 0
         while True:
             if asking is not None:
                 asking.begin()
+            token = call.cancel_token
+            unlink: Callable[[], None] | None = None
+            if reruns:
+                token = CancelToken()
+                token._on_error = call.cancel_token._on_error
+                unlink = call.cancel_token.on_cancel(
+                    functools.partial(_fire, token, call.cancel_token)
+                )
+            signal: _InputRequired | _InvalidAnswer
             try:
-                with _asking_scope(asking):
+                with _asking_scope(asking), cancel_scope(token):
                     value = await self._run_user_code(
                         definition.fn,
                         arguments,
                         is_async=definition.is_async,
                         timeout=call.timeout,
-                        token=call.cancel_token,
+                        token=token,
                         target=_Target("tool", name, "tool"),
                         context=context,
                         started=started,
                     )
                 return None, value
-            except _InputRequired as need:
-                assert asking is not None
-                if asking.stateless:
-                    return self._input_required(call, need, asking, context, duration_ms()), None
-                rounds += 1
-                if rounds > MAX_QUESTIONS:
-                    return self._question_failed(
-                        call,
-                        context,
-                        f"Tool '{name}' asked more than {MAX_QUESTIONS} questions",
-                        duration_ms(),
-                    ), None
-                try:
-                    asking.answers[need.key] = await self._ask_client(context, need, name)
-                except ElicitationUnavailableError as exc:
-                    return self._cannot_ask(call, asking, context, str(exc), duration_ms()), None
-                # The next run gets arguments of its own, as the first did.
-                arguments = build_param_models(definition.param_models, _copy(call._plain))
-            except _InvalidAnswer as bad:
-                assert asking is not None
+            except ElicitationUnavailableError as exc:
+                if asking is None:
+                    raise
+                return self._cannot_ask(call, asking, context, str(exc), duration_ms()), None
+            except BaseException as exc:
+                # A question, alone or in the exception group of a TaskGroup
+                # whose child asked it; anything else is not for us.
+                found = question_signal(exc)
+                if found is None or asking is None:
+                    raise
+                signal = found
+            finally:
+                if unlink is not None:
+                    unlink()
+            if isinstance(signal, _InvalidAnswer):
                 if asking.stateless:
                     audit(
                         "tool_call",
@@ -3461,22 +3477,34 @@ class MCPServer:
                     )
                     return ToolOutcome._create(
                         "refused",
-                        message="Invalid inputResponses: " + "; ".join(bad.errors),
+                        message="Invalid inputResponses: " + "; ".join(signal.errors),
                         started=True,
                         error_code=INVALID_PARAMS,
-                        data={"errors": bad.errors},
+                        data={"errors": signal.errors},
                         duration_ms=duration_ms(),
                     ), None
                 return self._question_failed(
                     call,
                     context,
-                    "The client's answer did not fit the question: " + "; ".join(bad.errors),
+                    "The client's answer did not fit the question: " + "; ".join(signal.errors),
                     duration_ms(),
                 ), None
+            if asking.stateless:
+                return self._input_required(call, signal, asking, context, duration_ms()), None
+            rounds += 1
+            if rounds > MAX_QUESTIONS:
+                return self._question_failed(
+                    call,
+                    context,
+                    f"Tool '{name}' asked more than {MAX_QUESTIONS} questions",
+                    duration_ms(),
+                ), None
+            try:
+                asking.answers[signal.key] = await self._ask_client(context, signal, name)
             except ElicitationUnavailableError as exc:
-                if asking is None:
-                    raise
                 return self._cannot_ask(call, asking, context, str(exc), duration_ms()), None
+            # The next run gets arguments of its own, as the first did.
+            arguments = build_param_models(definition.param_models, _copy(call._plain))
 
     def _input_required(
         self,
@@ -3588,7 +3616,7 @@ class MCPServer:
             )
         request_id = "easy-mcp-" + secrets.token_urlsafe(16)
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._asked[request_id] = (future, context.session_id)
+        self._asked[request_id] = (future, context.session_id, send)
         fields = {"tool": tool, "client_id": context.client_id, "question": need.key}
         audit("elicitation_requested", **fields)
         answered = False
@@ -3646,11 +3674,24 @@ class MCPServer:
         entry = self._asked.get(request_id) if isinstance(request_id, str) else None
         if entry is None:
             return False
-        future, session_id = entry
+        future, session_id, _ = entry
         if session_id != context.session_id or future.done():
             return False
         future.set_result(message)
         return True
+
+    def _channel_closed(self, send: Callable[[dict[str, Any]], None]) -> None:
+        """The channel *send* writes to has ended: the questions asked on it get no answer.
+
+        For a transport whose requests each have a channel of their own (a
+        Streamable HTTP response): a tool waiting for an answer there would
+        otherwise wait out the whole timeout for a client that has gone.
+        """
+        for future, _, channel in list(self._asked.values()):
+            if channel is send and not future.done():
+                future.set_exception(
+                    ElicitationUnavailableError("the connection to the client has ended")
+                )
 
     async def _run_user_code(
         self,
