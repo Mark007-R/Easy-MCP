@@ -24,6 +24,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   alike, they travel on the response of the request itself: see Changed.
 - `ClientContext.notify`, for custom transports that answer each request on
   a stream of its own: the server sends a request's progress there.
+- Icons. `MCPServer(icons=...)` and `icons=` on `@server.tool`,
+  `@server.resource` and `@server.prompt` attach MCP `Icon` objects, which
+  clients may show next to the server and its items. An `Icon` is an
+  `https://` URL or a `data:` URI, with optional `mime_type`, `sizes` and
+  `theme`; a plain string stands for its `src`, and `Icon.from_file()` embeds
+  an image file of up to 64 KiB. Any other source (`http:`, a path, another
+  scheme) is a registration error, since clients must refuse it. Icons appear
+  in `tools/list`, `resources/list`, `resources/templates/list` and
+  `prompts/list`, and the server's in `serverInfo`. The definitions gain an
+  `icons` field.
 - CORS for browser-based clients. `allowed_origins` is now the CORS policy
   as well as the `Origin` allowlist: a page on a listed origin (a loopback
   origin by default) gets its preflight answered (`204`, before credentials

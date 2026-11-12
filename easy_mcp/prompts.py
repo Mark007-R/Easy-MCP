@@ -17,6 +17,7 @@ from typing import Any
 from .completion import CompletionSource, choices_source, source_from
 from .decorators import Registry
 from .exceptions import RegistrationError, SchemaError
+from .icons import Icon, icons_to_mcp, normalize_icons
 from .schema import StringParameter, bind_string_arguments, parse_docstring, string_parameters
 
 # The same rule as tool names: safe in an Mcp-Name header.
@@ -38,6 +39,7 @@ class PromptDefinition:
     declared_scopes: tuple[str, ...] = ()
     timeout: float | None = None
     completers: Mapping[str, CompletionSource] = field(default_factory=dict)
+    icons: tuple[Icon, ...] = ()
 
     def to_mcp(self) -> dict[str, Any]:
         """Serialize it for a ``prompts/list`` response."""
@@ -46,6 +48,8 @@ class PromptDefinition:
             entry["title"] = self.title
         if self.description:
             entry["description"] = self.description
+        if self.icons:
+            entry["icons"] = icons_to_mcp(self.icons)
         if self.arguments:
             arguments = []
             for param in self.arguments:
@@ -76,6 +80,7 @@ def build_prompt(
     scopes: Iterable[str] = (),
     timeout: float | None = None,
     complete: Mapping[str, Any] | None = None,
+    icons: Iterable[Icon | str] | Icon | str | None = None,
 ) -> PromptDefinition:
     """Introspect *fn* and produce a :class:`PromptDefinition`.
 
@@ -95,6 +100,7 @@ def build_prompt(
         raise RegistrationError(f"{what}: title must be a non-empty string")
     if timeout is not None and timeout <= 0:
         raise RegistrationError(f"{what}: timeout must be positive")
+    prompt_icons = normalize_icons(icons, what)
     summary, param_docs = parse_docstring(inspect.getdoc(fn))
     text = (description if description is not None else summary).strip() or None
     try:
@@ -124,6 +130,7 @@ def build_prompt(
         declared_scopes=declared,
         timeout=timeout,
         completers=completers,
+        icons=prompt_icons,
     )
 
 

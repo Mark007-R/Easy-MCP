@@ -66,6 +66,7 @@ from .exceptions import (
     ToolRegistrationError,
     ValidationError,
 )
+from .icons import Icon, icons_to_mcp, normalize_icons
 from .logging import audit, configure_logging
 from .middleware import (
     ObservePolicy,
@@ -487,6 +488,10 @@ class MCPServer:
             may read the answers; cookies are never allowed.
         instructions: Optional usage hints sent to clients at initialize and
             in server/discover.
+        icons: Icons a client may show for the server:
+            :class:`~easy_mcp.Icon` objects, or strings standing for their
+            ``src`` (an ``https://`` URL or a ``data:`` URI).  Tools,
+            resources and prompts take their own ``icons=``.
         store: Where state that outlives one request is kept: handshake-era
             sessions, ``max_calls_per_session`` counts and rate-limit
             windows.  The default :class:`~easy_mcp.MemoryStore` keeps it in
@@ -529,6 +534,7 @@ class MCPServer:
         max_sessions: int = 256,
         allowed_origins: Iterable[str] | None = None,
         instructions: str | None = None,
+        icons: Iterable[Icon | str] | Icon | str | None = None,
         store: Store | None = None,
         metrics: bool = False,
         json_logs: bool = True,
@@ -577,6 +583,7 @@ class MCPServer:
             normalize_origins(allowed_origins) if allowed_origins is not None else None
         )
         self.instructions = instructions
+        self.icons = normalize_icons(icons, "icons", ValueError)
         self._registry = ToolRegistry()
         self._resources = ResourceRegistry()
         self._prompts = PromptRegistry()
@@ -638,12 +645,15 @@ class MCPServer:
         examples: Iterable[Mapping[str, Any]] = (),
         timeout: float | None = None,
         max_calls_per_session: int | None = None,
+        icons: Iterable[Icon | str] | Icon | str | None = None,
     ) -> Callable[..., Any]:
         """Register a function as an MCP tool.
 
         Works bare (``@server.tool``) or with options
         (``@server.tool(name="sum", scopes=("math",))``).  The wrapped
         function is returned unchanged, so it stays directly callable.
+        *icons* are :class:`~easy_mcp.Icon` objects (or their ``src``
+        strings) a client may show next to the tool.
         """
 
         def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
@@ -659,6 +669,7 @@ class MCPServer:
                 examples=examples,
                 timeout=timeout,
                 max_calls_per_session=max_calls_per_session,
+                icons=icons,
             )
             return target
 
@@ -752,6 +763,7 @@ class MCPServer:
         timeout: float | None = None,
         cache_ttl: float = 0.0,
         complete: Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | str] | Icon | str | None = None,
     ) -> Callable[[_F], _F]:
         """Register a function as an MCP resource at *uri*.
 
@@ -772,8 +784,8 @@ class MCPServer:
         return annotation, *description* from the docstring.  *cache_ttl* is
         how many seconds a stateless client may cache a read (default 0).
         *complete* maps a template variable to a completer: a list of
-        strings, or ``fn(value, arguments)``.  The other options are the
-        tools' own.
+        strings, or ``fn(value, arguments)``.  *icons* are shown by clients
+        next to the resource.  The other options are the tools' own.
 
         Raises:
             RegistrationError: The resource cannot be served safely.
@@ -798,6 +810,7 @@ class MCPServer:
                 timeout=timeout,
                 cache_ttl=cache_ttl,
                 complete=complete,
+                icons=icons,
             )
             return target
 
@@ -868,6 +881,7 @@ class MCPServer:
         scopes: Iterable[str] = (),
         timeout: float | None = None,
         complete: Mapping[str, Any] | None = None,
+        icons: Iterable[Icon | str] | Icon | str | None = None,
     ) -> Any:
         """Register a function as an MCP prompt.
 
@@ -893,6 +907,7 @@ class MCPServer:
                 scopes=scopes,
                 timeout=timeout,
                 complete=complete,
+                icons=icons,
             )
             return target
 
@@ -1964,7 +1979,10 @@ class MCPServer:
             )
 
     def _server_info(self) -> dict[str, Any]:
-        return {"name": self.name, "version": self.version}
+        info: dict[str, Any] = {"name": self.name, "version": self.version}
+        if self.icons:
+            info["icons"] = icons_to_mcp(self.icons)
+        return info
 
     def _handle_initialize(self, params: dict[str, Any], context: ClientContext) -> dict[str, Any]:
         # The version is recorded on *context* by _serve, once the answer

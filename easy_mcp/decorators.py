@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
 from .exceptions import RegistrationError, SchemaError, ToolRegistrationError
+from .icons import Icon, icons_to_mcp, normalize_icons
 from .schema import (
     build_input_schema,
     build_output_schema,
@@ -55,6 +56,8 @@ class ToolDefinition:
     #: ``scopes`` in the order given, duplicates removed.  The first is what
     #: an OAuth step-up challenge asks for, so list the narrowest first.
     declared_scopes: tuple[str, ...] = ()
+    #: Icons a client may show for the tool.
+    icons: tuple[Icon, ...] = ()
 
     def to_mcp(self) -> dict[str, Any]:
         """Serialize this tool for a ``tools/list`` response."""
@@ -65,6 +68,8 @@ class ToolDefinition:
         }
         if self.output_schema is not None:
             entry["outputSchema"] = self.output_schema
+        if self.icons:
+            entry["icons"] = icons_to_mcp(self.icons)
         meta: dict[str, Any] = {}
         if self.tags:
             meta["tags"] = list(self.tags)
@@ -91,6 +96,7 @@ def build_tool(
     examples: Iterable[Mapping[str, Any]] = (),
     timeout: float | None = None,
     max_calls_per_session: int | None = None,
+    icons: Iterable[Icon | str] | Icon | str | None = None,
 ) -> ToolDefinition:
     """Introspect *fn* and produce a :class:`ToolDefinition`.
 
@@ -112,6 +118,9 @@ def build_tool(
         timeout: Per-tool execution timeout in seconds (overrides the server
             default).
         max_calls_per_session: Cap on how often one session may call the tool.
+        icons: Icons a client may show for the tool: :class:`~easy_mcp.Icon`
+            objects, or strings standing for their ``src`` (an ``https://``
+            URL or a ``data:`` URI).
 
     Raises:
         ToolRegistrationError: If the function cannot be exposed safely.
@@ -128,6 +137,9 @@ def build_tool(
         raise ToolRegistrationError("timeout must be positive")
     if max_calls_per_session is not None and max_calls_per_session < 1:
         raise ToolRegistrationError("max_calls_per_session must be >= 1")
+    tool_icons = normalize_icons(
+        icons, f"cannot register tool {tool_name!r}", ToolRegistrationError
+    )
 
     summary, param_docs = parse_docstring(inspect.getdoc(fn))
     tool_description = (description or summary).strip()
@@ -181,6 +193,7 @@ def build_tool(
         timeout=timeout,
         max_calls_per_session=max_calls_per_session,
         declared_scopes=declared,
+        icons=tool_icons,
     )
 
 
