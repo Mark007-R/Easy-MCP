@@ -2749,7 +2749,7 @@ async def test_a_request_that_raises_cancellation_on_its_own_is_answered(
     # Serving the request raised CancelledError, but nothing cancelled it.
     # Only a client's cancel goes unanswered; this is an internal error,
     # with middleware or without, and no middleware is blamed for it.
-    def broken(context: ClientContext) -> Any:
+    def broken(*args: Any) -> Any:
         raise asyncio.CancelledError
 
     for layered in (False, True):
