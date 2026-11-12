@@ -49,6 +49,7 @@ from .middleware import (
     TransportInfo,
     current_tool_call,
 )
+from .progress import ProgressReporter, current_progress, report_progress
 from .prompts import PromptDefinition
 from .protocol import SUPPORTED_PROTOCOL_VERSIONS
 from .resources import ResourceDefinition, ResourceTemplateDefinition, safe_path
@@ -84,6 +85,7 @@ __all__ = [
     "OAuthResourceServer",
     "PROTOCOL_VERSION",
     "PayloadTooLargeError",
+    "ProgressReporter",
     "PromptDefinition",
     "ProtocolError",
     "RateLimitError",
@@ -120,6 +122,8 @@ __all__ = [
     "cancel_scope",
     "current_cancel_token",
     "current_identity",
+    "current_progress",
     "current_tool_call",
+    "report_progress",
     "safe_path",
 ]

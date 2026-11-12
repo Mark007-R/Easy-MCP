@@ -65,6 +65,15 @@ class ClientContext:
     ``initialize`` answered meanwhile starts the session's notifications
     anew.
 
+    ``notify`` delivers a notification that belongs to the request being
+    served (``notifications/progress``), where that request's answer will
+    go: a transport that answers each request on a stream of its own sets it
+    on the context of that one request.  Called on the event loop only, it
+    must not block, and raises once the stream has ended.  ``None`` leaves
+    such notifications to ``push`` when the channel is ``multiplexed``
+    (responses and notifications share it, as on stdio), and otherwise
+    drops them.
+
     New fields are only ever appended, with defaults, so positional
     construction keeps working.
     """
@@ -78,6 +87,7 @@ class ClientContext:
     store_handle: StoreHandle | None = None
     push: Callable[[dict[str, Any]], None] | None = None
     multiplexed: bool = False
+    notify: Callable[[dict[str, Any]], None] | None = None
 
 
 class Transport(abc.ABC):

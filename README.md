@@ -356,6 +356,53 @@ are returned, with `hasMore` and, when the size is known, `total`; an endless
 generator is read no further than that. A completer runs only for callers who
 may see its prompt or template, so treat it as data access.
 
+### Progress updates
+
+A slow tool can tell the client how far it has got, so the user sees more
+than a spinner:
+
+```python
+from easy_mcp import report_progress
+
+@server.tool
+def reindex(collection: str) -> str:
+    """Rebuild the search index of a collection."""
+    documents = load(collection)
+    for done, document in enumerate(documents, start=1):
+        index(document)
+        report_progress(done, total=len(documents), message=document.title)
+    return f"indexed {len(documents)} documents"
+```
+
+`report_progress(progress, total=None, message=None)` works in sync and async
+tools, in resource and prompt functions, and in middleware. It never blocks
+and returns whether the report was taken. Nothing is sent unless the client
+asked: a client opts in per request with a `progressToken` in `_meta`, and
+each report becomes a `notifications/progress` carrying that token. Without
+one the call is a no-op that returns `False`, so the same tool serves both
+kinds of client.
+
+- **How much is sent.** At most one notification every 0.1 s per request,
+  always the latest value; a tool may report on every loop iteration. The
+  last report before the answer is sent ahead of it, so a client that shows
+  a bar sees it complete.
+- **Values.** `progress` must grow from one report to the next, as the
+  specification requires; a report that does not is dropped (`False`).
+  `total` and `message` are optional, and may change between reports.
+  Anything but a finite number raises, with or without a client listening,
+  so a mistake shows in the first test.
+- **After the answer.** Once the request is answered, cancelled or timed
+  out, nothing more is sent: a sync tool's thread that runs on reports to
+  nobody.
+- **Where it travels.** On stdio and the legacy `/sse` stream, between the
+  other messages. Over Streamable HTTP, on the response of the request
+  itself: a request that reports progress before it finishes is answered
+  with `text/event-stream` (its notifications, then its response) rather
+  than `application/json`. That needs a client whose `Accept` names
+  `text/event-stream`, which the specification requires of every client; one
+  that does not gets its JSON answer and no progress. A request that never
+  reports is answered as JSON, as before.
+
 ### Transports: Streamable HTTP, SSE, or stdio
 
 The same server object serves every transport; nothing else changes.
@@ -1260,6 +1307,7 @@ sharing a `RedisStore` (see [Running several workers](#running-several-workers))
 | Resources and templates | yes | yes | yes | yes | yes, as tools |
 | Prompts | yes | yes | yes | yes | yes, as tools |
 | Completion | yes | yes | yes | yes | yes, as tools |
+| Progress updates | on stdout | on the `/sse` stream | on the request's own response, as an event stream | on the request's own response, as an event stream | yes; a legacy SSE message that reaches a worker not holding the stream reports nothing |
 | List changes | on stdout after `initialize`; `subscriptions/listen` for stateless clients | on the `/sse` stream | on the session's `GET /mcp` stream, also for changes made while none was open | `subscriptions/listen` | per worker: each tells the streams it holds about its own lists; what a session was last told is in the store |
 | Resource updates | `resources/subscribe`, or a listen's `resourceSubscriptions` | `resources/subscribe`, on the `/sse` stream | `resources/subscribe`, on `GET /mcp`; held until a stream opens | a listen's `resourceSubscriptions` | `notify_resource_updated` reaches its own worker's streams; subscriptions are in the store; an update with no stream open is lost |
 | OAuth 2.1 bearer tokens | no: local servers take credentials from the environment | yes; a missing tool scope is a `-32001` error on the stream, not a `403` | yes, with step-up `403` | yes, with step-up `403` | yes; key caches and the failed-token throttle per worker |
@@ -1575,6 +1623,13 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   result before awaiting anything else. A listen's `dispatch` returns only
   when its stream ends: its acknowledgment and notifications go through
   `push`, and whatever `dispatch` returns at the end is sent like any answer.
+- **Progress.** A request's `notifications/progress` go through `push` when
+  the channel is `multiplexed`. A transport that answers each request on a
+  stream of its own dispatches that request with
+  `dataclasses.replace(context, notify=send)` instead: `notify` is called on
+  the event loop with each notification of that one request, before
+  `dispatch` returns its answer. With neither, `report_progress()` returns
+  `False`.
 - **Ending.** Call `server.close_subscriptions(context, reason=...)` when the
   channel ends, and again once the requests it was still running have
   finished (an `initialize` answered meanwhile starts the session's
@@ -1664,8 +1719,6 @@ has the details.
 The MCP specification has more than easy_mcp offers yet. These are not in
 0.3.2:
 
-- **Progress notifications.** `notifications/progress` is never sent; a
-  `progressToken` in `_meta` is ignored.
 - **Multi-round-trip requests** (`InputRequiredResult`): no tool, resource or
   prompt can ask the client for input during a call. A retry carrying
   `inputResponses` or `requestState` is served like any request (its read is

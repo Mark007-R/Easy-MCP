@@ -7,7 +7,9 @@ notifications coalesce: a second one for the same list (and subscription)
 before the first is written adds nothing, since each only tells the client
 to fetch the list again.  So a stream's backlog stays bounded by the number
 of lists (plus the acknowledgment and the final result of a listen), however
-slowly its client reads.  The legacy SSE stream, whose queue also carries
+slowly its client reads.  Progress notifications coalesce the other way
+round: a newer one for the same token replaces the one still waiting, since
+only the latest matters.  The legacy SSE stream, whose queue also carries
 responses, coalesces by the same :func:`coalesce_key`.
 
 :class:`EventStreamResponse` serves such a stream and runs its ``on_close``
@@ -25,6 +27,7 @@ from typing import Any
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from ..progress import PROGRESS_METHOD
 from ..protocol import LIST_KINDS, META_SUBSCRIPTION_ID
 
 # How long a stream may stay silent before it sends an SSE comment, which
@@ -47,13 +50,17 @@ def coalesce_key(message: dict[str, Any]) -> Hashable | None:
     """What *message* coalesces by, if it is a change notification: else ``None``.
 
     Its method, the subscription it is tagged with (one channel may carry
-    several), and for a resource update its uri.
+    several), and for a resource update its uri.  A progress notification
+    coalesces by its token, and the newest stands (:func:`replaces`).
     """
     method = message.get("method")
     if "id" in message or not isinstance(method, str):
         return None
     params = message.get("params")
     params = params if isinstance(params, dict) else {}
+    if method == PROGRESS_METHOD:
+        token = params.get("progressToken")
+        return method, type(token).__name__, token
     meta = params.get("_meta")
     tag = meta.get(META_SUBSCRIPTION_ID) if isinstance(meta, dict) else None
     # By type as well as value, so 1, 1.0 and "1" are three subscriptions.
@@ -66,8 +73,17 @@ def coalesce_key(message: dict[str, Any]) -> Hashable | None:
     return None
 
 
+def replaces(message: dict[str, Any]) -> bool:
+    """Whether *message* takes the place of one waiting under the same :func:`coalesce_key`.
+
+    True for progress, where the latest value is the one worth sending;
+    change notifications all say the same, so the one waiting stays.
+    """
+    return message.get("method") == PROGRESS_METHOD
+
+
 class Outbox:
-    """Messages for one stream, in order, change notifications coalesced.  Loop-only."""
+    """Messages for one stream, in order, notifications coalesced.  Loop-only."""
 
     def __init__(self) -> None:
         self._items: collections.deque[tuple[Hashable | None, dict[str, Any]]] = collections.deque()
@@ -93,6 +109,12 @@ class Outbox:
         key = coalesce_key(message)
         if key is not None:
             if key in self._keys:
+                if replaces(message):
+                    # It keeps its place in the queue, with the newer value.
+                    for index, (waiting, _) in enumerate(self._items):
+                        if waiting == key:
+                            self._items[index] = (key, message)
+                            break
                 return  # one is waiting already, and says the same
             self._keys.add(key)
         self._items.append((key, message))
