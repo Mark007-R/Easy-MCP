@@ -39,6 +39,12 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 
 ### Changed
 
+- `tools/list` is paginated like the other lists: 100 tools per page in name
+  order, with `nextCursor` while more remain, and `-32602 "Invalid cursor"`
+  for a cursor the server did not hand out. A server with at most 100 tools
+  visible to the caller answers exactly as before. One with more now needs a
+  client that follows `nextCursor`, as the specification has always asked;
+  before, the whole list came in one answer and a `cursor` was ignored.
 - Over Streamable HTTP, a `POST` whose request carries a `progressToken` may
   now be answered with `text/event-stream` instead of `application/json`:
   the request's `notifications/progress`, then its response as the last
