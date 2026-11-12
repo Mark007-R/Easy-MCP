@@ -406,6 +406,42 @@ kinds of client.
   that does not gets its JSON answer and no progress. A request that never
   reports is answered as JSON, as before.
 
+### Icons
+
+Clients that show a list of servers and tools can show a picture next to
+each. Give the server, a tool, a resource or a prompt its `icons`:
+
+```python
+from easy_mcp import Icon, MCPServer
+
+server = MCPServer(name="notes", icons=[Icon.from_file("logo.png", sizes=("64x64",))])
+
+@server.tool(icons=["https://example.com/icons/search.svg"])
+def search(query: str) -> list[str]:
+    """Search the notes."""
+    ...
+
+@server.resource("notes://{note_id}", icons=[
+    Icon("https://example.com/icons/note-light.png", theme="light"),
+    Icon("https://example.com/icons/note-dark.png", theme="dark"),
+])
+def note(note_id: int) -> str: ...
+```
+
+An icon is an `https://` URL the client fetches, or the image itself as a
+`data:` URI; a plain string stands for `Icon(src)`. `Icon.from_file()` reads
+a `.png`, `.jpg`, `.svg` or `.webp` of up to 64 KiB once, at start-up, and
+embeds it, so nothing has to be hosted. `mime_type`, `sizes` (`"48x48"`, or
+`"any"` for a scalable image) and `theme` (`"light"` or `"dark"`) are
+optional and help a client choose among several; one item takes up to 8.
+
+Anything else is refused when it is registered: the specification tells
+clients to reject icons that are not `https:` or `data:`, so an `http://`
+URL or a file path would be an icon that silently never shows. Icons travel
+in `tools/list` and the other lists, and the server's in `initialize` and in
+every stateless result, so keep embedded ones small. Whether an icon is
+drawn at all is the client's choice.
+
 ### Transports: Streamable HTTP, SSE, or stdio
 
 The same server object serves every transport; nothing else changes.
@@ -1527,11 +1563,13 @@ easy_mcp/
 ├── server.py        MCPServer: registration, dispatch, execution, lifecycle
 ├── subscriptions.py change fan-out: list changes, resource updates, subscriptions/listen
 ├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
+├── progress.py      report_progress(): throttled notifications/progress of a request
 ├── middleware.py    request and tool middleware, current_tool_call()
 ├── decorators.py    @tool machinery, ToolDefinition, thread-safe registries
 ├── resources.py     resources and URI templates, their registry, safe_path()
 ├── prompts.py       prompts and their arguments
 ├── content.py       ResourceContent, Message, Image, Audio, ResourceLink; rendering
+├── icons.py         Icon: https and data: icons of the server and its items
 ├── completion.py    completion sources: lists, functions, Literal and bool
 ├── uritemplate.py   the RFC 6570 subset ({name}, {+name}) and the traversal guard
 ├── pagination.py    stable keyset cursors for the tool, resource and prompt lists
@@ -1551,7 +1589,7 @@ easy_mcp/
 │   └── redis_store.py  RedisStore: sessions, counts and limits shared between workers
 ├── transport/
 │   ├── base.py      Transport ABC + ClientContext
-│   ├── _http.py     shared HTTP plumbing: Origin allowlist, credentials, uvicorn
+│   ├── _http.py     shared HTTP plumbing: Origin allowlist and CORS, credentials, uvicorn
 │   ├── _sessions.py session records, cross-worker cancel and SSE relay
 │   ├── _outbox.py   coalescing outbox and SSE framing of notification streams
 │   ├── _bus.py      authenticated messages between workers
@@ -1748,7 +1786,6 @@ The MCP specification has more than easy_mcp offers yet. These are not in
   `GET /mcp` stream announces the list changes made meanwhile, a new listen
   stream does not, so list again after reopening one.
 - **Tasks** (`tasks/*`) are unknown methods (`-32601`).
-- **Icons.** Tools, resources, prompts and the server carry no `icons`.
 - **Protocol logging** (`logging/setLevel`, `notifications/message`); logs go
   to stderr and traces to OpenTelemetry, as the stateless revision prefers.
 - **Redis Cluster.** Use one Redis, or Sentinel through

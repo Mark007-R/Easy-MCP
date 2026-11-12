@@ -41,6 +41,7 @@ from .exceptions import (
     ToolRegistrationError,
     ValidationError,
 )
+from .icons import Icon
 from .middleware import (
     RequestInfo,
     RequestOutcome,
@@ -74,6 +75,7 @@ __all__ = [
     "ClientContext",
     "ClientIdentity",
     "EasyMCPError",
+    "Icon",
     "Image",
     "InsufficientScopeError",
     "Introspection",

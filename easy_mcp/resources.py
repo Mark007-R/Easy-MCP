@@ -20,6 +20,7 @@ from typing import Any
 from .completion import CompletionSource, choices_source, source_from
 from .content import ResourceContent, is_mime_type
 from .exceptions import RegistrationError, ResourceNotFoundError, SchemaError
+from .icons import Icon, icons_to_mcp, normalize_icons
 from .schema import (
     StringParameter,
     _unwrap_annotated,
@@ -117,6 +118,7 @@ class ResourceDefinition:
     declared_scopes: tuple[str, ...] = ()
     timeout: float | None = None
     cache_ttl_ms: int = 0
+    icons: tuple[Icon, ...] = ()
 
     @property
     def key(self) -> str:
@@ -136,6 +138,8 @@ class ResourceDefinition:
             entry["size"] = self.size
         if self.annotations:
             entry["annotations"] = dict(self.annotations)
+        if self.icons:
+            entry["icons"] = icons_to_mcp(self.icons)
         return entry
 
 
@@ -159,6 +163,7 @@ class ResourceTemplateDefinition:
     timeout: float | None = None
     cache_ttl_ms: int = 0
     completers: Mapping[str, CompletionSource] = field(default_factory=dict)
+    icons: tuple[Icon, ...] = ()
 
     @property
     def key(self) -> str:
@@ -176,6 +181,8 @@ class ResourceTemplateDefinition:
             entry["mimeType"] = self.mime_type
         if self.annotations:
             entry["annotations"] = dict(self.annotations)
+        if self.icons:
+            entry["icons"] = icons_to_mcp(self.icons)
         return entry
 
     def bind(self, uri: str) -> dict[str, Any] | None:
@@ -211,6 +218,7 @@ def build_resource(
     timeout: float | None = None,
     cache_ttl: float = 0.0,
     complete: Mapping[str, Any] | None = None,
+    icons: Iterable[Icon | str] | Icon | str | None = None,
 ) -> ResourceDefinition | ResourceTemplateDefinition:
     """Introspect *fn* and produce the definition of the resource at *uri*.
 
@@ -252,6 +260,7 @@ def build_resource(
             f"{what}: complete= needs a template; a concrete URI has nothing to complete"
         )
     checked_annotations = _check_annotations(annotations, what)
+    resource_icons = normalize_icons(icons, what)
 
     summary, param_docs = parse_docstring(inspect.getdoc(fn))
     text = (description if description is not None else summary).strip() or None
@@ -270,6 +279,7 @@ def build_resource(
         "declared_scopes": declared,
         "timeout": timeout,
         "cache_ttl_ms": round(cache_ttl * 1000),
+        "icons": resource_icons,
     }
     parameters = inspect.signature(fn).parameters
     if template is None:
