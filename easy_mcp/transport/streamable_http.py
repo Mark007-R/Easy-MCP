@@ -9,7 +9,10 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
   carries a ``progressToken`` and reports progress before it finishes (its
   client must accept ``text/event-stream``).  Such a stream carries the
   ``notifications/progress`` of that request, then its response, and ends.
-  A request that reports nothing is answered as JSON, like any other.
+  A request that reports nothing is answered as JSON, like any other.  In a
+  session, a ``tools/call`` whose tool asks the user a question is answered
+  the same way: the stream carries the ``elicitation/create`` request,
+  whose response the client POSTs, then the call's response.
 * ``GET`` with a session's ``MCP-Session-Id`` opens that session's stream
   (``text/event-stream``), which carries the list-change notifications
   (tools, prompts, resources) and ``notifications/resources/updated`` for the
@@ -180,15 +183,22 @@ class _Streaming:
         self.outbox = outbox
 
 
-def _progress_outbox(message: dict[str, Any], request: Request) -> Outbox | None:
-    """An outbox for the progress of *message*, if it asks for it and its client reads streams.
+def _request_outbox(
+    message: dict[str, Any], request: Request, *, session: bool = False
+) -> Outbox | None:
+    """An outbox for what *message* may send before its answer, if its client reads streams.
 
-    Only a client that names ``text/event-stream`` (or a range holding it)
-    in ``Accept`` is answered with one; a request without the header keeps
-    its JSON answer.
+    That is its progress, when it carries a token, and in a *session* the
+    question a tool call may ask the user (``elicitation/create``).  Only a
+    client that names ``text/event-stream`` (or a range holding it) in
+    ``Accept`` is answered with a stream; a request without the header
+    keeps its JSON answer.
     """
     params = message.get("params")
-    if "id" not in message or not isinstance(params, dict) or progress_token(params) is None:
+    if "id" not in message or not isinstance(params, dict):
+        return None
+    asks = session and message.get("method") == "tools/call"
+    if progress_token(params) is None and not asks:
         return None
     accept = request.headers.get("accept")
     if not accept or not accepts_event_stream(accept):
@@ -727,17 +737,19 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         streaming = False
         try:
             if "method" not in message and ("result" in message or "error" in message):
-                # A reply to a server-to-client request.  This server never
-                # sends those, so nothing is waiting for it.
+                # A reply to a server-to-client request: the answer to a
+                # question a tool asked, if one is waiting for it here.
+                self._server._resolve_response(message, session.context)
                 return Response(status_code=202)
             await self._forget_lists_seen_otherwise(session, identity)
             # This request's own identity: a refreshed or broader token takes
             # effect at once, in the same session.
             context = self._manager.context(session, identity)
-            outbox = _progress_outbox(message, request)
+            outbox = _request_outbox(message, request, session=True)
             if outbox is not None:
                 # A context of this request's own, sharing the session's
-                # calls: its progress goes to its own response.
+                # calls: its progress, and a question its tool asks, go to
+                # its own response.
                 context = dataclasses.replace(context, notify=outbox.put)
             try:
                 # A disconnect cancels nothing in this era; ending the session
@@ -827,7 +839,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             await store.touch_client(client_id, ttl=self._idle_timeout)
         except StoreUnavailableError:
             return self._store_unavailable(msg_id)
-        outbox = _progress_outbox(message, request)
+        outbox = _request_outbox(message, request)
         context = ClientContext(
             client_id=client_id,
             session_id="stateless",

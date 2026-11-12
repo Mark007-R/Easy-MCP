@@ -406,6 +406,82 @@ kinds of client.
   that does not gets its JSON answer and no progress. A request that never
   reports is answered as JSON, as before.
 
+### Asking the user a question
+
+A tool that needs something only the user knows can ask for it in the
+middle of a call. The client shows a small form and hands back the answer
+(MCP calls this elicitation):
+
+```python
+from typing import Literal
+
+from easy_mcp import elicit
+
+@server.tool
+def book_table(restaurant: str) -> str:
+    """Book a table."""
+    answer = elicit(
+        "For how many people, and when?",
+        {"guests": int, "day": Literal["today", "tomorrow"]},
+    )
+    if not answer.accepted:
+        return "Nothing was booked."
+    return reserve(restaurant, answer["guests"], answer["day"])
+```
+
+`elicit(message, fields)` works in sync and async tools and never blocks.
+Each field is a name and a type: `str`, `int`, `float`, `bool`,
+`Literal[...]` (pick one) or `list[Literal[...]]` (pick several). `T | None`
+makes a field optional, `Annotated[T, "..."]` describes it, and a JSON
+Schema dict (`{"type": "string", "format": "email"}`) gives full control. A
+question has up to 20 fields, and a call up to 10 questions.
+
+The answer says what the user did: `answer.accepted` is true when the form
+was submitted, and `answer.action` is `"accept"`, `"decline"` or `"cancel"`
+(dismissed, or not answered within 10 minutes). `answer["guests"]` reads a
+field and `answer.get("note")` an optional one. Submitted values are checked
+against the form before the tool sees them.
+
+**One rule: the function runs again from the top once the answer is in.**
+The first run stops at the `elicit()` that has no answer yet; when the
+answer arrives, the function is called anew with the same arguments, and
+this time `elicit()` returns it. So ask first and act afterwards: anything
+before the last `elicit()` runs more than once. The tool's timeout covers
+each run, not the time the user takes.
+
+That rule is what makes one tool work with every client:
+
+- **Stateless clients (`2026-07-28`)** get an `InputRequiredResult` naming
+  the question and retry the call with the answer. Answers to earlier
+  questions of the same call travel through the client in `requestState`,
+  which the server signs (HMAC-SHA256) and binds to the caller, the tool,
+  its arguments and a 15 minute expiry; a state that fails any check is
+  `-32602`. The server keeps nothing in between, so any worker can serve
+  the retry once the workers share a key: set `state_secret=` or
+  `EASY_MCP_STATE_SECRET` (16 bytes or more). Without one, each process
+  makes its own.
+- **Sessions (`2025-11-25` and earlier)** get an `elicitation/create`
+  request where the call's answer will go (stdout, the `/sse` stream, or the
+  call's own response as an event stream) and answer it; the server then
+  runs the function again within the same call.
+
+A client that cannot be asked makes `elicit()` raise
+`ElicitationUnavailableError`: it declared no `elicitation` capability with
+form mode, or it is a session served by several workers. `can_elicit()`
+tells beforehand, so a tool can fall back:
+
+```python
+name = elicit("Your name?", {"name": str}).get("name") if can_elicit() else None
+```
+
+Left uncaught, the error ends the call: `-32021` naming the missing
+capability for a stateless client, an `isError` result for a session.
+
+Never ask for a password, an API key or a card number this way: the
+specification forbids form questions for secrets, since the answer passes
+through the client. Only tools can ask, and only with a form (see
+[Not in 0.3.2](#not-in-032)). What the user answers is never logged.
+
 ### Icons
 
 Clients that show a list of servers and tools can show a picture next to
@@ -1163,7 +1239,9 @@ changed since 0.3.1.
 | Event | Logged when | Fields | 0.3.2 |
 |---|---|---|---|
 | **Calls** | | | |
-| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout` or `busy`; `error_id` with `error` and `output_schema_error` | |
+| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `busy`, `input_required` (a stateless call that asked the user a question) or `refused` (one whose client cannot be asked, or answered with something else); `error_id` with `error` and `output_schema_error` | |
+| `elicitation_requested` | a tool asks the user a question | `tool`, `client_id`, `question` (its key: its place in the call and a digest, never its text) | |
+| `elicitation_answered` | a session's client answers one, or does not | `tool`, `client_id`, `question`, `action`: `accept`, `decline`, `cancel`, `timeout` or `error` (with the client's `code`); never the answer | |
 | `tool_denied` | a call is refused before its tool runs: bad arguments, `max_calls_per_session`, a step-up, or tool middleware | `tool`, `client_id`, `reason` (the exception's class: `ValidationError`, `SessionLimitError`, `InsufficientScopeError`, ...), `middleware` when one refused, `scope` for a step-up | `middleware`, `scope` added |
 | `tool_cancelled` | a `tools/call` is cancelled: by its client, a closed stateless connection, the session's end or shutdown | `client_id`, `request_id` | |
 | `request_cancelled` | any other request is cancelled in the same ways (reads, prompts and completions included; a listen stream's end is a `subscription_close`) | `method`, `client_id`, `request_id` | new |
@@ -1287,7 +1365,7 @@ exporter writes to stdout unless told otherwise, so pass `out=sys.stderr`
 |---|---|---|---|
 | `mcp_server_operation_duration_seconds` | histogram | `mcp_method_name`, `gen_ai_operation_name`, `gen_ai_tool_name`, `gen_ai_prompt_name`, `error_type`, `rpc_response_status_code`, `mcp_protocol_version`, `network_transport`, `network_protocol_name` | time from receiving a message to its answer; cancelled requests and established `subscriptions/listen` streams are not sampled |
 | `mcp_server_session_duration_seconds` | histogram | `mcp_protocol_version`, `network_transport`, `network_protocol_name`, `error_type` | how long handshake-era sessions lasted (an idle one up to its last activity); `error_type` marks one that ended with an error: `store_lost` (the shared store lost it, in a failover or restart) or `lease_lost` (an SSE session whose lease in the shared store lapsed or was lost); with a shared store, a session that expires idle is counted closed in `easy_mcp_sessions_open` but not sampled here, since the store no longer knows when it opened |
-| `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `unauthorized`, `session_limit`, `invalid_arguments`, `refused` (before the tool ran: by middleware, or because the session was gone or the shared store out of reach) and `internal_error` (a middleware failed) |
+| `easy_mcp_tool_calls_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | tool calls by outcome: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `cancelled`, `busy`, `input_required` (a stateless call that asked the user a question; its retry is counted by its own outcome), `unauthorized`, `session_limit`, `invalid_arguments`, `refused` (before the tool ran: by middleware, or because the session was gone or the shared store out of reach; or a question its client could not be asked) and `internal_error` (a middleware failed) |
 | `easy_mcp_tool_calls_active` | gauge | `gen_ai_tool_name` | calls between their validation and their answer |
 | `easy_mcp_sync_workers_in_use` | gauge | | threads of sync tools, resources, prompts and completers holding a `max_sync_workers` slot, those a timed-out call still holds included |
 | `easy_mcp_tool_finished_after_cancel_total` | counter | `gen_ai_tool_name`, `easy_mcp_status` | sync tools that finished after their call was cancelled or timed out |
@@ -1361,6 +1439,7 @@ sharing a `RedisStore` (see [Running several workers](#running-several-workers))
 | Prompts | yes | yes | yes | yes | yes, as tools |
 | Completion | yes | yes | yes | yes | yes, as tools |
 | Progress updates | on stdout | on the `/sse` stream | on the request's own response, as an event stream | on the request's own response, as an event stream | yes; a legacy SSE message that reaches a worker not holding the stream reports nothing |
+| Asking the user (`elicit()`) | yes | yes | yes; the question goes on the call's own response, as an event stream | yes, as an `InputRequiredResult` and a retry | stateless clients yes, with one `state_secret` for all workers; sessions cannot be asked |
 | List changes | on stdout after `initialize`; `subscriptions/listen` for stateless clients | on the `/sse` stream | on the session's `GET /mcp` stream, also for changes made while none was open | `subscriptions/listen` | per worker: each tells the streams it holds about its own lists; what a session was last told is in the store |
 | Resource updates | `resources/subscribe`, or a listen's `resourceSubscriptions` | `resources/subscribe`, on the `/sse` stream | `resources/subscribe`, on `GET /mcp`; held until a stream opens | a listen's `resourceSubscriptions` | `notify_resource_updated` reaches its own worker's streams; subscriptions are in the store; an update with no stream open is lost |
 | OAuth 2.1 bearer tokens | no: local servers take credentials from the environment | yes; a missing tool scope is a `-32001` error on the stream, not a `403` | yes, with step-up `403` | yes, with step-up `403` | yes; key caches and the failed-token throttle per worker |
@@ -1523,8 +1602,8 @@ user with only the `read` role.
 ## Environment variables
 
 These are all the variables easy_mcp reads. Outside the `from_env()`
-constructors and the connectors, only the stdio key and the OpenTelemetry
-switches are read without being asked for.
+constructors and the connectors, only the stdio key, the state secret and
+the OpenTelemetry switches are read without being asked for.
 
 | Variable | Read by | Meaning |
 |---|---|---|
@@ -1532,6 +1611,7 @@ switches are read without being asked for.
 | `EASY_MCP_API_KEYS` | `APIKeyAuth.from_env()`, the connectors | API keys and their scopes, `key1:*;key2:reports\|stats` (`;` between keys, `\|` between scopes, `*` or none for all scopes) |
 | `EASY_MCP_STDIO_API_KEY` | `StdioTransport` (`server.run("stdio")`) | the stdio client's key; an invalid one stops startup |
 | `EASY_MCP_REDIS_URL` | `RedisStore.from_env()` | the shared store, a `redis://` or `rediss://` URL with its ACL user; client options may follow in the query string |
+| `EASY_MCP_STATE_SECRET` | `MCPServer`, unless `state_secret=` is given | the key that signs the `requestState` of calls whose tool asks the user a question, 16 bytes or more; the same in every worker |
 | `EASY_MCP_OAUTH_RESOURCE` | `OAuthResourceServer.from_env()`, the connectors (OAuth is on when it is set) | required: the public URL of this endpoint |
 | `EASY_MCP_OAUTH_AUTHORIZATION_SERVERS` | the same | required: the accepted issuers, separated by spaces or commas |
 | `EASY_MCP_OAUTH_AUDIENCE` | the same | optional: the accepted `aud` values, when not the resource |
@@ -1564,6 +1644,7 @@ easy_mcp/
 ├── subscriptions.py change fan-out: list changes, resource updates, subscriptions/listen
 ├── cancellation.py  CancelToken: a cancel or timeout reaching a sync tool's thread
 ├── progress.py      report_progress(): throttled notifications/progress of a request
+├── elicitation.py   elicit(): forms, answers, and the signed requestState
 ├── middleware.py    request and tool middleware, current_tool_call()
 ├── decorators.py    @tool machinery, ToolDefinition, thread-safe registries
 ├── resources.py     resources and URI templates, their registry, safe_path()
@@ -1678,6 +1759,13 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
   result before awaiting anything else. A listen's `dispatch` returns only
   when its stream ends: its acknowledgment and notifications go through
   `push`, and whatever `dispatch` returns at the end is sent like any answer.
+- **Responses from the client.** Dispatch a message that has an `id` and a
+  `result` or `error` but no `method` like any other: it is the answer to a
+  question a tool asked (`elicitation/create`), which the server sent where
+  the call's progress goes. `dispatch` returns `None` for it. The server
+  records what the client declared at `initialize` in
+  `context.client_capabilities`, and asks only clients that declared
+  `elicitation`.
 - **Progress.** A request's `notifications/progress` go through `push` when
   the channel is `multiplexed`. A transport that answers each request on a
   stream of its own dispatches that request with
@@ -1775,16 +1863,20 @@ has the details.
 The MCP specification has more than easy_mcp offers yet. These are not in
 0.3.2:
 
-- **Multi-round-trip requests** (`InputRequiredResult`): no tool, resource or
-  prompt can ask the client for input during a call. A retry carrying
-  `inputResponses` or `requestState` is served like any request (its read is
-  `private` with `ttlMs: 0`).
-- **Elicitation and sampling.** The server never sends `elicitation/create` or
-  `sampling/createMessage`.
+- **Questions from resources and prompts.** Only a tool can ask the user
+  (`elicit()`); a `resources/read` or `prompts/get` never answers with an
+  `InputRequiredResult`, and a retry of one carrying `inputResponses` or
+  `requestState` is served like any request (its read is `private` with
+  `ttlMs: 0`).
+- **URL mode elicitation.** Questions are forms; a tool cannot send the user
+  to a web page.
+- **Sampling and roots.** The server never asks for `sampling/createMessage`
+  or `roots/list`: the `2026-07-28` specification deprecates both.
 - **SSE resumability.** No stream carries event ids, and `Last-Event-ID` is
-  ignored. A client whose stream drops opens a new one: a session's
-  `GET /mcp` stream announces the list changes made meanwhile, a new listen
-  stream does not, so list again after reopening one.
+  ignored, as the `2026-07-28` specification now requires of its streams. A
+  client whose stream drops opens a new one: a session's `GET /mcp` stream
+  announces the list changes made meanwhile, a new listen stream does not,
+  so list again after reopening one.
 - **Tasks** (`tasks/*`) are unknown methods (`-32601`).
 - **Protocol logging** (`logging/setLevel`, `notifications/message`); logs go
   to stderr and traces to OpenTelemetry, as the stateless revision prefers.

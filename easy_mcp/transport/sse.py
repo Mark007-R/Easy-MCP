@@ -421,6 +421,8 @@ class SSETransport(BaseHTTPTransport):
             # copy: the session speaks that version from now on.
             if context.protocol_version != session.context.protocol_version:
                 session.context.protocol_version = context.protocol_version
+            if context.client_capabilities is not None:
+                session.context.client_capabilities = context.client_capabilities
         version = _negotiated(message, response, context)
         if version is not None:
             # Other workers serving its messages read it from the store.

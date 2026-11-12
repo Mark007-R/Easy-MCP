@@ -19,6 +19,7 @@ from ._version import __version__
 from .cancellation import CancelToken, cancel_scope, current_cancel_token
 from .content import Audio, Image, Message, ResourceContent, ResourceLink
 from .decorators import ToolDefinition
+from .elicitation import Elicitation, ElicitationUnavailableError, can_elicit, elicit
 from .exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -75,6 +76,8 @@ __all__ = [
     "ClientContext",
     "ClientIdentity",
     "EasyMCPError",
+    "Elicitation",
+    "ElicitationUnavailableError",
     "Icon",
     "Image",
     "InsufficientScopeError",
@@ -121,11 +124,13 @@ __all__ = [
     "TransportInfo",
     "ValidationError",
     "__version__",
+    "can_elicit",
     "cancel_scope",
     "current_cancel_token",
     "current_identity",
     "current_progress",
     "current_tool_call",
+    "elicit",
     "report_progress",
     "safe_path",
 ]
