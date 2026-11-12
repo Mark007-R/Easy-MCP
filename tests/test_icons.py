@@ -45,6 +45,8 @@ def test_an_icon_serializes_only_what_it_was_given() -> None:
         "HTTPS://EXAMPLE.COM/a.png",
         "https://example.com:8443/a.png?v=2#x",
         "https://example.com",
+        "https://[2001:db8::1]:8443/a.png",
+        "https://xn--exmple-cua.com/%E2%9C%93.png",
         PNG_URI,
         "data:image/svg+xml;base64,PHN2Zy8+",
     ],
@@ -69,6 +71,20 @@ def test_https_and_data_sources_are_accepted(src: str) -> None:
         "https://user@example.com/a.png",
         "https://example.com/a b.png",
         "https://example.com/a.png\nX-Injected: 1",
+        "https://example.com/\ud800",
+        "https://exa\x00mple.com/a.png",
+        "https://example.com/\x7f\x1b[31m",
+        "https://example.com/\u202egnp.exe",
+        "https://example.com/\u200b",
+        "https://ex\u00e4mple.com/a.png",
+        "https://:443",
+        "https://.",
+        "https://[",
+        "https://example.com:999999/a.png",
+        "https://example.com/" + "a" * 2048,
+        "data:image/png;base64,A",
+        "data:image/png;base64,AAAA=",
+        "data:text/html;base64,AAAA",
         "data:image/png,rawbytes",
         "data:image/png;base64,",
         "data:image/png;base64,not base64!",
@@ -105,7 +121,23 @@ def test_malformed_fields_are_refused(options: dict[str, Any]) -> None:
 def test_a_source_too_long_is_refused() -> None:
     assert Icon("https://example.com/" + "a" * 500).src
     with pytest.raises(ValueError, match="serve a larger image by URL"):
-        Icon("https://example.com/" + "a" * MAX_SRC_LENGTH)
+        Icon("data:image/png;base64," + "A" * MAX_SRC_LENGTH)
+    with pytest.raises(ValueError, match="at most 2048 characters"):
+        Icon("https://example.com/" + "a" * 2048)
+
+
+def test_the_icons_of_one_item_share_the_size_cap(tmp_path: Path) -> None:
+    (tmp_path / "half.png").write_bytes(b"x" * (MAX_ICON_BYTES // 2))
+    half = Icon.from_file(tmp_path / "half.png")
+    assert len(normalize_icons([half, URL], "x")) == 2
+    with pytest.raises(RegistrationError, match="add up to more than 64 KiB"):
+        normalize_icons([half, half, half], "x")
+
+
+def test_sizes_may_be_left_out_as_none() -> None:
+    assert Icon(URL, sizes=None).sizes == ()  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="list of strings"):
+        Icon(URL, sizes=7)  # type: ignore[arg-type]
 
 
 def test_from_file_reads_the_image_once(tmp_path: Path) -> None:
@@ -132,7 +164,9 @@ def test_from_file_refuses_what_it_cannot_serve(tmp_path: Path) -> None:
     (tmp_path / "logo.bmp").write_bytes(b"BM")
     with pytest.raises(ValueError, match="pass mime_type="):
         Icon.from_file(tmp_path / "logo.bmp")
-    assert Icon.from_file(tmp_path / "logo.bmp", mime_type="image/bmp").mime_type == "image/bmp"
+    assert Icon.from_file(tmp_path / "logo.bmp", mime_type="image/BMP").mime_type == "image/bmp"
+    with pytest.raises(ValueError, match="is not one"):
+        Icon.from_file(tmp_path / "logo.bmp", mime_type="text/html")
     (tmp_path / "empty.png").write_bytes(b"")
     with pytest.raises(ValueError, match="empty"):
         Icon.from_file(tmp_path / "empty.png")

@@ -513,7 +513,9 @@ An icon is an `https://` URL the client fetches, or the image itself as a
 a `.png`, `.jpg`, `.svg` or `.webp` of up to 64 KiB once, at start-up, and
 embeds it, so nothing has to be hosted. `mime_type`, `sizes` (`"48x48"`, or
 `"any"` for a scalable image) and `theme` (`"light"` or `"dark"`) are
-optional and help a client choose among several; one item takes up to 8.
+optional and help a client choose among several; one item takes up to 8,
+which together may embed 64 KiB. A URL is plain ASCII (percent-encode
+anything else) of up to 2048 characters, and embedded data is an image.
 
 Anything else is refused when it is registered: the specification tells
 clients to reject icons that are not `https:` or `data:`, so an `http://`
@@ -584,7 +586,8 @@ and no CORS headers, so its browser shows it nothing. The preflight allows
 10 minutes. Cookies are never allowed (`Access-Control-Allow-Credentials` is
 not sent): credentials travel in headers the page sets itself. Requests with
 no `Origin` header, which is every client that is not a browser, are served
-exactly as before.
+as before; unless every origin is allowed, their answers gain `Vary: Origin`,
+so a shared cache keeps them apart from a browser's.
 
 Over stdio the MCP host launches your script as a child process and talks
 JSON-RPC over its pipes. Logs go to stderr, and `sys.stdout` is redirected to

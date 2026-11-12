@@ -269,14 +269,27 @@ CORS_EXPOSED_HEADERS = "MCP-Session-Id, WWW-Authenticate, Retry-After"
 CORS_MAX_AGE_SECONDS = 600
 
 
+def _varying(send: Send) -> Send:
+    """*send*, adding ``Vary: Origin`` to the response it starts."""
+
+    async def send_varying(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            MutableHeaders(scope=message).add_vary_header("Origin")
+        await send(message)
+
+    return send_varying
+
+
 class OriginGuard:
     """ASGI middleware: the ``Origin`` allowlist, and CORS for the origins on it.
 
     Requests without an ``Origin`` header come from non-browser clients and
-    pass through untouched; browsers always send one on POST and DELETE, and
-    on every cross-origin request.  A request whose origin is not allowed is
-    answered ``403``, with no CORS headers; *on_reject* is told ``"origin"``
-    for each (the metrics count it).
+    pass through; browsers always send one on POST and DELETE, and on every
+    cross-origin request.  A request whose origin is not allowed is answered
+    ``403``, with no CORS headers; *on_reject* is told ``"origin"`` for each
+    (the metrics count it).  Unless every origin is allowed, every answer
+    says ``Vary: Origin``, those to requests without one included, so a
+    shared cache never serves a browser an answer made for another origin.
 
     A request from an allowed origin is served, and its answer says so
     (``Access-Control-Allow-Origin``), so that a page on that origin may
@@ -309,11 +322,18 @@ class OriginGuard:
                 # keep the code they have always seen.
                 version = _header(scope, b"mcp-protocol-version")
                 code = INVALID_REQUEST if version in MODERN_PROTOCOL_VERSIONS else FORBIDDEN
-                response = rpc_error(403, code, "Forbidden: origin not allowed")
+                response = rpc_error(
+                    403, code, "Forbidden: origin not allowed", headers={"Vary": "Origin"}
+                )
                 await response(scope, receive, send)
                 return
             if origin is not None:
                 await self._serve_cross_origin(scope, receive, send, origin)
+                return
+            if self.allowed_origins is None or "*" not in self.allowed_origins:
+                # The answer to a request with an Origin differs (its CORS
+                # headers), so a cache must not hand this one to a browser.
+                await self.app(scope, receive, _varying(send))
                 return
         await self.app(scope, receive, send)
 
@@ -333,9 +353,11 @@ class OriginGuard:
                 "Access-Control-Max-Age": str(CORS_MAX_AGE_SECONDS),
                 "Vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
             }
-            if _header(scope, b"access-control-request-private-network") == "true":
+            asks = _header(scope, b"access-control-request-private-network") == "true"
+            if asks and not any_origin:
                 # A public page reaching a server on a private network: the
                 # operator listed its origin, which is the consent asked for.
+                # "*" lists nobody, so it grants no such access.
                 headers["Access-Control-Allow-Private-Network"] = "true"
             await Response(status_code=204, headers=headers)(scope, receive, send)
             return

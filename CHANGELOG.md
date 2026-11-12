@@ -73,7 +73,9 @@ streams, so easy_mcp implements neither.
   `https://` URL or a `data:` URI, with optional `mime_type`, `sizes` and
   `theme`; a plain string stands for its `src`, and `Icon.from_file()` embeds
   an image file of up to 64 KiB. Any other source (`http:`, a path, another
-  scheme) is a registration error, since clients must refuse it. Icons appear
+  scheme, a URL holding anything but printable ASCII, a `data:` URI that is
+  no Base64 image) is a registration error, since clients must refuse it. An
+  item takes up to 8 icons embedding 64 KiB together. Icons appear
   in `tools/list`, `resources/list`, `resources/templates/list` and
   `prompts/list`, and the server's in `serverInfo`. The definitions gain an
   `icons` field.
@@ -84,9 +86,11 @@ streams, so easy_mcp implements neither.
   every HTTP endpoint, with `MCP-Session-Id`, `WWW-Authenticate` and
   `Retry-After` exposed. The preflight allows `GET`, `POST` and `DELETE`
   with the headers MCP clients send, for 10 minutes, and grants Private
-  Network Access when asked. `Access-Control-Allow-Credentials` is never
-  sent. With `allowed_origins=["*"]` the answer is `*`; otherwise the origin
-  is named and `Vary: Origin` is added. Wrapping the app in Starlette's
+  Network Access when asked (not with `"*"`, which names no origin).
+  `Access-Control-Allow-Credentials` is never sent. With
+  `allowed_origins=["*"]` the answer is `*`; otherwise the origin is named,
+  and every answer, with or without an `Origin`, the `403` included, says
+  `Vary: Origin`. Wrapping the app in Starlette's
   `CORSMiddleware`, as the 0.3.2 README suggested, is no longer needed (and
   still works).
 
