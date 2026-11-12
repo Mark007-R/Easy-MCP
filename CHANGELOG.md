@@ -4,7 +4,19 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-12
+
+0.4.0 lets a server talk to its client while a request is running: a tool
+reports its progress and can ask the user a question, on stateless clients
+and sessions alike. Browser-based clients can connect directly, `tools/list`
+is paginated, and the server and its tools, resources and prompts can carry
+icons. Several visible behaviours change for existing servers, each listed
+under Changed; the README's "Upgrading from 0.3.2" says what to do about
+them.
+
+Two features of older protocol revisions are deliberately left out. The
+`2026-07-28` specification deprecates sampling and removes resumable SSE
+streams, so easy_mcp implements neither.
 
 ### Added
 
@@ -1070,7 +1082,8 @@ change for existing servers, each listed under Changed; the README's
   correlation, structured JSON logs with an audit trail, and the HTTP + SSE
   transport.
 
-[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.5...v0.3.0
