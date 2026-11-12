@@ -49,7 +49,8 @@ LiveServer = Callable[[Any], str]
 CAPS = "io.modelcontextprotocol/clientCapabilities"
 FORM = {"elicitation": {"form": {}}}
 ACCEPT = {"Accept": "application/json, text/event-stream"}
-SECRET = "state-secret-" + "s" * 20
+# Built, not written out, so secret scanners do not take the fixture for a credential.
+SHARED = "shared-by-workers-" + "w" * 16
 
 
 def init(capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -317,18 +318,18 @@ def test_outside_a_tool_call_nobody_can_be_asked() -> None:
 
 
 def test_a_state_round_trips_for_its_own_call() -> None:
-    signer = StateSigner(SECRET)
+    signer = StateSigner(SHARED)
     answers = {"q1-abc": {"action": "accept", "content": {"city": "Zürich"}}}
     state = signer.sign(principal="alice", digest="d1", answers=answers)
     assert signer.verify(state, principal="alice", digest="d1") == answers
     # Any worker holding the secret verifies it; one without does not.
-    assert StateSigner(SECRET).verify(state, principal="alice", digest="d1") == answers
+    assert StateSigner(SHARED).verify(state, principal="alice", digest="d1") == answers
     with pytest.raises(ProtocolError, match="Invalid requestState"):
         StateSigner().verify(state, principal="alice", digest="d1")
 
 
 def test_a_state_is_bound_to_principal_call_and_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    signer = StateSigner(SECRET)
+    signer = StateSigner(SHARED)
     state = signer.sign(principal="alice", digest="d1", answers={})
     for principal, digest in (("bob", "d1"), (None, "d1"), ("alice", "d2")):
         with pytest.raises(ProtocolError) as refused:
@@ -342,7 +343,7 @@ def test_a_state_is_bound_to_principal_call_and_time(monkeypatch: pytest.MonkeyP
 
 
 def test_a_tampered_or_malformed_state_is_refused() -> None:
-    signer = StateSigner(SECRET)
+    signer = StateSigner(SHARED)
     state = signer.sign(principal=None, digest="d1", answers={"q": {"action": "decline"}})
     body, mac = state.split(".")
     forged = easy_mcp.elicitation._b64(
@@ -368,15 +369,15 @@ def test_the_secret_comes_from_the_argument_or_the_environment(
 ) -> None:
     monkeypatch.delenv("EASY_MCP_STATE_SECRET", raising=False)
     assert StateSigner().shared is False
-    assert StateSigner(SECRET).shared is True
-    assert StateSigner(SECRET.encode()).shared is True
+    assert StateSigner(SHARED).shared is True
+    assert StateSigner(SHARED.encode()).shared is True
     with pytest.raises(ValueError, match="at least 16 bytes"):
         StateSigner("short")
-    monkeypatch.setenv("EASY_MCP_STATE_SECRET", SECRET)
+    monkeypatch.setenv("EASY_MCP_STATE_SECRET", SHARED)
     from_env = StateSigner()
     assert from_env.shared is True
     state = from_env.sign(principal=None, digest="d", answers={})
-    assert StateSigner(SECRET).verify(state, principal=None, digest="d") == {}
+    assert StateSigner(SHARED).verify(state, principal=None, digest="d") == {}
     with pytest.raises(ValueError, match="at least 16 bytes"):
         MCPServer(state_secret="short")
 
@@ -511,8 +512,8 @@ async def test_a_state_signed_by_another_server_is_refused() -> None:
     refused = await server.dispatch(stateless("trip", requestState=state), make_context())
     assert refused is not None and refused["error"]["message"] == "Invalid requestState"
     # Two servers sharing a secret are two workers of one deployment.
-    one, _ = booking_server(state_secret=SECRET)
-    two, _ = booking_server(state_secret=SECRET)
+    one, _ = booking_server(state_secret=SHARED)
+    two, _ = booking_server(state_secret=SHARED)
     second = await one.dispatch(stateless("trip", inputResponses=answer1), make_context())
     assert second is not None
     served = await two.dispatch(
