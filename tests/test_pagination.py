@@ -1,4 +1,4 @@
-"""Pagination of resources/list, resources/templates/list and prompts/list."""
+"""Pagination of tools/list, resources/list, resources/templates/list and prompts/list."""
 
 from __future__ import annotations
 
@@ -249,11 +249,95 @@ async def test_every_page_has_the_same_cache_scope() -> None:
         assert scopes == [(scope, 0)] * 3
 
 
-async def test_tools_list_is_not_paginated() -> None:
-    server = MCPServer(port=0, rate_limit_per_minute=None)
-    for index in range(150):
+def tool_server(count: int, **kwargs: Any) -> MCPServer:
+    server = MCPServer(port=0, rate_limit_per_minute=None, **kwargs)
+    for index in range(count):
         server.register_tool(lambda: "x", name=f"t{index:04d}", description="A tool.")
-    response = await server.dispatch(rpc("tools/list", {"cursor": "ignored"}), make_context())
-    assert response is not None
-    assert len(response["result"]["tools"]) == 150
-    assert "nextCursor" not in response["result"]
+    return server
+
+
+async def test_tools_list_walks_every_tool_once() -> None:
+    server = tool_server(250)
+    pages = await walk(server, "tools/list", "tools")
+    assert [len(page) for page in pages] == [100, 100, 50]
+    assert sum(pages, []) == [f"t{index:04d}" for index in range(250)]
+
+
+async def test_a_short_tool_list_is_one_page_as_before() -> None:
+    server = tool_server(PAGE_SIZE)
+    for message in (rpc("tools/list"), rpc("tools/list", {}), modern("tools/list")):
+        response = await server.dispatch(message, make_context())
+        assert response is not None
+        assert len(response["result"]["tools"]) == PAGE_SIZE
+        assert "nextCursor" not in response["result"]
+
+
+async def test_stateless_tool_pages_share_their_cache_fields() -> None:
+    for kwargs, scope in (({}, "public"), ({"auth": APIKeyAuth({SEE_KEY: "*"})}, "private")):
+        server = tool_server(250, **kwargs)
+        cursor: Any = None
+        seen: list[str] = []
+        fields = []
+        while True:
+            params = {} if cursor is None else {"cursor": cursor}
+            response = await server.dispatch(modern("tools/list", params), make_context())
+            assert response is not None
+            result = response["result"]
+            assert result["resultType"] == "complete"
+            seen.extend(tool["name"] for tool in result["tools"])
+            fields.append((result["cacheScope"], result["ttlMs"]))
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                break
+        assert seen == [f"t{index:04d}" for index in range(250)]
+        assert len(fields) == 3 and len(set(fields)) == 1
+        assert fields[0][0] == scope
+
+
+async def test_tools_list_refuses_a_cursor_it_did_not_hand_out() -> None:
+    server = tool_server(3)
+    for cursor in ("garbage!", encode_cursor("prompts", "t0001"), 7, NESTED):
+        for message in (
+            rpc("tools/list", {"cursor": cursor}),
+            modern("tools/list", {"cursor": cursor}),
+        ):
+            response = await server.dispatch(message, make_context())
+            assert response is not None
+            assert response["error"] == {"code": INVALID_PARAMS, "message": "Invalid cursor"}
+
+
+async def test_tool_pages_count_only_visible_tools() -> None:
+    server = MCPServer(port=0, rate_limit_per_minute=None, auth=APIKeyAuth({SEE_KEY: ["see"]}))
+    for index in range(150):
+        hidden = index % 2 == 0
+        server.register_tool(
+            lambda: "x",
+            name=f"t{index:04d}",
+            description="A tool.",
+            scopes=("see",) if hidden else (),
+        )
+    anonymous = await walk(server, "tools/list", "tools")
+    assert [len(page) for page in anonymous] == [75]
+    assert all(int(name[1:]) % 2 == 1 for name in anonymous[0])
+    who = ClientIdentity(fingerprint="s" * 12, scopes=frozenset({"see"}))
+    assert [len(page) for page in await walk(server, "tools/list", "tools", identity=who)] == [
+        100,
+        50,
+    ]
+
+
+async def test_a_tool_cursor_is_stable_across_registrations() -> None:
+    server = tool_server(150)
+    first = await server.dispatch(rpc("tools/list"), make_context())
+    assert first is not None
+    cursor = first["result"]["nextCursor"]
+    assert decode_cursor("tools", cursor) == "t0099"
+    server.unregister_tool("t0010")  # before the cursor
+    server.unregister_tool("t0120")  # after it
+    server.register_tool(lambda: "x", name="t0005a", description="A tool.")
+    server.register_tool(lambda: "x", name="t0130a", description="A tool.")
+    second = await server.dispatch(rpc("tools/list", {"cursor": cursor}), make_context())
+    assert second is not None
+    names = [entry["name"] for entry in second["result"]["tools"]]
+    assert names[0] == "t0100" and "t0120" not in names and "t0130a" in names
+    assert "t0005a" not in names and "nextCursor" not in second["result"]

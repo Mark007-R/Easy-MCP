@@ -1872,7 +1872,7 @@ class MCPServer:
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = self._handle_tools_list(context)
+                result = self._handle_tools_list(context, request._params)
             elif method in _LISTS:
                 result = self._handle_list(method, request._params, context)
             else:  # the method table and this routing disagree
@@ -1998,7 +1998,8 @@ class MCPServer:
                 result["instructions"] = self.instructions
             return result
         if method == "tools/list":
-            result = self._handle_tools_list(context)
+            # The same scope on every page, as the caching spec requires.
+            result = self._handle_tools_list(context, params)
             result["ttlMs"] = TOOLS_LIST_TTL_MS
             result["cacheScope"] = self._cache_scope(method)
             return result
@@ -2077,9 +2078,24 @@ class MCPServer:
         meta[META_SERVER_INFO] = self._server_info()
         return {**result, "resultType": "complete", "_meta": meta}
 
-    def _handle_tools_list(self, context: ClientContext) -> dict[str, Any]:
-        _, tools = self._list_entries("tools", context.identity)
-        return {"tools": tools}
+    def _handle_tools_list(
+        self, context: ClientContext, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """One page of ``tools/list``, in name order, paged as the other lists are.
+
+        Raises:
+            ProtocolError: ``-32602`` for an invalid cursor.
+        """
+        identity = context.identity
+        # Protected tools are left out before paging for callers who could
+        # not use them, so they are neither shown nor counted.
+        tools = [tool for tool in self.tools if self._visible(identity, tool)]
+        cursor = (params or {}).get("cursor")
+        page, next_cursor = paginate(tools, key=lambda t: t.name, kind="tools", cursor=cursor)
+        result: dict[str, Any] = {"tools": [tool.to_mcp() for tool in page]}
+        if next_cursor is not None:
+            result["nextCursor"] = next_cursor
+        return result
 
     def _handle_list(
         self, method: str, params: dict[str, Any], context: ClientContext

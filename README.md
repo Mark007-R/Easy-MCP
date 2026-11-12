@@ -126,6 +126,9 @@ tool list changed, so they can fetch it again. Nothing to configure: bursts
 are combined into one notice, and a client only hears about tools it is
 allowed to see (see [Change notifications](#change-notifications)).
 
+`tools/list` returns the tools in name order, 100 per page: a server with more
+answers with a `nextCursor`, which MCP clients follow by themselves.
+
 ### Supported parameter types
 
 | Python annotation | JSON Schema |
@@ -1531,7 +1534,7 @@ easy_mcp/
 ├── content.py       ResourceContent, Message, Image, Audio, ResourceLink; rendering
 ├── completion.py    completion sources: lists, functions, Literal and bool
 ├── uritemplate.py   the RFC 6570 subset ({name}, {+name}) and the traversal guard
-├── pagination.py    stable keyset cursors for the resource and prompt lists
+├── pagination.py    stable keyset cursors for the tool, resource and prompt lists
 ├── schema.py        type hints → JSON Schema; docstring parsing; validation
 ├── security/
 │   ├── auth.py      APIKeyAuth (constant-time), scopes, visibility rules
@@ -1748,7 +1751,6 @@ The MCP specification has more than easy_mcp offers yet. These are not in
 - **Icons.** Tools, resources, prompts and the server carry no `icons`.
 - **Protocol logging** (`logging/setLevel`, `notifications/message`); logs go
   to stderr and traces to OpenTelemetry, as the stateless revision prefers.
-- **`tools/list` pagination.** The tool list is always one page.
 - **Redis Cluster.** Use one Redis, or Sentinel through
   `RedisStore.from_client()`.
 - **A notification bus between workers.** List changes and resource updates

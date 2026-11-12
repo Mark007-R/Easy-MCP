@@ -241,7 +241,7 @@ async def test_reserved_codes_never_reach_the_wire(
 ) -> None:
     server = make_server()
 
-    def refuse(context: Any) -> dict[str, Any]:
+    def refuse(*args: Any) -> dict[str, Any]:
         raise ProtocolError("made-up code", code=-32050)
 
     monkeypatch.setattr(server, "_handle_tools_list", refuse)
@@ -257,7 +257,7 @@ async def test_the_spec_defined_reserved_codes_pass(monkeypatch: pytest.MonkeyPa
     server = make_server()
     for code in (-32020, -32021, -32022, -32001):
 
-        def refuse(context: Any, code: int = code) -> dict[str, Any]:
+        def refuse(*args: Any, code: int = code) -> dict[str, Any]:
             raise ProtocolError("defined", code=code)
 
         monkeypatch.setattr(server, "_handle_tools_list", refuse)

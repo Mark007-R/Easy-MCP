@@ -1,12 +1,12 @@
-"""Pagination of ``resources/list``, ``resources/templates/list`` and ``prompts/list``.
+"""Pagination of ``tools/list``, ``resources/list``, ``resources/templates/list`` and
+``prompts/list``.
 
 A page holds :data:`PAGE_SIZE` items.  The cursor is the key of the last
 item of the page, so the next page starts after it whatever was added or
 removed meanwhile: no item is repeated, and only removed items are skipped.
 It is ``base64url(JSON {"k": kind, "a": last key})`` without padding and is
 not signed: it only holds a key its caller was already shown, and a forged
-one only moves where the caller's own visible list starts.  ``tools/list``
-is not paginated.
+one only moves where the caller's own visible list starts.
 """
 
 from __future__ import annotations
