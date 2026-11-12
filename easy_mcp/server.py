@@ -89,6 +89,7 @@ from .middleware import (
     run_chain,
 )
 from .pagination import paginate
+from .progress import ProgressReporter, _progress_scope, progress_token
 from .prompts import PromptDefinition, PromptRegistry, build_prompt
 from .protocol import (
     DISCOVER_METHOD,
@@ -1699,7 +1700,45 @@ class MCPServer:
         ``None`` for a ``subscriptions/listen`` that was served, or whose
         stream had its answer before middleware replaced it: its frames, the
         final one included, went through ``context.push``.
+
+        A request that carries a progress token gets a reporter for as long
+        as it is served, which ``report_progress()`` reaches from middleware
+        and from the function the request runs.  Its last report goes out
+        before the answer does; a cancelled request sends no more.
         """
+        reporter = self._progress_reporter(request, context)
+        # Set even when there is none: a request served from inside another
+        # (a tool dispatching to a server in-process) must not report as it.
+        with _progress_scope(reporter):
+            try:
+                return await self._serve_request(request, context)
+            except asyncio.CancelledError:
+                if reporter is not None:
+                    reporter._close(flush=False)
+                raise
+            finally:
+                if reporter is not None:
+                    reporter._close()
+
+    def _progress_reporter(
+        self, request: RequestInfo, context: ClientContext
+    ) -> ProgressReporter | None:
+        """The reporter for *request*, if it asked for progress on a channel that carries it."""
+        if request.method == LISTEN_METHOD:
+            return None  # its stream carries change notifications only
+        token = progress_token(request._params)
+        if token is None:
+            return None
+        send = context.notify
+        if send is None and context.multiplexed:
+            send = context.push
+        if send is None:
+            return None
+        return ProgressReporter(token, send, asyncio.get_running_loop())
+
+    async def _serve_request(
+        self, request: RequestInfo, context: ClientContext
+    ) -> dict[str, Any] | None:
         outcome = await self._isolated(request, functools.partial(self._outcome, request, context))
         if request.method == "tools/call":
             # A call that request middleware refused, or failed on, before

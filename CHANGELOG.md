@@ -4,6 +4,42 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
+## [Unreleased]
+
+### Added
+
+- Progress updates. `report_progress(progress, total=None, message=None)`
+  tells the client how far the request being served has got, from a sync or
+  async tool, a resource or prompt function, or middleware. It sends
+  `notifications/progress` to a client that put a `progressToken` in the
+  request's `_meta`, and does nothing (returning `False`) for one that did
+  not. Reports are bounded to one notification per 0.1 s per request, always
+  the latest value, and the last one before the answer is sent ahead of it; a
+  `progress` that does not grow is dropped, and nothing is sent once the
+  request is answered, cancelled or timed out. `current_progress()` returns
+  the request's `ProgressReporter`, or `None`.
+
+  On stdio and the legacy `/sse` stream the notifications travel between the
+  other messages. Over Streamable HTTP, in sessions and stateless requests
+  alike, they travel on the response of the request itself: see Changed.
+- `ClientContext.notify`, for custom transports that answer each request on
+  a stream of its own: the server sends a request's progress there.
+
+### Changed
+
+- Over Streamable HTTP, a `POST` whose request carries a `progressToken` may
+  now be answered with `text/event-stream` instead of `application/json`:
+  the request's `notifications/progress`, then its response as the last
+  event. This happens only when the function reports progress before it
+  finishes and the client's `Accept` header names `text/event-stream` (or a
+  range holding it), which the specification requires of clients. Requests
+  without a token, requests that report nothing, and clients that accept
+  only JSON are answered exactly as before. On such a stream every answer is
+  `200`: an error that would have had a status of its own (a shutdown's
+  `503`, say) arrives as the JSON-RPC error in the last event.
+- A stream's queue keeps only the newest waiting `notifications/progress` of
+  each token, so a client that reads slowly cannot grow a backlog of them.
+
 ## [0.3.2] - 2026-10-19
 
 0.3.2 completes the v0.3 milestone: MCP resources, prompts and completion,

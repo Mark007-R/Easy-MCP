@@ -4,8 +4,12 @@ One endpoint (``/mcp`` by default) carries the whole protocol:
 
 * ``POST`` delivers exactly one JSON-RPC message.  A request is answered in
   the HTTP response body as ``application/json``; notifications and client
-  responses get ``202 Accepted``.  The one exception is
-  ``subscriptions/listen``, whose answer is a ``text/event-stream``.
+  responses get ``202 Accepted``.  Two answers are a ``text/event-stream``
+  instead: that of ``subscriptions/listen``, and that of a request which
+  carries a ``progressToken`` and reports progress before it finishes (its
+  client must accept ``text/event-stream``).  Such a stream carries the
+  ``notifications/progress`` of that request, then its response, and ends.
+  A request that reports nothing is answered as JSON, like any other.
 * ``GET`` with a session's ``MCP-Session-Id`` opens that session's stream
   (``text/event-stream``), which carries the list-change notifications
   (tools, prompts, resources) and ``notifications/resources/updated`` for the
@@ -64,6 +68,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import dataclasses
 import json
 import math
 import secrets
@@ -95,6 +100,7 @@ from ..exceptions import (
 )
 from ..logging import audit
 from ..middleware import TransportInfo
+from ..progress import progress_token
 from ..protocol import (
     LISTEN_METHOD,
     META_PROTOCOL_VERSION,
@@ -158,6 +164,36 @@ _TRANSPORT = "streamable-http"
 
 class _ShuttingDown(Exception):
     """Shutdown stopped a message being dispatched, or refused to start one."""
+
+
+class _Streaming:
+    """A request that reported progress before finishing: its answer is a stream.
+
+    ``task`` is its dispatch, still running, and ``outbox`` holds what it
+    has reported so far.
+    """
+
+    __slots__ = ("outbox", "task")
+
+    def __init__(self, task: asyncio.Task[dict[str, Any] | None], outbox: Outbox) -> None:
+        self.task = task
+        self.outbox = outbox
+
+
+def _progress_outbox(message: dict[str, Any], request: Request) -> Outbox | None:
+    """An outbox for the progress of *message*, if it asks for it and its client reads streams.
+
+    Only a client that names ``text/event-stream`` (or a range holding it)
+    in ``Accept`` is answered with one; a request without the header keeps
+    its JSON answer.
+    """
+    params = message.get("params")
+    if "id" not in message or not isinstance(params, dict) or progress_token(params) is None:
+        return None
+    accept = request.headers.get("accept")
+    if not accept or not accepts_event_stream(accept):
+        return None
+    return Outbox()
 
 
 class _NotifyStream:
@@ -688,6 +724,7 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         session = await self._session_for(request, identity)
         if isinstance(session, Response):
             return session
+        streaming = False
         try:
             if "method" not in message and ("result" in message or "error" in message):
                 # A reply to a server-to-client request.  This server never
@@ -697,18 +734,28 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             # This request's own identity: a refreshed or broader token takes
             # effect at once, in the same session.
             context = self._manager.context(session, identity)
+            outbox = _progress_outbox(message, request)
+            if outbox is not None:
+                # A context of this request's own, sharing the session's
+                # calls: its progress goes to its own response.
+                context = dataclasses.replace(context, notify=outbox.put)
             try:
                 # A disconnect cancels nothing in this era; ending the session
                 # (DELETE) and shutdown do.
                 response = await self._dispatch_until_disconnect(
-                    message, context, request, info, disconnect=False, owner=session
+                    message, context, request, info, disconnect=False, owner=session, outbox=outbox
                 )
             except _ShuttingDown:
                 if "id" in message:
                     return _shutting_down(message["id"])
                 return Response(status_code=202)  # a notification gets no answer either way
+            if isinstance(response, _Streaming):
+                # The session stays held until the request has finished.
+                streaming = True
+                return self._progress_stream(response, message, context, owner=session)
         finally:
-            await self._manager.finish(session)
+            if not streaming:
+                await self._manager.finish(session)
         if response is None:
             # A notification, or a request cancelled via notifications/cancelled:
             # MCP sends a reply to neither.
@@ -780,16 +827,22 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             await store.touch_client(client_id, ttl=self._idle_timeout)
         except StoreUnavailableError:
             return self._store_unavailable(msg_id)
+        outbox = _progress_outbox(message, request)
         context = ClientContext(
             client_id=client_id,
             session_id="stateless",
             identity=identity,
             store_handle=ClientHandle(store, client_id, self._idle_timeout),
+            notify=outbox.put if outbox is not None else None,
         )
         try:
-            response = await self._dispatch_until_disconnect(message, context, request, info)
+            response = await self._dispatch_until_disconnect(
+                message, context, request, info, outbox=outbox
+            )
         except _ShuttingDown:
             return _shutting_down(msg_id)
+        if isinstance(response, _Streaming):
+            return self._progress_stream(response, message, context, cancel_on_close=True)
         if response is None:
             return Response(status_code=202)  # the client hung up: nobody reads it
         challenge = self._step_up_headers(response, identity, modern=True)
@@ -923,7 +976,8 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         *,
         disconnect: bool = True,
         owner: LocalSession | None = None,
-    ) -> dict[str, Any] | None:
+        outbox: Outbox | None = None,
+    ) -> dict[str, Any] | _Streaming | None:
         """Dispatch, cancelling the work if the client closes the connection.
 
         In the stateless era a closed connection is the cancellation signal:
@@ -931,6 +985,12 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         *disconnect* false: there a closed connection cancels nothing, and
         the end of the *owner* session does.  Returns ``None`` for work
         cancelled either way (no answer is sent, as for any cancel).
+
+        With an *outbox* (the request asked for progress), a notification
+        queued there while the work is still running hands the work over:
+        the :class:`_Streaming` returned must be answered with
+        :meth:`_progress_stream`, which takes over everything this method
+        would have cleaned up.
 
         Raises:
             _ShuttingDown: Shutdown cancelled the work, or had begun before it
@@ -955,16 +1015,27 @@ class StreamableHTTPTransport(BaseHTTPTransport):
             owner.dispatches.add(task)
             if owner.ended:
                 task.cancel()  # it ended while this request was on its way in
+        waiter = asyncio.ensure_future(outbox.wait()) if outbox is not None else None
+        handed_over = False
         try:
             while True:
                 timeout = _DISCONNECT_POLL_SECONDS if disconnect else None
-                done, _ = await asyncio.wait({task}, timeout=timeout)
-                if done:
+                waiting = {task} if waiter is None else {task, waiter}
+                done, _ = await asyncio.wait(
+                    waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if task in done:
+                    # Progress that arrived with the answer is not worth a stream.
                     if not task.cancelled():
                         return task.result()
                     if self._closing:
                         raise _ShuttingDown
                     return None  # the session ended
+                if outbox is not None and len(outbox):
+                    handed_over = True
+                    return _Streaming(task, outbox)
+                if not disconnect:
+                    continue
                 if await request.is_disconnected():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -977,13 +1048,76 @@ class StreamableHTTPTransport(BaseHTTPTransport):
                     )
                     return None
         finally:
+            if waiter is not None:
+                waiter.cancel()
+            if not handed_over:
+                self._dispatches.discard(task)
+                if owner is not None:
+                    owner.dispatches.discard(task)
+                # Our own caller may be cancelled too (shutdown, a timeout in a
+                # wrapping app): the call must not outlive its request.
+                if not task.done():
+                    task.cancel()
+
+    def _progress_stream(
+        self,
+        streaming: _Streaming,
+        message: dict[str, Any],
+        context: ClientContext,
+        *,
+        cancel_on_close: bool = False,
+        owner: LocalSession | None = None,
+    ) -> Response:
+        """Answer a request that reports progress: its notifications, then its response.
+
+        The response is the stream's last event, whatever it is (an error
+        too: the status line has been sent by then).  A request shutdown
+        stops ends with ``-32008``; one its client cancelled, or whose
+        session ended, ends with no response, as every cancelled request
+        does.  With *cancel_on_close* (the stateless era) a client that
+        closes the stream cancels the request; in a session the request
+        runs on, and *owner* stays held until it has finished.
+        """
+        task, outbox = streaming.task, streaming.outbox
+        msg_id = message.get("id")
+
+        def finished(_: object) -> None:
             self._dispatches.discard(task)
+            response: dict[str, Any] | None = None
+            if task.cancelled():
+                if self._closing:
+                    response = _rpc_error_body(
+                        msg_id,
+                        SERVER_BUSY,
+                        "Server is shutting down; retry shortly",
+                        {"reason": "shutdown"},
+                    )
+            elif task.exception() is None:
+                response = task.result()
+            if response is not None:
+                with contextlib.suppress(ChannelClosed):
+                    outbox.put(response)
+            outbox.close()
             if owner is not None:
                 owner.dispatches.discard(task)
-            # Our own caller may be cancelled too (shutdown, a timeout in a
-            # wrapping app): the call must not outlive its request.
-            if not task.done():
-                task.cancel()
+                release = asyncio.ensure_future(self._manager.finish(owner))
+                self._stream_ends.add(release)
+                release.add_done_callback(self._stream_ends.discard)
+
+        task.add_done_callback(finished)
+
+        def on_close() -> None:
+            outbox.close()
+            if cancel_on_close and not task.done():
+                task.cancel()  # the client closed the stream: that is its cancel
+                audit(
+                    "request_abandoned",
+                    client_id=context.client_id,
+                    request_id=msg_id,
+                    transport=_TRANSPORT,
+                )
+
+        return EventStreamResponse(stream_events(outbox), on_close=on_close)
 
     @staticmethod
     def _client_id(identity: ClientIdentity | None, request: Request) -> str:
@@ -1051,9 +1185,11 @@ class StreamableHTTPTransport(BaseHTTPTransport):
         try:
             # A disconnect cancels nothing in this era, and nor can the
             # client cancel a handshake; shutdown does.
-            response = await self._dispatch_until_disconnect(
+            answer = await self._dispatch_until_disconnect(
                 message, session.context, request, info, disconnect=False
             )
+            assert not isinstance(answer, _Streaming)  # no outbox was offered
+            response = answer
         except _ShuttingDown:
             return _shutting_down(message["id"])  # and no session, below
         finally:

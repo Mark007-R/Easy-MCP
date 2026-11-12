@@ -48,7 +48,7 @@ from ..store.base import (
     session_ref,
 )
 from . import _bus
-from ._outbox import coalesce_key
+from ._outbox import coalesce_key, replaces
 from .base import ClientContext
 
 if TYPE_CHECKING:
@@ -138,8 +138,8 @@ class LocalSession:
     # Background work for it: legacy SSE dispatches and relays.
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     stream: asyncio.Queue[Any] | None = None
-    # The change notifications waiting in stream, by what they coalesce by.
-    waiting: set[Hashable] = field(default_factory=set)
+    # The notifications waiting in stream, by what they coalesce by.
+    waiting: dict[Hashable, dict[str, Any]] = field(default_factory=dict)
     # The transport's own object, with a close(reason) method.
     notify_stream: Any = None
     # Changes to its resource subscriptions and reads of them under way
@@ -159,14 +159,21 @@ class LocalSession:
         A change notification already waiting there (the same list, for the
         same subscription) is not queued again: each only tells the client
         to fetch the list, so a client that stops reading cannot grow a
-        backlog of them.
+        backlog of them.  A progress notification takes the place of the
+        one waiting for the same token.
         """
         assert self.stream is not None
         key = coalesce_key(message)
         if key is not None:
-            if key in self.waiting:
+            queued = self.waiting.get(key)
+            if queued is not None:
+                if replaces(message):
+                    # The queue holds this very object: it keeps its place.
+                    queued["params"] = message["params"]
                 return
-            self.waiting.add(key)
+            # A copy, so that replacing its params never touches the caller's.
+            message = dict(message)
+            self.waiting[key] = message
         self.stream.put_nowait(message)
 
     def taken(self, item: Any) -> None:
@@ -174,7 +181,7 @@ class LocalSession:
         if isinstance(item, dict):
             key = coalesce_key(item)
             if key is not None:
-                self.waiting.discard(key)
+                self.waiting.pop(key, None)
 
     def stop_work(self) -> None:
         """Cancel every call of the session on this worker, those yet to start included."""
