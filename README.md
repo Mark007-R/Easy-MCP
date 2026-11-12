@@ -57,8 +57,8 @@ combine them as `pip install "easy-mcp-kit[redis,otel]"`:
 | `[mysql]` | PyMySQL 1.1+ | the MySQL / MariaDB connector |
 | `[mongodb]` | pymongo 4.6+ | the MongoDB connector |
 
-The GitHub and SQLite connectors need no extra. Coming from 0.3.1? Read
-[Upgrading from 0.3.1](#upgrading-from-031) first.
+The GitHub and SQLite connectors need no extra. Coming from 0.3.2? Read
+[Upgrading from 0.3.2](#upgrading-from-032) first.
 
 ## Why easy_mcp?
 
@@ -73,6 +73,10 @@ The GitHub and SQLite connectors need no extra. Coming from 0.3.1? Read
 | Prompts | `@server.prompt` | Argument metadata from the signature, typed arguments, completion from `Literal` |
 | Auth | `auth=APIKeyAuth({...})` or `oauth=OAuthResourceServer(...)` | Constant-time key checks, OAuth 2.1 bearer tokens with audience checks, per-tool scopes, hidden protected tools |
 | Rate limits | `rate_limit_per_minute=120` | Sliding-window limiter per client |
+| Slow tools | `report_progress(done, total)` | Progress notifications, throttled, on whichever channel the call's answer takes |
+| Questions | `elicit("...", {"guests": int})` | A form shown by the client, on stateless clients and sessions alike; answers checked against it |
+| Browser clients | `allowed_origins=[...]` | An `Origin` allowlist that is also the CORS policy; DNS rebinding stops at 403 |
+| Icons | `icons=["https://..."]` or `Icon.from_file(...)` | Icons on the server and its tools, resources and prompts; only `https:` and `data:` |
 | Several workers | `store=RedisStore.from_env()` | Sessions, call caps and rate limits shared between processes, no sticky routing |
 | Policy & telemetry | `@server.middleware`, `@server.tool_middleware` | Hooks around every request and tool call, after the built-in checks; refuse with an exception |
 | Observability | Nothing (or `metrics=True`) | OpenTelemetry spans per request with the MCP semantic conventions; Prometheus `/metrics` |
@@ -448,6 +452,8 @@ answer arrives, the function is called anew with the same arguments, and
 this time `elicit()` returns it. So ask first and act afterwards: anything
 before the last `elicit()` runs more than once. The tool's timeout covers
 each run, not the time the user takes.
+Progress keeps counting across runs: after a
+question, only values above those already reported are sent.
 
 That rule is what makes one tool work with every client:
 
@@ -480,7 +486,7 @@ capability for a stateless client, an `isError` result for a session.
 Never ask for a password, an API key or a card number this way: the
 specification forbids form questions for secrets, since the answer passes
 through the client. Only tools can ask, and only with a form (see
-[Not in 0.3.2](#not-in-032)). What the user answers is never logged.
+[Not in 0.4.0](#not-in-040)). What the user answers is never logged.
 
 ### Icons
 
@@ -509,7 +515,9 @@ An icon is an `https://` URL the client fetches, or the image itself as a
 a `.png`, `.jpg`, `.svg` or `.webp` of up to 64 KiB once, at start-up, and
 embeds it, so nothing has to be hosted. `mime_type`, `sizes` (`"48x48"`, or
 `"any"` for a scalable image) and `theme` (`"light"` or `"dark"`) are
-optional and help a client choose among several; one item takes up to 8.
+optional and help a client choose among several; one item takes up to 8,
+which together may embed 64 KiB. A URL is plain ASCII (percent-encode
+anything else) of up to 2048 characters, and embedded data is an image.
 
 Anything else is refused when it is registered: the specification tells
 clients to reject icons that are not `https:` or `data:`, so an `http://`
@@ -580,7 +588,8 @@ and no CORS headers, so its browser shows it nothing. The preflight allows
 10 minutes. Cookies are never allowed (`Access-Control-Allow-Credentials` is
 not sent): credentials travel in headers the page sets itself. Requests with
 no `Origin` header, which is every client that is not a browser, are served
-exactly as before.
+as before; unless every origin is allowed, their answers gain `Vary: Origin`,
+so a shared cache keeps them apart from a browser's.
 
 Over stdio the MCP host launches your script as a child process and talks
 JSON-RPC over its pipes. Logs go to stderr, and `sys.stdout` is redirected to
@@ -1234,53 +1243,53 @@ argument values, `_meta` or header values other than a refused `Origin`
 characters (to 256, ending in `...`, in the `*_finished_after_cancel` events
 and in `cancel_callback_failed`'s `name`, so a URI longer than that is not
 spelled the same there as in its `resource_read`). The last column says what
-changed since 0.3.1.
+changed since 0.3.2.
 
-| Event | Logged when | Fields | 0.3.2 |
+| Event | Logged when | Fields | 0.4.0 |
 |---|---|---|---|
 | **Calls** | | | |
-| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `busy`, `input_required` (a stateless call that asked the user a question) or `refused` (one whose client cannot be asked, or answered with something else); `error_id` with `error` and `output_schema_error` | |
-| `elicitation_requested` | a tool asks the user a question | `tool`, `client_id`, `question` (its key: its place in the call and a digest, never its text) | |
-| `elicitation_answered` | a session's client answers one, or does not | `tool`, `client_id`, `question`, `action`: `accept`, `decline`, `cancel`, `timeout` or `error` (with the client's `code`); never the answer | |
-| `tool_denied` | a call is refused before its tool runs: bad arguments, `max_calls_per_session`, a step-up, or tool middleware | `tool`, `client_id`, `reason` (the exception's class: `ValidationError`, `SessionLimitError`, `InsufficientScopeError`, ...), `middleware` when one refused, `scope` for a step-up | `middleware`, `scope` added |
+| `tool_call` | a tool call is answered | `tool`, `client_id`, `duration_ms` (not for `busy`), `status`: `ok`, `tool_error`, `error`, `output_schema_error`, `timeout`, `busy`, `input_required` (a stateless call that asked the user a question) or `refused` (one whose client cannot be asked, or answered with something else); `error_id` with `error` and `output_schema_error` | `input_required` and `refused` statuses added |
+| `elicitation_requested` | a tool asks the user a question | `tool`, `client_id`, `question` (its key: its place in the call and a digest, never its text) | new |
+| `elicitation_answered` | a session's client answers one, or does not | `tool`, `client_id`, `question`, `action`: `accept`, `decline`, `cancel`, `timeout` or `error` (with the client's `code`); never the answer | new |
+| `tool_denied` | a call is refused before its tool runs: bad arguments, `max_calls_per_session`, a step-up, or tool middleware | `tool`, `client_id`, `reason` (the exception's class: `ValidationError`, `SessionLimitError`, `InsufficientScopeError`, ...), `middleware` when one refused, `scope` for a step-up | |
 | `tool_cancelled` | a `tools/call` is cancelled: by its client, a closed stateless connection, the session's end or shutdown | `client_id`, `request_id` | |
-| `request_cancelled` | any other request is cancelled in the same ways (reads, prompts and completions included; a listen stream's end is a `subscription_close`) | `method`, `client_id`, `request_id` | new |
+| `request_cancelled` | any other request is cancelled in the same ways (reads, prompts and completions included; a listen stream's end is a `subscription_close`) | `method`, `client_id`, `request_id` | |
 | `tool_finished_after_cancel` | a sync tool returns after its call was cancelled or timed out: worth watching for tools that write | `tool`, `client_id`, `reason` (`cancelled` or `timeout`), `status` (`ok` or `error`) | |
-| `resource_finished_after_cancel`, `prompt_finished_after_cancel`, `completion_finished_after_cancel` | the same, for a sync resource, prompt or completer | `uri`, `prompt`, or for a completion the `prompt` or template `uri` with `.` and the argument's name; then as above | new |
-| `cancel_callback_failed` | a cancel callback raised (the traceback is logged under its `error_id`) | `tool`, or `kind` and `name` for a resource, prompt or completion; `client_id`, `error_id` | `kind`, `name` added |
-| `rate_limited` | a message, an SSE session opening, a `GET /mcp` stream opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse`, `GET /mcp` and `GET /metrics` for those three; the first two name the transport's configured path) | `GET /mcp` and `GET /metrics` added |
+| `resource_finished_after_cancel`, `prompt_finished_after_cancel`, `completion_finished_after_cancel` | the same, for a sync resource, prompt or completer | `uri`, `prompt`, or for a completion the `prompt` or template `uri` with `.` and the argument's name; then as above | |
+| `cancel_callback_failed` | a cancel callback raised (the traceback is logged under its `error_id`) | `tool`, or `kind` and `name` for a resource, prompt or completion; `client_id`, `error_id` | |
+| `rate_limited` | a message, an SSE session opening, a `GET /mcp` stream opening or a scrape is over the rate limit | `client_id`, `method` (`GET /sse`, `GET /mcp` and `GET /metrics` for those three; the first two name the transport's configured path) | |
 | **Middleware** | | | |
-| `request_denied` | request middleware refuses before the work runs | `method`, `client_id`, `reason` (the exception's class), `middleware`, `tool` on `tools/call` | new |
-| `tool_result_withheld` | middleware replaces the answer of a tool that did run | `tool`, `client_id`, `middleware`, `status` (the tool's, or `cancelled` when the middleware stopped it before it answered, with a timeout of its own, say), `reason` | new |
-| `middleware_failed` | a middleware raises unexpectedly or breaks its contract | `middleware`, `method`, `tool` when there is one, `client_id`, `error_id`, `stage` (`before` or `after`) | new |
+| `request_denied` | request middleware refuses before the work runs | `method`, `client_id`, `reason` (the exception's class), `middleware`, `tool` on `tools/call` | |
+| `tool_result_withheld` | middleware replaces the answer of a tool that did run | `tool`, `client_id`, `middleware`, `status` (the tool's, or `cancelled` when the middleware stopped it before it answered, with a timeout of its own, say), `reason` | |
+| `middleware_failed` | a middleware raises unexpectedly or breaks its contract | `middleware`, `method`, `tool` when there is one, `client_id`, `error_id`, `stage` (`before` or `after`) | |
 | **Resources and prompts** | | | |
-| `resource_read` | a `resources/read` is answered | `uri`, `template` when one matched, `client_id`, `duration_ms`, `status`: `ok`, `not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`; `error_id` when one was logged; `hidden: true` when the URI matched an item the caller may not see | new |
-| `prompt_get` | a `prompts/get` of a prompt the caller may see is answered | `prompt`, `client_id`, `duration_ms`, `status` (as for reads; `denied` for bad arguments) | new |
-| `resource_subscribe`, `resource_unsubscribe` | a handshake-era session watches a resource or stops | `uri`, `client_id`, `session_id`, `session_ref` | new |
+| `resource_read` | a `resources/read` is answered | `uri`, `template` when one matched, `client_id`, `duration_ms`, `status`: `ok`, `not_found`, `denied`, `tool_error`, `error`, `timeout` or `busy`; `error_id` when one was logged; `hidden: true` when the URI matched an item the caller may not see | |
+| `prompt_get` | a `prompts/get` of a prompt the caller may see is answered | `prompt`, `client_id`, `duration_ms`, `status` (as for reads; `denied` for bad arguments) | |
+| `resource_subscribe`, `resource_unsubscribe` | a handshake-era session watches a resource or stops | `uri`, `client_id`, `session_id`, `session_ref` | |
 | **Streams** | | | |
-| `subscription_open` | a `subscriptions/listen` stream is acknowledged | `client_id`, `subscription_id` (the listen request's id), `kinds`, `resources` (how many it watches, when it names any) | new |
-| `subscription_close` | a listen stream ends | `client_id`, `subscription_id`, `reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`, `token_expired`, `undeliverable` or `closed` | new |
-| `subscription_refused` | a listen is over its cap (`-32007`) | `client_id`, `reason` (`client_limit` or `server_limit`) | new |
-| `stream_open`, `stream_close` | a session's `GET /mcp` stream opens or closes | `session_id`, `session_ref`, `client_id`, `transport`; on close a `reason`: `client_closed`, `replaced`, `session_closed`, `shutdown` or `token_expired` | new |
+| `subscription_open` | a `subscriptions/listen` stream is acknowledged | `client_id`, `subscription_id` (the listen request's id), `kinds`, `resources` (how many it watches, when it names any) | |
+| `subscription_close` | a listen stream ends | `client_id`, `subscription_id`, `reason`: `client_cancelled`, `disconnected`, `shutdown`, `session_closed`, `token_expired`, `undeliverable` or `closed` | |
+| `subscription_refused` | a listen is over its cap (`-32007`) | `client_id`, `reason` (`client_limit` or `server_limit`) | |
+| `stream_open`, `stream_close` | a session's `GET /mcp` stream opens or closes | `session_id`, `session_ref`, `client_id`, `transport`; on close a `reason`: `client_closed`, `replaced`, `session_closed`, `shutdown` or `token_expired` | |
 | **Sessions** | | | |
-| `session_open` | a handshake-era session opens: on Streamable HTTP when its `initialize` is answered, on legacy SSE and stdio when the stream or the process starts (so before `initialize`) | `session_id`, `session_ref`, `client_id`, `transport`; `protocol_version` on Streamable HTTP; `worker` with a shared store | `session_ref`, `protocol_version`, `worker` added; `transport` on legacy SSE |
-| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | `session_ref`, `worker` and `store_lost` added; `transport` and `reason` on legacy SSE |
-| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | `session_ref` added; `transport` on legacy SSE |
+| `session_open` | a handshake-era session opens: on Streamable HTTP when its `initialize` is answered, on legacy SSE and stdio when the stream or the process starts (so before `initialize`) | `session_id`, `session_ref`, `client_id`, `transport`; `protocol_version` on Streamable HTTP; `worker` with a shared store | |
+| `session_close` | the session ends; with a shared store it is logged once, by the worker that removes it from the store, or if the store lost it by the worker serving it | as `session_open`, without `protocol_version`, with a `reason`: `client_terminated` (a `DELETE`), `idle_timeout`, `shutdown` or `store_lost` on Streamable HTTP; `stream_closed`, `shutdown` or `lease_lost` on legacy SSE; none on stdio | |
+| `session_credential_mismatch` | a session is used with another credential (`403`) | `session_id`, `session_ref`, `client_id` (the session's), `transport` | |
 | **Transports** | | | |
 | `origin_rejected` | a browser `Origin` is refused (`403`) | `origin` (cut to 200 characters), `path` | |
 | `header_mismatch` | a stateless request's MCP headers disagree with its body (`400`) | `client_id`, `transport` | |
-| `request_abandoned` | a stateless Streamable HTTP client closes the connection before its answer, which cancels the call | `client_id`, `request_id`, `transport` | |
+| `request_abandoned` | a stateless Streamable HTTP client closes the connection before its answer, which cancels the call | `client_id`, `request_id`, `transport` | also for a progress stream its client closed |
 | `payload_too_large` | an oversized line arrives on stdio | `client_id`, `transport` | |
 | `stdio_auth_failed` | stdio refuses to start: an invalid `EASY_MCP_STDIO_API_KEY`, or one set for an `oauth=` server without API keys | none | |
-| `metrics_denied` | `/metrics` is refused | `reason` (`unauthenticated`, `insufficient_scope` or `not_local`), `client_id` | new |
+| `metrics_denied` | `/metrics` is refused | `reason` (`unauthenticated`, `insufficient_scope` or `not_local`), `client_id` | |
 | **OAuth** | | | |
-| `auth_failed` | a token is refused (`401`), or lacks the required scopes at the transport's check (`403`) | `reason` (`expired`, `bad_signature`, `wrong_audience`, ... or `insufficient_scope`), `transport`, `client_id` (`ip:<address>`), `token_fp` (a fingerprint of the token), `issuer` when it is a configured one, `scope` for `insufficient_scope` | new |
-| `auth_rate_limited` | an address is over its failed-token budget (`429`) | `client_id`, `transport` | new |
-| `auth_unavailable` | the authorization server cannot be reached | `issuer`, `stage` (`metadata`, `keys` or `introspection`) | new |
-| `principal_seen` | this process first sees a signed-in user; every other event names the user by fingerprint only | `client_id` (the principal's fingerprint), `issuer`, `subject`, `oauth_client_id` | new |
+| `auth_failed` | a token is refused (`401`), or lacks the required scopes at the transport's check (`403`) | `reason` (`expired`, `bad_signature`, `wrong_audience`, ... or `insufficient_scope`), `transport`, `client_id` (`ip:<address>`), `token_fp` (a fingerprint of the token), `issuer` when it is a configured one, `scope` for `insufficient_scope` | |
+| `auth_rate_limited` | an address is over its failed-token budget (`429`) | `client_id`, `transport` | |
+| `auth_unavailable` | the authorization server cannot be reached | `issuer`, `stage` (`metadata`, `keys` or `introspection`) | |
+| `principal_seen` | this process first sees a signed-in user; every other event names the user by fingerprint only | `client_id` (the principal's fingerprint), `issuer`, `subject`, `oauth_client_id` | |
 | **Shared store** | | | |
-| `bus_message_rejected` | a message between workers fails its authentication or names another identity | `op`, `session_ref`, `src` (the sending worker), `reason` (`mac` or `identity`) | new |
-| `sse_relay_failed` | an answer cannot reach the worker holding a legacy SSE stream | `session_ref`, `reason` (`too_large`, `unserializable` or `owner_unreachable`), `error_id` for the first two, which still reach the stream as a `-32603` error with it | new |
+| `bus_message_rejected` | a message between workers fails its authentication or names another identity | `op`, `session_ref`, `src` (the sending worker), `reason` (`mac` or `identity`) | |
+| `sse_relay_failed` | an answer cannot reach the worker holding a legacy SSE stream | `session_ref`, `reason` (`too_large`, `unserializable` or `owner_unreachable`), `error_id` for the first two, which still reach the stream as a `-32603` error with it | |
 
 `session_ref` is a digest of the session id, and also names the session in
 the store. The raw `session_id` is deprecated in audit events and dropped in
@@ -1829,39 +1838,29 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
 - Read [SECURITY.md](https://github.com/Mark007-R/Easy-MCP/blob/main/SECURITY.md)
   before exposing a server beyond localhost.
 
-## Upgrading from 0.3.1
+## Upgrading from 0.3.2
 
-A server that worked on 0.3.1 needs no code change, unless a row below asks
+A server that worked on 0.3.2 needs no code change, unless a row below asks
 for one. These are the differences its clients, proxies and log pipelines
 can see; the
 [CHANGELOG](https://github.com/Mark007-R/Easy-MCP/blob/main/CHANGELOG.md)
-has the details.
+has the details, and the changes of earlier releases.
 
 | What changed | What to do |
 |---|---|
-| `initialize` and `server/discover` advertise `tools.listChanged: true`, and a tool registered or removed while clients are connected sends them `notifications/tools/list_changed` (stdout, the `/sse` stream, the session's `GET /mcp` stream) | Nothing for MCP clients. A hand-written stdio client must accept notifications between answers. |
-| `GET /mcp` with a session's `MCP-Session-Id` opens a long-lived `text/event-stream` instead of answering `405` | Keep proxy buffering off and idle timeouts above 15 s for it, as for `/sse`; under your own uvicorn pass `--timeout-graceful-shutdown`. |
-| Every request except `initialize` can be cancelled with `notifications/cancelled`, not only `tools/call`; a cancelled one gets no answer | Nothing; a client that cancels gets what it asked for. |
-| A call that middleware refuses, or that is cancelled before its tool starts, no longer spends a unit of `max_calls_per_session` (a busy one already did not); a call holds its unit from the built-in checks on, so concurrent calls beyond the cap get `-32006` while one waits in tool middleware | Nothing, unless you relied on refusals using up the cap. |
-| In a handshake-era session, each request runs with the identity of its own credential; the session stays bound to the principal that opened it | Nothing for API keys. With OAuth a refreshed or broader token takes effect at once. |
-| A stateless `tools/list` is `cacheScope: "private"` with request middleware registered or `oauth=` set, as with `auth=` before | Nothing; caches keep it per caller. |
-| No stateless (`2026-07-28`) response carries `-32002`: the `Origin` `403` sends `-32600`, any other becomes `-32001`; codes `-32023` to `-32099` become `-32603` with an `error_id`. Handshake-era clients still get `-32002`, now deprecated | A stateless client that matched `-32002` should look at the HTTP status (`403`) instead. |
-| `ClientContext` compares and hashes by identity, and can be weakly referenced | A custom transport that compared contexts with `==` must compare the fields it means. |
-| With a shared store, `/healthz` answers `503` (`"store": "unreachable"`) when Redis cannot be reached | Use it as the load balancer's health check: the worker would refuse those requests anyway. |
-| `subscriptions/listen` without the stateless `_meta` is `-32602` over stdio and legacy SSE (was `-32601`); over Streamable HTTP a listen with `params` is a stateless request, so missing mirrored headers get `400` with `-32020` | Nothing for MCP clients; send listens as stateless requests. |
-| A request with an `id` naming a `notifications/*` method is answered `-32601` (it got no answer at all); a stateless error `-32020` to `-32022` raised by middleware gets HTTP `400` | Nothing. |
-| `server.run()` gives running Streamable HTTP requests 5 s at shutdown, then cancels them with `503`, `-32008` (`data.reason: "shutdown"`) and `Retry-After: 1`; it used to wait without a bound | Retry on `503`. |
-| The HTTP transports charge the rate limit through `acheck_rate_limit()` | A subclass that overrides `check_rate_limit()` for HTTP must override `acheck_rate_limit()`. |
-| `max_sessions` counts the sessions of every endpoint of one kind serving a server together (Streamable HTTP and legacy SSE still apart), and Streamable HTTP endpoints share stateless call counts; each transport used to keep its own | Nothing, unless you serve one server at several endpoints of one kind and sized `max_sessions` per endpoint. |
-| `StreamableHTTPTransport(path=...)` refuses a path under `/.well-known/`, and `/metrics` with `metrics=True` | Move the endpoint. |
-| Existing audit events gain fields (`session_ref`, `worker`, `protocol_version`, `middleware`, `scope`, a legacy SSE `transport` and `reason`), and the raw `session_id` is deprecated | Key log processing on `session_ref`; see the [event catalogue](#structured-logging-and-audit-trail). |
-| With `opentelemetry-api` installed and an SDK configured, every message is a span and JSON log lines carry `trace_id` and `span_id` | `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp` turns this off. |
-| `ToolRegistrationError` is a subclass of the new `RegistrationError` | Nothing: existing `except` clauses still catch it. |
+| A page on an allowed `Origin` (a loopback origin by default) now gets CORS headers and its preflight answered, so it can call the server and read the answers; before, its browser withheld them | Nothing if `allowed_origins` already lists only origins you trust. To let no browser page in, pass `allowed_origins=[]`. Remove a `CORSMiddleware` wrapper if you added one (it still works). |
+| `tools/list` is paginated: 100 tools per page in name order, with `nextCursor`; a `cursor` it did not hand out is `-32602` (it was ignored) | Nothing with at most 100 tools visible to a caller. With more, clients must follow `nextCursor`, as MCP clients do. |
+| Over Streamable HTTP, a request that carries a `progressToken` and whose function calls `report_progress()` is answered with `text/event-stream` instead of `application/json`, when the client's `Accept` allows it. In a session, so is a `tools/call` whose tool calls `elicit()` | Nothing unless a tool uses the new functions. Then keep proxy buffering off for `POST /mcp`, as for the other streams; on such a stream every answer is `200` and an error arrives as the last event. |
+| A message with an `id` and a `result` or `error` but no `method` is a response: it is never answered (over stdio it got `-32600`) | Nothing for MCP clients. |
+| A stateless `tools/call` whose `requestState` this server did not sign, or whose `inputResponses` is not an object, is refused with `-32602`; both were ignored | Nothing: clients send these only on the retry of a call that asked for input. |
+| `MCPServer` reads `EASY_MCP_STATE_SECRET` when it is set (at least 16 bytes, or construction fails) | Set it, or `state_secret=`, to the same value in every worker when tools call `elicit()`; otherwise nothing. |
+| `ToolOutcome.status` can be `input_required`, and `easy_mcp_tool_calls_total` and the `tool_call` audit event carry it | Tool middleware that treats every outcome that is not `ok` as a failure should let `input_required` pass: it is a question, and the retry brings the result. Dashboards gain one status. |
+| `ClientContext` gains `notify` and `client_capabilities`; `ToolDefinition`, `ResourceDefinition`, `ResourceTemplateDefinition` and `PromptDefinition` gain `icons` | Nothing: the new fields come last and have defaults. A custom transport that wants progress and questions on a stream of the request's own sets `notify` (see [Custom transports](#custom-transports)). |
 
-## Not in 0.3.2
+## Not in 0.4.0
 
 The MCP specification has more than easy_mcp offers yet. These are not in
-0.3.2:
+0.4.0:
 
 - **Questions from resources and prompts.** Only a tool can ask the user
   (`elicit()`); a `resources/read` or `prompts/get` never answers with an
@@ -1891,7 +1890,7 @@ The MCP specification has more than easy_mcp offers yet. These are not in
 
 ```bash
 pip install -e .[dev]
-pytest            # 1,200+ tests: schema, dispatch, resources, prompts, security, transports
+pytest            # 1,400+ tests: schema, dispatch, resources, prompts, security, transports
 ruff check .
 mypy easy_mcp
 ```

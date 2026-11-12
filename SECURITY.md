@@ -247,6 +247,38 @@ Where they meet:
   buffers are full (see Known limitations); list changes can fill them
   without the client sending anything.
 
+## The surfaces 0.4.0 adds, together
+
+0.4.0 adds two things a server sends before a request's answer (progress,
+and a question to the user), one thing it accepts back through the client
+(`requestState`), a CORS policy, and metadata that makes clients fetch
+URLs (icons). None adds an endpoint or a credential.
+
+| Surface | Who can reach it | What it exposes or accepts | What bounds it | Left to you |
+|---|---|---|---|---|
+| Progress (`notifications/progress`) | the client of the request, which opted in with a `progressToken` | whatever the tool passes to `report_progress()`: numbers and a message | one notification per 0.1 s per request, the newest replacing the one waiting on a slow stream; nothing after the answer, a cancel or a timeout; over Streamable HTTP only on that request's own response | a `message` is shown to the user: put nothing in it the caller may not see |
+| A question (`elicit()`): `InputRequiredResult`, or `elicitation/create` in a session | the client of the tool call, and only one that declared form elicitation | the question's message and form; back comes the user's answer | 10 questions per call, 20 fields and 2000 characters per question; answers checked against the form; a session's answer is taken only from the session asked, by a 128-bit request id, within 10 minutes; neither question nor answer is logged | never ask for a secret: the answer passes through the client. Do nothing before the last `elicit()` that must happen once: the function runs again |
+| `requestState` | any stateless caller can send one | the earlier answers of a call, echoed by the client | HMAC-SHA256 over the whole state, compared in constant time before anything in it is parsed; bound to the principal, the tool and its arguments; 15 minutes; refused with `-32602` before the tool runs; carries only answers the tool read | `state_secret` (or `EASY_MCP_STATE_SECRET`), the same in every worker and kept like a key; single use, where an answer authorizes a one-time action |
+| CORS | pages on the origins in `allowed_origins` (loopback origins by default) | every answer of every HTTP endpoint, readable by the page, with `MCP-Session-Id`, `WWW-Authenticate` and `Retry-After`; a fixed preflight answer before credentials and the rate limit | the allowlist: any other origin gets `403` and no CORS headers; no credentials mode, so a page uses only a credential it holds itself | the list of origins; `"*"` only for servers with nothing to protect; `[]` to let no page in |
+| Icons | everyone who can list the item, or reach the server (`serverInfo`) | URLs the client may fetch, or embedded images | `https:` and `data:` only, checked at registration; 64 KiB and 8 icons per item | an icon URL is fetched by every client that renders it, which tells its host who uses the server: serve icons from your own origin, or embed them. Check SVGs you did not draw |
+| `tools/list` cursors | every caller | where a caller's own visible list continues | unsigned by design: a cursor holds a tool name its caller was already shown, and a forged one only moves the start of that caller's own list | nothing |
+
+Where they meet:
+
+- **A question on a progress stream.** In a Streamable HTTP session both
+  travel on the response of the call itself, which is held by the worker
+  that runs the tool; the client's answer is a separate `POST`. With a
+  shared store that `POST` may reach another worker, so a session served by
+  several workers is not asked at all (`ElicitationUnavailableError`),
+  rather than asked and never heard.
+- **CORS and questions.** A page on an allowed origin can call a tool that
+  asks the user a question, as any client can; the form is shown by that
+  page. Allowing an origin means trusting what it shows your users.
+- **Middleware and `input_required`.** A stateless call that stops to ask
+  reaches tool middleware as an outcome with that status, once per
+  round; the retry is a new request that passes every check again:
+  credentials, scopes, the rate limit and argument validation.
+
 ## Ready-made connectors
 
 The connectors are ordinary tool functions and follow the trust model above:
@@ -292,7 +324,7 @@ the client is untrusted, the credential in the environment is trusted.
   server-side JavaScript is refused. Connect as a user with only the `read`
   role on the one database served.
 
-## Known limitations (v0.3)
+## Known limitations (v0.4)
 
 - **Sync tool cancellation is cooperative.** Python cannot force-kill a
   thread. When a sync tool's call is cancelled or times out, the response is
@@ -547,6 +579,7 @@ patch versions and credited unless you prefer otherwise.
 
 | Version | Supported |
 |---|---|
-| 0.3.x | ✅ |
-| 0.2.x | Security fixes only until 0.4.0 |
+| 0.4.x | ✅ |
+| 0.3.x | Security fixes only until 0.5.0 |
+| 0.2.x | ❌ |
 | 0.1.x | ❌ |

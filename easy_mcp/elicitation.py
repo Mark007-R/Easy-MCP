@@ -164,6 +164,22 @@ class _InvalidAnswer(BaseException):
         self.errors = errors
 
 
+def question_signal(exc: BaseException) -> _InputRequired | _InvalidAnswer | None:
+    """The question (or bad answer) that *exc* is, or carries in an exception group.
+
+    ``elicit()`` called in a child of an ``asyncio.TaskGroup`` reaches the
+    tool's caller wrapped in a ``BaseExceptionGroup``.
+    """
+    if isinstance(exc, _InputRequired | _InvalidAnswer):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for inner in exc.exceptions:
+            found = question_signal(inner)
+            if found is not None:
+                return found
+    return None
+
+
 class _Asking:
     """The questions of one tool call: the answers so far, and whether more can be asked.
 
@@ -542,8 +558,9 @@ class StateSigner:
             "req": digest,
             "ans": dict(answers),
         }
-        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
-        body = _b64(raw.encode("utf-8"))
+        # ASCII: whatever a client answered (a lone surrogate, say) can be carried.
+        raw = json.dumps(payload, separators=(",", ":"), default=str)
+        body = _b64(raw.encode("ascii"))
         return f"{body}.{self._mac(body)}"
 
     def verify(self, state: object, *, principal: str | None, digest: str) -> dict[str, Any]:
@@ -560,10 +577,11 @@ class StateSigner:
         body, mac = state.split(".")
         # Compared before anything in it is parsed.
         try:
-            expected = self._mac(body)
-        except UnicodeEncodeError:
+            expected = self._mac(body).encode("ascii")
+            presented = mac.encode("ascii")
+        except UnicodeError:  # not ASCII, so nothing this server signed
             raise invalid from None
-        if not hmac.compare_digest(expected.encode("ascii"), mac.encode("utf-8")):
+        if not hmac.compare_digest(expected, presented):
             raise invalid
         try:
             payload = json.loads(_unb64(body).decode("utf-8"))

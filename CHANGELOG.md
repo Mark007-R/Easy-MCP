@@ -4,7 +4,19 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/); the public API is not frozen until 1.0.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-12
+
+0.4.0 lets a server talk to its client while a request is running: a tool
+reports its progress and can ask the user a question, on stateless clients
+and sessions alike. Browser-based clients can connect directly, `tools/list`
+is paginated, and the server and its tools, resources and prompts can carry
+icons. Several visible behaviours change for existing servers, each listed
+under Changed; the README's "Upgrading from 0.3.2" says what to do about
+them.
+
+Two features of older protocol revisions are deliberately left out. The
+`2026-07-28` specification deprecates sampling and removes resumable SSE
+streams, so easy_mcp implements neither.
 
 ### Added
 
@@ -61,7 +73,9 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `https://` URL or a `data:` URI, with optional `mime_type`, `sizes` and
   `theme`; a plain string stands for its `src`, and `Icon.from_file()` embeds
   an image file of up to 64 KiB. Any other source (`http:`, a path, another
-  scheme) is a registration error, since clients must refuse it. Icons appear
+  scheme, a URL holding anything but printable ASCII, a `data:` URI that is
+  no Base64 image) is a registration error, since clients must refuse it. An
+  item takes up to 8 icons embedding 64 KiB together. Icons appear
   in `tools/list`, `resources/list`, `resources/templates/list` and
   `prompts/list`, and the server's in `serverInfo`. The definitions gain an
   `icons` field.
@@ -72,9 +86,11 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   every HTTP endpoint, with `MCP-Session-Id`, `WWW-Authenticate` and
   `Retry-After` exposed. The preflight allows `GET`, `POST` and `DELETE`
   with the headers MCP clients send, for 10 minutes, and grants Private
-  Network Access when asked. `Access-Control-Allow-Credentials` is never
-  sent. With `allowed_origins=["*"]` the answer is `*`; otherwise the origin
-  is named and `Vary: Origin` is added. Wrapping the app in Starlette's
+  Network Access when asked (not with `"*"`, which names no origin).
+  `Access-Control-Allow-Credentials` is never sent. With
+  `allowed_origins=["*"]` the answer is `*`; otherwise the origin is named,
+  and every answer, with or without an `Origin`, the `403` included, says
+  `Vary: Origin`. Wrapping the app in Starlette's
   `CORSMiddleware`, as the 0.3.2 README suggested, is no longer needed (and
   still works).
 
@@ -1070,7 +1086,8 @@ change for existing servers, each listed under Changed; the README's
   correlation, structured JSON logs with an audit trail, and the HTTP + SSE
   transport.
 
-[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Mark007-R/Easy-MCP/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Mark007-R/Easy-MCP/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Mark007-R/Easy-MCP/compare/v0.2.5...v0.3.0

@@ -21,6 +21,7 @@ silently never shows.
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import re
 from collections.abc import Iterable
@@ -30,17 +31,28 @@ from typing import Any, Literal
 from .exceptions import RegistrationError
 
 # The longest icon source accepted: a data: URI of a 64 KiB image.  Every
-# list a client fetches carries the icons of every item on the page.
+# list a client fetches carries the icons of every item on the page, so the
+# sources of one item's icons may not add up to more than that either.
 MAX_ICON_BYTES = 64 * 1024
 MAX_SRC_LENGTH = 4 * ((MAX_ICON_BYTES + 2) // 3) + 128
+# The longest https:// URL accepted.
+MAX_URL_LENGTH = 2048
 
 # How many icons one item may carry.
 MAX_ICONS = 8
 
 _MIME_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*")
 _SIZE = re.compile(r"[1-9][0-9]{0,4}x[1-9][0-9]{0,4}")
-_DATA_URI = re.compile(r"data:[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+;base64,[A-Za-z0-9+/]+={0,2}")
-_HTTPS_URL = re.compile(r"https://[^\s/?#\\@]+(?:[/?#][^\s\\]*)?", re.IGNORECASE)
+_DATA_URI = re.compile(r"data:image/[a-z0-9!#$&^_.+-]+;base64,([A-Za-z0-9+/]+={0,2})")
+# Printable ASCII only: a host name (or a bracketed IPv6 address), an optional
+# port, then a path, query or fragment.  Anything else (other scripts, control
+# or invisible characters) must arrive percent-encoded or as punycode, so a
+# source can neither hide what it is nor break the JSON it travels in.
+_HTTPS_URL = re.compile(
+    r"https://(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])"
+    r"(?::[0-9]{1,5})?(?:[/?#][!#-\[\]-~]*)?",
+    re.IGNORECASE,
+)
 
 # What a file's extension says it is, for Icon.from_file.
 _FILE_TYPES = {
@@ -86,21 +98,36 @@ class Icon:
                 f"(a data: URI of {MAX_ICON_BYTES // 1024} KiB); serve a larger image by URL"
             )
         if src.startswith("data:"):
-            if _DATA_URI.fullmatch(src) is None:
-                raise ValueError("a data: icon must be 'data:<type>/<subtype>;base64,<data>'")
+            found = _DATA_URI.fullmatch(src)
+            if found is None:
+                raise ValueError("a data: icon must be 'data:image/<subtype>;base64,<data>'")
+            try:
+                if len(found.group(1)) % 4:
+                    raise ValueError
+                base64.b64decode(found.group(1), validate=True)
+            except (binascii.Error, ValueError):
+                raise ValueError("a data: icon's data is not valid Base64") from None
         elif _HTTPS_URL.fullmatch(src) is None:
             raise ValueError(
-                f"an icon's src must be an https:// URL or a data: URI, got {src[:60]!r}"
+                "an icon's src must be an https:// URL in ASCII (percent-encode anything "
+                f"else) or a data: URI, got {src[:60]!r}"
             )
+        elif len(src) > MAX_URL_LENGTH:
+            raise ValueError(f"an icon's URL may have at most {MAX_URL_LENGTH} characters")
         mime_type = self.mime_type
         if mime_type is not None and (
             not isinstance(mime_type, str) or _MIME_TYPE.fullmatch(mime_type) is None
         ):
             raise ValueError(f"an icon's mime_type must look like 'image/png', got {mime_type!r}")
         sizes = self.sizes
-        if isinstance(sizes, str):
+        if sizes is None:
+            sizes = ()
+        elif isinstance(sizes, str):
             sizes = (sizes,)
-        sizes = tuple(sizes)
+        try:
+            sizes = tuple(sizes)
+        except TypeError:
+            raise ValueError("an icon's sizes must be a list of strings") from None
         for size in sizes:
             if not isinstance(size, str) or (size != "any" and _SIZE.fullmatch(size) is None):
                 raise ValueError(f"an icon size must be like '48x48' or 'any', got {size!r}")
@@ -128,11 +155,14 @@ class Icon:
             OSError: The file cannot be read.
         """
         name = os.fspath(path)
-        kind = mime_type or _FILE_TYPES.get(os.path.splitext(name)[1].lower())
+        kind = mime_type.lower() if isinstance(mime_type, str) else None
+        kind = kind or _FILE_TYPES.get(os.path.splitext(name)[1].lower())
         if kind is None:
             raise ValueError(
                 f"cannot tell the image type of {name!r} from its extension; pass mime_type="
             )
+        if not kind.startswith("image/"):
+            raise ValueError(f"an icon is an image; mime_type {kind!r} is not one")
         with open(name, "rb") as file:
             data = file.read(MAX_ICON_BYTES + 1)
         if not data:
@@ -187,6 +217,11 @@ def normalize_icons(
         raise error(f"{what}: {exc}") from exc
     if len(result) > MAX_ICONS:
         raise error(f"{what}: at most {MAX_ICONS} icons, got {len(result)}")
+    if sum(len(icon.src) for icon in result) > MAX_SRC_LENGTH:
+        raise error(
+            f"{what}: its icons add up to more than {MAX_ICON_BYTES // 1024} KiB; "
+            "serve the larger ones by URL"
+        )
     return tuple(result)
 
 

@@ -676,3 +676,89 @@ def test_legacy_sse_carries_progress_on_the_session_stream(
         "response",
     ]
     assert tail[1]["params"] == {"progressToken": "l-1", "progress": 2, "total": 2}
+
+
+# ------------------------------------------ a stream cut short by the server
+
+
+def events_of(response: httpx.Response) -> list[dict[str, Any]]:
+    """Every ``message`` event of a text/event-stream response read to its end."""
+    assert response.headers["content-type"].startswith("text/event-stream"), response.text
+    return [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def waiting_server() -> tuple[MCPServer, asyncio.Event]:
+    server = MCPServer(port=0, rate_limit_per_minute=None)
+    started = asyncio.Event()
+
+    @server.tool
+    async def wait() -> str:
+        """Report once, then wait to be stopped."""
+        report_progress(1, message="waiting")
+        started.set()
+        await asyncio.sleep(30)
+        return "never"
+
+    return server, started
+
+
+async def test_shutdown_ends_a_progress_stream_with_its_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from easy_mcp import StreamableHTTPTransport
+    from easy_mcp.exceptions import SERVER_BUSY
+    from easy_mcp.transport import streamable_http
+
+    monkeypatch.setattr(streamable_http, "_SHUTDOWN_GRACE_SECONDS", 0.1)
+    server, started = waiting_server()
+    transport = StreamableHTTPTransport(server)
+    app = transport.build_app()  # its lifespan never runs here
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        message = stateless_call("wait", token="s-1")
+        call = asyncio.create_task(client.post("/mcp", json=message, headers=headers_for(message)))
+        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.sleep(0.05)  # the report is on the stream by now
+        await asyncio.wait_for(transport.close_streams(), 5)
+        events = events_of(await asyncio.wait_for(call, 5))
+    assert events[0]["params"] == {"progressToken": "s-1", "progress": 1, "message": "waiting"}
+    final = events[-1]
+    assert final["id"] == 1 and final["error"]["code"] == SERVER_BUSY
+    assert final["error"]["data"] == {"reason": "shutdown"}
+    assert len(events) == 2
+    assert transport._dispatches == set()
+
+
+async def test_ending_the_session_ends_its_progress_stream_without_an_answer() -> None:
+    from easy_mcp import StreamableHTTPTransport
+
+    server, started = waiting_server()
+    transport = StreamableHTTPTransport(server)
+    app = transport.build_app()  # its lifespan never runs here
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        init = await client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
+        session = {**ACCEPT, "MCP-Session-Id": init.headers["mcp-session-id"]}
+        message = call("wait", token="d-1", msg_id=3)
+        running = asyncio.create_task(client.post("/mcp", json=message, headers=session))
+        await asyncio.wait_for(started.wait(), 5)
+        await asyncio.sleep(0.05)
+        deleted = await client.delete("/mcp", headers=session)
+        assert deleted.status_code == 204
+        events = events_of(await asyncio.wait_for(running, 5))
+        # As for any cancelled request: its progress so far, and no response.
+        assert [event.get("method") for event in events] == [PROGRESS_METHOD]
+        gone = await client.post("/mcp", json=rpc("ping", msg_id=4), headers=session)
+        assert gone.status_code == 404
+    for _ in range(100):
+        if not transport._sessions and not transport._stream_ends:
+            break
+        await asyncio.sleep(0.01)
+    assert transport._sessions == {}
+    assert transport._dispatches == set() and transport._stream_ends == set()

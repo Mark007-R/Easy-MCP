@@ -158,6 +158,14 @@ def test_a_private_network_preflight_is_granted_to_an_allowed_origin(
         )
         assert refused.status_code == 403
         assert "access-control-allow-private-network" not in refused.headers
+    # "*" names nobody: any page may call, none is let into a private network.
+    base = live_server(make_server(allowed_origins=["*"]))
+    with httpx.Client(base_url=base, timeout=10) as client:
+        anyone = preflight(
+            client, "https://evil.example", **{"Access-Control-Request-Private-Network": "true"}
+        )
+        assert anyone.status_code == 204
+        assert "access-control-allow-private-network" not in anyone.headers
 
 
 def test_options_that_is_no_preflight_reaches_the_app(live_server: LiveServer) -> None:
@@ -238,7 +246,11 @@ def test_requests_without_an_origin_are_untouched(live_server: LiveServer) -> No
         init = client.post("/mcp", json=rpc("initialize", INIT), headers=ACCEPT)
         assert init.status_code == 200
         assert not [name for name in init.headers if name.startswith("access-control-")]
-        assert "vary" not in init.headers
+        # Still marked: a cache must not hand this answer to a browser page.
+        assert init.headers["vary"] == "Origin"
+    base = live_server(make_server(allowed_origins=["*"]))
+    with httpx.Client(base_url=base, timeout=10) as client:
+        assert "vary" not in client.get("/healthz").headers
 
 
 def test_a_refused_origin_gets_no_cors_headers(live_server: LiveServer) -> None:
@@ -249,6 +261,7 @@ def test_a_refused_origin_gets_no_cors_headers(live_server: LiveServer) -> None:
         )
         assert refused.status_code == 403
         assert not [name for name in refused.headers if name.startswith("access-control-")]
+        assert refused.headers["vary"] == "Origin"
 
 
 @pytest.mark.parametrize("origin", ["HTTPS://APP.EXAMPLE.COM", "https://app.example.com/"])
