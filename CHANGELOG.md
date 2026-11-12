@@ -24,6 +24,18 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   alike, they travel on the response of the request itself: see Changed.
 - `ClientContext.notify`, for custom transports that answer each request on
   a stream of its own: the server sends a request's progress there.
+- CORS for browser-based clients. `allowed_origins` is now the CORS policy
+  as well as the `Origin` allowlist: a page on a listed origin (a loopback
+  origin by default) gets its preflight answered (`204`, before credentials
+  and the rate limit) and `Access-Control-Allow-Origin` on every answer of
+  every HTTP endpoint, with `MCP-Session-Id`, `WWW-Authenticate` and
+  `Retry-After` exposed. The preflight allows `GET`, `POST` and `DELETE`
+  with the headers MCP clients send, for 10 minutes, and grants Private
+  Network Access when asked. `Access-Control-Allow-Credentials` is never
+  sent. With `allowed_origins=["*"]` the answer is `*`; otherwise the origin
+  is named and `Vary: Origin` is added. Wrapping the app in Starlette's
+  `CORSMiddleware`, as the 0.3.2 README suggested, is no longer needed (and
+  still works).
 
 ### Changed
 
@@ -39,6 +51,14 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   `503`, say) arrives as the JSON-RPC error in the last event.
 - A stream's queue keeps only the newest waiting `notifications/progress` of
   each token, so a client that reads slowly cannot grow a backlog of them.
+- Answers to a request that carries an allowed `Origin` header now carry
+  CORS headers (see Added), so a page on a loopback origin, allowed by
+  default, can call a server on the same machine and read its answers.
+  Before, its browser sent the request and withheld the answer, or refused
+  to send it for want of a preflight answer. Set `allowed_origins` to the
+  origins you trust (an empty list allows none) to narrow this. Requests
+  without an `Origin` header are unchanged, and an origin not allowed still
+  gets `403`.
 
 ## [0.3.2] - 2026-10-19
 

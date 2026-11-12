@@ -480,8 +480,11 @@ class MCPServer:
             with ``-32007`` (HTTP ``503``).
         allowed_origins: Browser origins allowed to call the HTTP endpoints,
             e.g. ``["https://app.example.com"]``; ``"*"`` allows any.  The
-            default (``None``) allows loopback origins only.  Requests that
-            carry no ``Origin`` header (non-browser clients) are unaffected.
+            default (``None``) allows loopback origins only, and an empty
+            list none.  Requests that carry no ``Origin`` header
+            (non-browser clients) are unaffected.  It is the CORS policy
+            too: a page on an allowed origin has its preflight answered and
+            may read the answers; cookies are never allowed.
         instructions: Optional usage hints sent to clients at initialize and
             in server/discover.
         store: Where state that outlives one request is kept: handshake-era

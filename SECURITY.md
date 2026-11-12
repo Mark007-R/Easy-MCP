@@ -53,7 +53,7 @@ Consequences:
 | Server-side request forgery through OAuth | Only configured URLs and URLs from a configured issuer's validated metadata are fetched, `https` only (loopback `http` for development), redirects refused, bodies capped (1 MiB, 64 KiB for introspection), 5 s per fetch however slowly the answer arrives |
 | Token leakage in logs | Tokens are never logged, kept or used as cache keys (only SHA-256 fingerprints); the introspection client secret stays out of every `repr`, log line and error |
 | Header/body disagreement (stateless HTTP) | A proxy may route or rate-limit on the mirrored `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers while the server executes the body, so the server rejects any request whose headers are missing, repeated or disagree with its body (`400`, `-32020`); Base64-encoded names are decoded before comparing. A message without an `id` never runs a method (no header checks apply to it), and the client notifications this revision leaves undefined over HTTP, `notifications/cancelled` included, are ignored, so one caller cannot cancel another's call; a `subscriptions/listen` stream ends only when its own connection closes |
-| DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs; Streamable HTTP also requires `Content-Type: application/json` |
+| DNS rebinding / cross-site requests | Browser `Origin` headers on the HTTP transports must match `allowed_origins` (loopback origins by default) or get 403 before any route runs, with no CORS headers; only listed origins get CORS headers, never with credentials mode; Streamable HTTP also requires `Content-Type: application/json` |
 | Malformed / hostile input | Strict schema validation: unknown fields rejected, types enforced (bool ≠ int), required params enforced, before any tool code runs |
 | Oversized payloads | `max_request_bytes` enforced on the Content-Length header *and* while streaming the body (a lying header does not help) |
 | Request flooding | Per-client sliding-window rate limiting on every method, including discovery and opening an SSE session; idle clients are dropped from the limiter so its memory stays bounded; concurrent session cap (`max_sessions`) |
@@ -425,11 +425,15 @@ the client is untrusted, the credential in the environment is trusted.
   fetches its own keys and counts failures on its own; behind a proxy, all
   clients share the proxy's address for that throttle, as for anonymous rate
   limiting.
-- **No CORS headers yet.** A browser-based client on another origin cannot
-  read `WWW-Authenticate` or the metadata cross-origin; clients behind a proxy
-  are not affected. The README's "Not in 0.3.2" shows a workaround with
-  Starlette's `CORSMiddleware`; list exactly the origins you trust, in it and
-  in `allowed_origins`.
+- **`allowed_origins` is the CORS policy too.** A page on a listed origin may
+  call the server and read its answers, with whatever credential the page
+  itself holds; by default that is any page served from this machine
+  (loopback origins, any port). Cookies are never allowed, so a page cannot
+  borrow a signed-in user's credential, and `"*"` therefore grants a page no
+  more than any program on the network has. List exactly the origins you
+  trust. An origin not listed gets `403` with no CORS headers, preflights
+  included; a preflight from a listed origin is answered before credentials
+  and the rate limit, with a fixed answer.
 - **Middleware is not covered by tool timeouts.** A tool's `timeout` bounds the
   tool function only; a middleware must bound its own awaits.
 - **Some messages never reach middleware.** Requests the transport rejects,

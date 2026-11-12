@@ -453,6 +453,20 @@ origins are allowed by default; list any web app that should connect:
 server = MCPServer(allowed_origins=["https://app.example.com"])  # "*" allows any
 ```
 
+The same list is the server's CORS policy, so a browser-based client needs
+nothing else. A page on a listed origin gets its preflight (`OPTIONS`)
+answered and may read every answer, the `MCP-Session-Id` and
+`WWW-Authenticate` headers included; a page on any other origin gets `403`
+and no CORS headers, so its browser shows it nothing. The preflight allows
+`GET`, `POST` and `DELETE` with the headers MCP clients send
+(`Authorization`, `X-API-Key`, `Content-Type`, `Accept`,
+`MCP-Protocol-Version`, `MCP-Session-Id`, `Mcp-Method`, `Mcp-Name`,
+`Last-Event-ID` and the trace-context headers), and browsers may cache it for
+10 minutes. Cookies are never allowed (`Access-Control-Allow-Credentials` is
+not sent): credentials travel in headers the page sets itself. Requests with
+no `Origin` header, which is every client that is not a browser, are served
+exactly as before.
+
 Over stdio the MCP host launches your script as a child process and talks
 JSON-RPC over its pipes. Logs go to stderr, and `sys.stdout` is redirected to
 stderr while serving, so a stray `print()` inside a tool cannot corrupt the
@@ -837,9 +851,9 @@ Good to know:
 - Mounted inside another app, `build_app()` runs no lifespan of its own: run
   `async with server.lifespan(): ...` from the host app's, and serve
   `server.oauth.metadata_path` at the root of the host.
-- Browser-based clients on other origins need CORS headers, which easy_mcp
-  does not send yet; clients behind a proxy (such as the MCP Inspector's) are
-  not affected. [Not in 0.3.2](#not-in-032) has a workaround.
+- A browser-based client on another origin must be listed in
+  `allowed_origins`; it can then read the `401` and `403` challenges and the
+  metadata cross-origin.
 
 ### Rate limiting, payload caps, timeouts, session limits
 
@@ -1648,7 +1662,8 @@ WebSocket, a message queue) subclasses `Transport` and keeps this contract:
 - Load keys from the environment (`APIKeyAuth.from_env()`), never hardcode them.
 - Keep `debug=False`; it is the only thing standing between clients and tracebacks.
 - Browser-based clients on other origins must be listed in `allowed_origins`,
-  and need CORS headers (see [Not in 0.3.2](#not-in-032)).
+  which is also the CORS policy: list only origins you trust, and keep `"*"`
+  for servers with nothing to protect.
 - With OAuth, set `resource` to the exact URL clients use, and behind a proxy
   forward `/.well-known/oauth-protected-resource/...` to the server too.
 - Notification streams (`GET /mcp`, `subscriptions/listen`, `/sse`) stay
@@ -1740,34 +1755,6 @@ The MCP specification has more than easy_mcp offers yet. These are not in
   are per worker; see [Running several workers](#running-several-workers).
 - **Resources in the connectors.** The five ready-made connectors offer
   tools only.
-- **CORS for browser clients.** easy_mcp sends no CORS headers, so a
-  browser-based client on another origin cannot read its answers,
-  `WWW-Authenticate` or `MCP-Session-Id` (clients that are not browsers, and
-  those behind a proxy such as the MCP Inspector's, are not affected).
-  Until it does, wrap the app in Starlette's `CORSMiddleware`, list the same
-  origins in `allowed_origins`, and serve it with uvicorn instead of
-  `server.run()`; `build_app()`'s lifespan still runs through the wrapper:
-
-  ```python
-  # app.py: uvicorn app:app
-  from starlette.middleware.cors import CORSMiddleware
-
-  from easy_mcp import MCPServer, OAuthResourceServer
-
-  ORIGINS = ["https://app.example.com"]
-  server = MCPServer(allowed_origins=ORIGINS, oauth=OAuthResourceServer.from_env())
-  app = CORSMiddleware(
-      server.build_app(),
-      allow_origins=ORIGINS,
-      allow_methods=["GET", "POST", "DELETE"],
-      allow_headers=["Authorization", "Content-Type", "Accept", "MCP-Protocol-Version",
-                     "MCP-Session-Id", "Mcp-Method", "Mcp-Name"],
-      expose_headers=["MCP-Session-Id", "WWW-Authenticate", "Retry-After"],
-  )
-  ```
-
-  The middleware answers preflight requests itself, and easy_mcp's `Origin`
-  check still refuses every origin not listed.
 
 ## Development
 

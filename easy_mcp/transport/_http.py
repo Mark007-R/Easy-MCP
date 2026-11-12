@@ -4,7 +4,8 @@
   allowlist with 403.  A DNS-rebinding page can make a victim's browser talk
   to a server on loopback, but the browser still stamps the page's real
   origin on every POST and DELETE, so the request stops here before any
-  route runs.
+  route runs.  For the origins on the allowlist it answers CORS preflights
+  and marks every answer readable by their pages.
 * :class:`BaseHTTPTransport` resolves credentials from headers (API keys,
   and OAuth access tokens with their ``WWW-Authenticate`` challenges), serves
   the health endpoint, the OAuth Protected Resource Metadata and (with
@@ -23,11 +24,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
+from starlette.datastructures import MutableHeaders
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..exceptions import (
     AUTHENTICATION_REQUIRED,
@@ -254,12 +256,35 @@ def _host_name(value: str) -> str | None:
     return name.lower()
 
 
+# What a preflight is told a browser page may send, and what a page may read.
+# No credentials mode: MCP credentials travel in headers a page sets itself,
+# never in cookies, so ``Access-Control-Allow-Credentials`` is not sent.
+CORS_METHODS = "GET, POST, DELETE"
+CORS_REQUEST_HEADERS = (
+    "Accept, Authorization, Content-Type, Last-Event-ID, MCP-Protocol-Version, "
+    "MCP-Session-Id, Mcp-Method, Mcp-Name, X-API-Key, traceparent, tracestate, baggage"
+)
+CORS_EXPOSED_HEADERS = "MCP-Session-Id, WWW-Authenticate, Retry-After"
+# How long a browser may reuse a preflight's answer.
+CORS_MAX_AGE_SECONDS = 600
+
+
 class OriginGuard:
-    """ASGI middleware: answer 403 when the ``Origin`` header is not allowed.
+    """ASGI middleware: the ``Origin`` allowlist, and CORS for the origins on it.
 
     Requests without an ``Origin`` header come from non-browser clients and
-    pass through; browsers always send one on POST and DELETE.  *on_reject*
-    is told ``"origin"`` for each request refused (the metrics count it).
+    pass through untouched; browsers always send one on POST and DELETE, and
+    on every cross-origin request.  A request whose origin is not allowed is
+    answered ``403``, with no CORS headers; *on_reject* is told ``"origin"``
+    for each (the metrics count it).
+
+    A request from an allowed origin is served, and its answer says so
+    (``Access-Control-Allow-Origin``), so that a page on that origin may
+    read it, the ``MCP-Session-Id`` and ``WWW-Authenticate`` headers
+    included.  The origin's preflight (``OPTIONS`` with
+    ``Access-Control-Request-Method``) is answered here, ``204``, before
+    any route, credential check or rate limit: it carries no credential,
+    and what it allows is fixed.
     """
 
     def __init__(
@@ -287,7 +312,44 @@ class OriginGuard:
                 response = rpc_error(403, code, "Forbidden: origin not allowed")
                 await response(scope, receive, send)
                 return
+            if origin is not None:
+                await self._serve_cross_origin(scope, receive, send, origin)
+                return
         await self.app(scope, receive, send)
+
+    async def _serve_cross_origin(
+        self, scope: Scope, receive: Receive, send: Send, origin: str
+    ) -> None:
+        """Serve a browser's request from an allowed *origin*, readable by its page."""
+        # "*" is itself the answer when every origin is allowed; otherwise the
+        # origin is named, and caches are told the answer varies by it.
+        any_origin = self.allowed_origins is not None and "*" in self.allowed_origins
+        allow = "*" if any_origin else origin
+        if scope["method"] == "OPTIONS" and _header(scope, b"access-control-request-method"):
+            headers = {
+                "Access-Control-Allow-Origin": allow,
+                "Access-Control-Allow-Methods": CORS_METHODS,
+                "Access-Control-Allow-Headers": CORS_REQUEST_HEADERS,
+                "Access-Control-Max-Age": str(CORS_MAX_AGE_SECONDS),
+                "Vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+            }
+            if _header(scope, b"access-control-request-private-network") == "true":
+                # A public page reaching a server on a private network: the
+                # operator listed its origin, which is the consent asked for.
+                headers["Access-Control-Allow-Private-Network"] = "true"
+            await Response(status_code=204, headers=headers)(scope, receive, send)
+            return
+
+        async def send_readable(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Access-Control-Allow-Origin"] = allow
+                headers["Access-Control-Expose-Headers"] = CORS_EXPOSED_HEADERS
+                if not any_origin:
+                    headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_readable)
 
 
 # How long the HTTP transports wait at shutdown for sync tool threads and
