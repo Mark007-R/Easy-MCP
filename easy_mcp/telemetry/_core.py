@@ -128,6 +128,7 @@ TOOL_STATUSES: Final = frozenset(
         "timeout",
         "cancelled",
         "busy",
+        "input_required",
         "unauthorized",
         "session_limit",
         "invalid_arguments",

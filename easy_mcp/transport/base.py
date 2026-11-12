@@ -74,6 +74,11 @@ class ClientContext:
     (responses and notifications share it, as on stdio), and otherwise
     drops them.
 
+    ``client_capabilities`` is what the client declared in ``initialize``
+    on this connection or session (``None`` before; stateless requests
+    carry their own).  The server sets it; a tool may ask the user a
+    question only of a client that declared ``elicitation``.
+
     New fields are only ever appended, with defaults, so positional
     construction keeps working.
     """
@@ -88,6 +93,7 @@ class ClientContext:
     push: Callable[[dict[str, Any]], None] | None = None
     multiplexed: bool = False
     notify: Callable[[dict[str, Any]], None] | None = None
+    client_capabilities: dict[str, Any] | None = None
 
 
 class Transport(abc.ABC):

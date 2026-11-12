@@ -98,6 +98,7 @@ ToolStatus = Literal[
     "busy",
     "refused",
     "internal_error",
+    "input_required",
 ]
 
 # Headers that carry credentials or the session capability.  Middleware never
@@ -541,8 +542,13 @@ class ToolOutcome:
       its own output schema.
     * ``timeout``: ``-32005``; the tool ran past its timeout.
     * ``busy``: ``-32008``; every sync worker was taken, and the tool never started.
-    * ``refused``: a middleware's ``ProtocolError``.
+    * ``refused``: a middleware's ``ProtocolError``; also a tool that had to
+      ask the user a question of a stateless client that cannot be asked
+      (``-32021``) or that answered with something else (``-32602``).
     * ``internal_error``: ``-32603``; a middleware failed or broke its contract.
+    * ``input_required``: a stateless call whose tool asked the user a
+      question: the client gets an ``InputRequiredResult`` and retries with
+      the answer.  Not an error, and not the call's result yet.
     """
 
     __slots__ = (

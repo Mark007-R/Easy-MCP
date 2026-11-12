@@ -17,6 +17,7 @@ import functools
 import hashlib
 import json
 import logging
+import secrets
 import threading
 import time
 import traceback
@@ -42,6 +43,19 @@ from .cancellation import CANCELLED, TIMEOUT, CancelToken, _run_callbacks, cance
 from .completion import CompletionSource, collect, empty, filter_static, shape
 from .content import NotFound, to_prompt_messages, to_resource_contents
 from .decorators import ToolDefinition, ToolRegistry, build_tool
+from .elicitation import (
+    ELICIT_METHOD,
+    ELICITATION_TIMEOUT_SECONDS,
+    MAX_QUESTIONS,
+    ElicitationUnavailableError,
+    StateSigner,
+    _Asking,
+    _asking_scope,
+    _InputRequired,
+    _InvalidAnswer,
+    call_digest,
+    supports_form,
+)
 from .exceptions import (
     AUTHENTICATION_REQUIRED,
     FORBIDDEN,
@@ -49,6 +63,7 @@ from .exceptions import (
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     RESOURCE_NOT_FOUND_LEGACY,
     TOOL_TIMEOUT,
     AuthenticationError,
@@ -97,6 +112,7 @@ from .protocol import (
     LATEST_PROTOCOL_VERSION,
     LIST_KINDS,
     LISTEN_METHOD,
+    META_CLIENT_CAPABILITIES,
     META_PROTOCOL_VERSION,
     META_SERVER_INFO,
     META_SUBSCRIPTION_ID,
@@ -515,6 +531,12 @@ class MCPServer:
             OpenTelemetry SDK (``OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=easy_mcp``
             turns it off).
         json_logs: Emit structured JSON logs (recommended) or plain text.
+        state_secret: The key that signs the ``requestState`` of stateless
+            calls whose tool asks the user a question
+            (:func:`~easy_mcp.elicit`), at least 16 bytes.  By default the
+            ``EASY_MCP_STATE_SECRET`` environment variable, and without it a
+            random key that only this process can verify: give every worker
+            the same secret when several serve the same clients.
     """
 
     def __init__(
@@ -538,6 +560,7 @@ class MCPServer:
         store: Store | None = None,
         metrics: bool = False,
         json_logs: bool = True,
+        state_secret: str | bytes | None = None,
     ) -> None:
         if default_timeout is not None and default_timeout <= 0:
             raise ValueError("default_timeout must be positive or None")
@@ -584,6 +607,11 @@ class MCPServer:
         )
         self.instructions = instructions
         self.icons = normalize_icons(icons, "icons", ValueError)
+        self._state = StateSigner(state_secret)
+        self._state_warned = False
+        # The questions sessions' clients have yet to answer, by the id of the
+        # request that asked: the future waiting, and the session asked.
+        self._asked: dict[str, tuple[asyncio.Future[dict[str, Any]], str]] = {}
         self._registry = ToolRegistry()
         self._resources = ResourceRegistry()
         self._prompts = PromptRegistry()
@@ -1437,6 +1465,12 @@ class MCPServer:
             return _error_response(
                 msg_id, INVALID_REQUEST, "Invalid request: jsonrpc must be '2.0'"
             )
+        if "method" not in message and ("result" in message or "error" in message):
+            # A response to a request of the server's own: the answer to a
+            # question a tool asked, or nothing anybody waits for.  Never
+            # answered, and not charged: it starts no work.
+            self._resolve_response(message, context)
+            return None
         method = message.get("method")
         if not isinstance(method, str):
             if is_notification:
@@ -1767,6 +1801,8 @@ class MCPServer:
             # version; later requests on this connection or session are
             # spoken in it.
             context.protocol_version = request.protocol_version
+            declared = request._params.get("capabilities")
+            context.client_capabilities = dict(declared) if isinstance(declared, dict) else {}
             if context.push is not None and context.store_handle is None:
                 # The context holds the session's whole state, its channel
                 # included: list changes are announced on it from now on,
@@ -2094,7 +2130,8 @@ class MCPServer:
         """Stamp a stateless result with its ``resultType`` and our identity."""
         meta = dict(result.get("_meta") or {})
         meta[META_SERVER_INFO] = self._server_info()
-        return {**result, "resultType": "complete", "_meta": meta}
+        # "complete" unless the result says otherwise (an InputRequiredResult).
+        return {"resultType": "complete", **result, "_meta": meta}
 
     def _handle_tools_list(
         self, context: ClientContext, params: dict[str, Any] | None = None
@@ -3093,6 +3130,10 @@ class MCPServer:
             # itself reaches through current_tool_call().
             plain = validate_arguments(arguments, definition.arguments_schema)
             built = build_param_models(definition.param_models, _copy(plain))
+            # Whether the tool may ask the user a question, and the answers
+            # a stateless retry brings: a requestState that fails its checks
+            # is refused here, before anything runs.
+            asking = self._asking_for(request, context, name, plain)
         except ProtocolError as exc:
             request._denial = _denial(exc)
             if reserved and handle is not None:
@@ -3123,18 +3164,21 @@ class MCPServer:
         call = ToolCall._create(request, definition, plain, token, timeout)
         telemetry = self._telemetry
         telemetry.tool_started(name)
+        outcome: ToolOutcome | None = None
         try:
             # Set here rather than around the tool alone, so tool middleware
             # sees the token, the call and the caller too, and context
             # variables it sets reach the tool (a sync tool's thread gets a
             # copy of this context).
             with cancel_scope(token), _tool_call_scope(call), _identity_scope(context.identity):
-                run = functools.partial(self._run_tool, call, built, context)
+                run = functools.partial(self._run_tool, call, built, context, asking)
                 layers = request._tool_layers
                 if not layers:
-                    return await run()
-                policy = ToolPolicy(self._logger, self.debug)
-                return await run_chain(layers, call, run, policy, request)
+                    outcome = await run()
+                else:
+                    policy = ToolPolicy(self._logger, self.debug)
+                    outcome = await run_chain(layers, call, run, policy, request)
+                return outcome
         except asyncio.CancelledError:
             # Wherever the call was, in a middleware or in the tool.  Only the
             # first trigger counts, so a tool stopped already keeps its reason.
@@ -3146,9 +3190,12 @@ class MCPServer:
             # Work a middleware left behind must not start the tool from now
             # on, when its count may be refunded.
             call._closed = True
-            if not call._started:
+            unfinished = outcome is not None and outcome.status == "input_required"
+            if not call._started or unfinished:
                 # Refused, busy, a middleware failure or an early cancel: it
                 # never ran, so it does not count against the session cap.
+                # Nor does a stateless call that stopped to ask the user a
+                # question: its retry is the call that counts.
                 if handle is None:
                     context.tool_calls[name] -= 1
                 elif reserved:
@@ -3168,12 +3215,17 @@ class MCPServer:
             )
 
     async def _run_tool(
-        self, call: ToolCall, arguments: dict[str, Any], context: ClientContext
+        self,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        context: ClientContext,
+        asking: _Asking | None = None,
     ) -> ToolOutcome:
         """Run the tool itself: the innermost step of the tool middleware chain.
 
         Every answer is an outcome, timeouts and a busy server included; only
-        a cancellation is raised.
+        a cancellation is raised.  *asking* holds the answers to the
+        questions the tool asks the user (:func:`~easy_mcp.elicit`).
         """
         if call._closed:
             # The call is over and its count may be refunded: this is work a
@@ -3191,16 +3243,11 @@ class MCPServer:
         def _started() -> None:
             call._started = call.request._tool_started = True
 
+        early: ToolOutcome | None = None
+        result: Any = None
         try:
-            result = await self._run_user_code(
-                definition.fn,
-                arguments,
-                is_async=definition.is_async,
-                timeout=timeout,
-                token=call.cancel_token,
-                target=_Target("tool", name, "tool"),
-                context=context,
-                started=_started,
+            early, result = await self._run_asking(
+                call, arguments, context, asking, _started, _duration_ms
             )
         except ServerBusyError as exc:
             audit("tool_call", tool=name, client_id=context.client_id, status="busy")
@@ -3252,6 +3299,8 @@ class MCPServer:
                 exc.__traceback__ = None  # see _tool_failed
         except Exception as exc:
             return self._tool_failed(name, context, exc, _duration_ms())
+        if early is not None:
+            return early
 
         try:
             text, structured = _render_result(definition, result)
@@ -3304,6 +3353,304 @@ class MCPServer:
         return ToolOutcome._create(
             "ok", message=text, started=True, payload=payload, duration_ms=duration_ms
         )
+
+    # ------------------------------------------------------------ questions
+
+    def _asking_for(
+        self, request: RequestInfo, context: ClientContext, name: str, arguments: dict[str, Any]
+    ) -> _Asking:
+        """What the tool *name* may ask the user in this call, and what was answered already.
+
+        Raises:
+            ProtocolError: ``-32602`` for a stateless retry whose
+                ``requestState`` this server did not sign for this caller
+                and call, or whose ``inputResponses`` is no object.
+        """
+        no_capability = "the client did not declare the elicitation capability"
+        if request.stateless:
+            params = request._params
+            declared = params["_meta"].get(META_CLIENT_CAPABILITIES)
+            answers: dict[str, Any] = {}
+            state = params.get("requestState")
+            if state is not None:
+                principal = context.identity.fingerprint if context.identity else None
+                digest = call_digest(name, arguments)
+                answers.update(self._state.verify(state, principal=principal, digest=digest))
+            responses = params.get("inputResponses")
+            if responses is not None:
+                if not isinstance(responses, dict):
+                    raise ProtocolError("'inputResponses' must be an object", code=INVALID_PARAMS)
+                answers.update(responses)
+            unavailable = None if supports_form(declared) else no_capability
+            return _Asking(stateless=True, unavailable=unavailable, answers=answers)
+        unavailable = None
+        if not supports_form(context.client_capabilities):
+            unavailable = no_capability
+        elif context.notify is None and not (context.multiplexed and context.push is not None):
+            unavailable = "this connection cannot carry a question to the client"
+        elif context.store_handle is not None and self.store.shared:
+            # The answer may reach another worker than the one waiting for it.
+            unavailable = (
+                "a session served by several workers cannot be asked; stateless clients can"
+            )
+        return _Asking(stateless=False, unavailable=unavailable)
+
+    async def _run_asking(
+        self,
+        call: ToolCall,
+        arguments: dict[str, Any],
+        context: ClientContext,
+        asking: _Asking | None,
+        started: Callable[[], None],
+        duration_ms: Callable[[], float],
+    ) -> tuple[ToolOutcome | None, Any]:
+        """Run the tool, again for every question it asks a session's client.
+
+        Returns ``(None, value)`` with what the tool returned, or an outcome
+        that ends the call early: a stateless call's ``InputRequiredResult``,
+        or why the question could not be asked or its answer not taken.
+
+        Raises what :meth:`_run_user_code` raises.
+        """
+        definition = call.tool
+        name = definition.name
+        rounds = 0
+        while True:
+            if asking is not None:
+                asking.begin()
+            try:
+                with _asking_scope(asking):
+                    value = await self._run_user_code(
+                        definition.fn,
+                        arguments,
+                        is_async=definition.is_async,
+                        timeout=call.timeout,
+                        token=call.cancel_token,
+                        target=_Target("tool", name, "tool"),
+                        context=context,
+                        started=started,
+                    )
+                return None, value
+            except _InputRequired as need:
+                assert asking is not None
+                if asking.stateless:
+                    return self._input_required(call, need, asking, context, duration_ms()), None
+                rounds += 1
+                if rounds > MAX_QUESTIONS:
+                    return self._question_failed(
+                        call,
+                        context,
+                        f"Tool '{name}' asked more than {MAX_QUESTIONS} questions",
+                        duration_ms(),
+                    ), None
+                try:
+                    asking.answers[need.key] = await self._ask_client(context, need, name)
+                except ElicitationUnavailableError as exc:
+                    return self._cannot_ask(call, asking, context, str(exc), duration_ms()), None
+                # The next run gets arguments of its own, as the first did.
+                arguments = build_param_models(definition.param_models, _copy(call._plain))
+            except _InvalidAnswer as bad:
+                assert asking is not None
+                if asking.stateless:
+                    audit(
+                        "tool_call",
+                        tool=name,
+                        client_id=context.client_id,
+                        duration_ms=duration_ms(),
+                        status="refused",
+                    )
+                    return ToolOutcome._create(
+                        "refused",
+                        message="Invalid inputResponses: " + "; ".join(bad.errors),
+                        started=True,
+                        error_code=INVALID_PARAMS,
+                        data={"errors": bad.errors},
+                        duration_ms=duration_ms(),
+                    ), None
+                return self._question_failed(
+                    call,
+                    context,
+                    "The client's answer did not fit the question: " + "; ".join(bad.errors),
+                    duration_ms(),
+                ), None
+            except ElicitationUnavailableError as exc:
+                if asking is None:
+                    raise
+                return self._cannot_ask(call, asking, context, str(exc), duration_ms()), None
+
+    def _input_required(
+        self,
+        call: ToolCall,
+        need: _InputRequired,
+        asking: _Asking,
+        context: ClientContext,
+        duration_ms: float,
+    ) -> ToolOutcome:
+        """The ``InputRequiredResult`` of a stateless call whose tool asked a question."""
+        name = call.tool.name
+        payload: dict[str, Any] = {
+            "resultType": "input_required",
+            "inputRequests": {need.key: {"method": ELICIT_METHOD, "params": need.params}},
+        }
+        # The answers this run read, so that the retry needs to bring only
+        # the new one.  Nothing else a client sent is carried on.
+        carried = {key: asking.answers[key] for key in sorted(asking.used)}
+        if carried:
+            principal = context.identity.fingerprint if context.identity else None
+            payload["requestState"] = self._state.sign(
+                principal=principal, digest=call_digest(name, call._plain), answers=carried
+            )
+            if self.store.shared and not self._state.shared and not self._state_warned:
+                self._state_warned = True
+                self._logger.warning(
+                    "requestState is signed with a key only this process has; set "
+                    "state_secret (or EASY_MCP_STATE_SECRET) so every worker can verify it"
+                )
+        audit(
+            "tool_call",
+            tool=name,
+            client_id=context.client_id,
+            duration_ms=duration_ms,
+            status="input_required",
+        )
+        audit("elicitation_requested", tool=name, client_id=context.client_id, question=need.key)
+        return ToolOutcome._create(
+            "input_required",
+            message="The tool asked the user a question",
+            started=True,
+            payload=payload,
+            duration_ms=duration_ms,
+        )
+
+    def _cannot_ask(
+        self,
+        call: ToolCall,
+        asking: _Asking,
+        context: ClientContext,
+        reason: str,
+        duration_ms: float,
+    ) -> ToolOutcome:
+        """The outcome of a tool that had to ask a question of a client that cannot be asked."""
+        name = call.tool.name
+        message = f"Tool '{name}' needs to ask the user a question: {reason}"
+        if not asking.stateless:
+            return self._question_failed(call, context, message, duration_ms)
+        audit(
+            "tool_call",
+            tool=name,
+            client_id=context.client_id,
+            duration_ms=duration_ms,
+            status="refused",
+        )
+        return ToolOutcome._create(
+            "refused",
+            message=message,
+            started=True,
+            error_code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+            data={"requiredCapabilities": {"elicitation": {"form": {}}}},
+            duration_ms=duration_ms,
+        )
+
+    def _question_failed(
+        self, call: ToolCall, context: ClientContext, message: str, duration_ms: float
+    ) -> ToolOutcome:
+        """An ``isError`` result for a call that a question, or its answer, ended."""
+        audit(
+            "tool_call",
+            tool=call.tool.name,
+            client_id=context.client_id,
+            duration_ms=duration_ms,
+            status="tool_error",
+        )
+        return ToolOutcome._create(
+            "tool_error", message=message, started=True, is_error=True, duration_ms=duration_ms
+        )
+
+    async def _ask_client(
+        self, context: ClientContext, need: _InputRequired, tool: str
+    ) -> dict[str, Any]:
+        """Send a session's client the question *need*, and wait for its result.
+
+        The request goes where the call's own notifications go.  A client
+        that does not answer within ``ELICITATION_TIMEOUT_SECONDS`` is told
+        the request is cancelled, and the question counts as dismissed.
+
+        Raises:
+            ElicitationUnavailableError: The channel has ended, or the client
+                answered the request with an error.
+        """
+        send = context.notify
+        if send is None and context.multiplexed:
+            send = context.push
+        if send is None:
+            raise ElicitationUnavailableError(
+                "this connection cannot carry a question to the client"
+            )
+        request_id = "easy-mcp-" + secrets.token_urlsafe(16)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._asked[request_id] = (future, context.session_id)
+        fields = {"tool": tool, "client_id": context.client_id, "question": need.key}
+        audit("elicitation_requested", **fields)
+        answered = False
+        try:
+            try:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": ELICIT_METHOD,
+                        "params": need.params,
+                    }
+                )
+            except Exception:
+                raise ElicitationUnavailableError(
+                    "the connection to the client has ended"
+                ) from None
+            try:
+                async with asyncio.timeout(ELICITATION_TIMEOUT_SECONDS):
+                    response = await future
+            except TimeoutError:
+                audit("elicitation_answered", **fields, action="timeout")
+                return {"action": "cancel"}
+            answered = True
+        finally:
+            self._asked.pop(request_id, None)
+            if not answered:
+                # Timed out, or the call was cancelled: the client may take
+                # its form down.
+                with contextlib.suppress(Exception):
+                    send(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {"requestId": request_id, "reason": "no longer needed"},
+                        }
+                    )
+        if "error" in response:
+            error = response["error"]
+            code = error.get("code") if isinstance(error, dict) else None
+            audit("elicitation_answered", **fields, action="error", code=code)
+            raise ElicitationUnavailableError(f"the client refused the question (code {code})")
+        result = response.get("result")
+        action = result.get("action") if isinstance(result, dict) else None
+        audit("elicitation_answered", **fields, action=action if isinstance(action, str) else None)
+        return result if isinstance(result, dict) else {}
+
+    def _resolve_response(self, message: dict[str, Any], context: ClientContext) -> bool:
+        """Hand a client's response to the question waiting for it; whether one was.
+
+        Only the session that was asked can answer: the id is unguessable,
+        and checked against the session all the same.
+        """
+        request_id = message.get("id")
+        entry = self._asked.get(request_id) if isinstance(request_id, str) else None
+        if entry is None:
+            return False
+        future, session_id = entry
+        if session_id != context.session_id or future.done():
+            return False
+        future.set_result(message)
+        return True
 
     async def _run_user_code(
         self,

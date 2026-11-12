@@ -24,6 +24,37 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   alike, they travel on the response of the request itself: see Changed.
 - `ClientContext.notify`, for custom transports that answer each request on
   a stream of its own: the server sends a request's progress there.
+- Asking the user a question. `elicit(message, fields)` asks the user of
+  the tool call being served for structured input (MCP form elicitation) and
+  returns an `Elicitation`: `accepted`, `action` (`accept`, `decline`,
+  `cancel`) and the submitted fields, checked against the form. Fields are
+  Python types (`str`, `int`, `float`, `bool`, `Literal[...]`,
+  `list[Literal[...]]`, `T | None`, `Annotated[T, "..."]`) or JSON Schema
+  dicts. The tool function runs again from the top once the answer is in,
+  which is what lets one tool serve both protocol eras:
+
+  - Stateless (`2026-07-28`) calls implement multi-round-trip requests: the
+    call is answered with an `InputRequiredResult` (`resultType:
+    "input_required"`) and the client retries with `inputResponses`.
+    Earlier answers travel in a `requestState` signed with HMAC-SHA256 and
+    bound to the principal, the tool, its arguments and a 15 minute expiry;
+    one that fails verification is `-32602 "Invalid requestState"`. The key
+    comes from `MCPServer(state_secret=...)` or `EASY_MCP_STATE_SECRET`, and
+    is random per process without either.
+  - Sessions (`2025-11-25` and earlier) are sent an `elicitation/create`
+    request on stdio, on the `/sse` stream, or over Streamable HTTP on the
+    call's own response as an event stream; the client has 10 minutes to
+    answer, and the tool's timeout does not run meanwhile.
+
+  A client that declared no `elicitation` capability with form mode, and a
+  session served by several workers, cannot be asked: `elicit()` raises
+  `ElicitationUnavailableError` (`can_elicit()` tells beforehand), which
+  left uncaught ends the call with `-32021` and `requiredCapabilities` for a
+  stateless client and an `isError` result for a session. A stateless call
+  that stops to ask does not count against `max_calls_per_session`.
+  `ToolOutcome.status` gains `input_required`, the audit log
+  `elicitation_requested` and `elicitation_answered` (never the question's
+  text or the answer), and `ClientContext` gains `client_capabilities`.
 - Icons. `MCPServer(icons=...)` and `icons=` on `@server.tool`,
   `@server.resource` and `@server.prompt` attach MCP `Icon` objects, which
   clients may show next to the server and its items. An `Icon` is an
@@ -55,6 +86,16 @@ All notable changes to `easy-mcp-kit` are recorded here. The format follows
   visible to the caller answers exactly as before. One with more now needs a
   client that follows `nextCursor`, as the specification has always asked;
   before, the whole list came in one answer and a `cursor` was ignored.
+- A message with an `id` and a `result` or `error` but no `method` is a
+  response, and is no longer answered: `dispatch` returns `None` for it
+  (over stdio it used to be answered with `-32600 "missing method"`). It
+  reaches the question waiting for it, if one is.
+- A stateless `tools/call` carrying a `requestState` this server did not
+  sign for this caller and call is refused with `-32602`, and one whose
+  `inputResponses` is not an object likewise; both were ignored before.
+- In a Streamable HTTP session, a `tools/call` whose tool asks the user a
+  question is answered with `text/event-stream` when the client accepts it,
+  as a request reporting progress is.
 - Over Streamable HTTP, a `POST` whose request carries a `progressToken` may
   now be answered with `text/event-stream` instead of `application/json`:
   the request's `notifications/progress`, then its response as the last

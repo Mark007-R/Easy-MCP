@@ -425,6 +425,20 @@ the client is untrusted, the credential in the environment is trusted.
   fetches its own keys and counts failures on its own; behind a proxy, all
   clients share the proxy's address for that throttle, as for anonymous rate
   limiting.
+- **Questions to the user pass through the client.** `elicit()` asks with a
+  form the client shows, so the client sees every answer: never ask for a
+  password, an API key or a payment detail (the specification forbids it).
+  Answers are checked against the form, and neither the question's text nor
+  the answer is logged. A stateless client carries a call's earlier answers
+  back in `requestState`, which is attacker-controlled input: it is signed
+  with HMAC-SHA256 and bound to the principal, the tool and its arguments,
+  and expires after 15 minutes, and a state failing any check is refused
+  before the tool runs. It is signed, not encrypted, and not single-use: a
+  client may replay its own answers to the same call within the expiry, so
+  a tool whose question guards a one-time action must enforce that itself.
+  Keep `state_secret` as you keep an API key; anyone holding it can forge
+  answers for any caller. A session's client answers by request id, 128
+  random bits, and only from the session that was asked.
 - **`allowed_origins` is the CORS policy too.** A page on a listed origin may
   call the server and read its answers, with whatever credential the page
   itself holds; by default that is any page served from this machine
